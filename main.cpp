@@ -1,5 +1,6 @@
 #include <chrono>
 #include<iostream>
+#include <libtorrent/units.hpp>
 #include<thread>
 #include <libtorrent/add_torrent_params.hpp>
 #include<libtorrent/version.hpp>
@@ -8,6 +9,7 @@
 #include<libtorrent/alert.hpp>
 #include<libtorrent/settings_pack.hpp>
 #include<libtorrent/torrent_status.hpp>
+#include <libtorrent/torrent_info.hpp>
 #include <string>
 #include<filesystem>
 namespace lt = libtorrent;
@@ -49,6 +51,26 @@ int main()
 	  /*
 	   *TO GET IMP DATA WHILE DOWNLOADING WE NEED ALERTS
 	   * */
+
+	  /*Get Files to show*/
+	 auto torrent_info = handle.torrent_file();
+
+	auto const& files = torrent_info->files();
+
+	std::cout << "\nFiles in torrent:\n";
+
+	for (int i = 0; i < files.num_files(); ++i)
+	{
+    		auto file_index = lt::file_index_t{i};
+
+    		std::cout << "[" << i << "]\t"
+              << files.file_path(file_index)
+              << " -- "
+              << files.file_size(file_index) / (1024.0 * 1024.0)
+              << " MB\n";
+	}
+	  std::string empty;
+	  std::getline(std::cin,empty);
 	 while(1)
 	 {
 		 std::vector<lt::alert*>alerts;
