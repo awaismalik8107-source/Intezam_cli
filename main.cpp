@@ -1,100 +1,131 @@
+#include "src/torrent_metadata.hpp"
+#include "src/video_files.hpp"
+#include "src/video_selection.hpp"
+#include "src/cache_simulation.hpp"
+
+#include <libtorrent/version.hpp>
+
+#include <charconv>
 #include <chrono>
-#include<iostream>
-#include <libtorrent/units.hpp>
-#include<thread>
-#include <libtorrent/add_torrent_params.hpp>
-#include<libtorrent/version.hpp>
-#include<libtorrent/session.hpp>
-#include<libtorrent/magnet_uri.hpp>
-#include<libtorrent/alert.hpp>
-#include<libtorrent/settings_pack.hpp>
-#include<libtorrent/torrent_status.hpp>
-#include <libtorrent/torrent_info.hpp>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <stdexcept>
 #include <string>
-#include<filesystem>
-namespace lt = libtorrent;
-namespace fs =std::filesystem;
-int main()
-	{
-	lt::settings_pack setting;
-	setting.set_bool(lt::settings_pack::enable_dht,true);
-	setting.set_bool(lt::settings_pack::enable_lsd,true);
-	setting.set_bool(lt::settings_pack::enable_upnp,true);
-	setting.set_bool(lt::settings_pack::enable_natpmp,true);
-	  std::cout<< "Libtorrent version :"<< LIBTORRENT_VERSION<<"\n"<<std::endl;
-	  lt::session ses(setting);
-	  //This create a object session of Bittorrent engine
-	  /*
-	   Thing session as object of
-	   |
-	   |__Internet Networking
-	   |__DHT
-	   |__Tracker
-	   |__peerConnection
-	   |__torrent
-	    
-	   */
-	  std::string magnet;
-	  std::cout<<"Enter your magnet link here \t:";
-	  std::getline(std::cin,magnet);
-	  lt::add_torrent_params params= lt::parse_magnet_uri(magnet);
-	  //params.save_path = "/test";
-	fs::path download_path=fs::current_path() / "test";
-	fs::create_directories(download_path);
-	params.save_path=download_path.string();
-	  lt::torrent_handle handle =ses.add_torrent(params);
-	  std::cout<<"LIBTORRENT SESSION STARTED And Torrent addded";
-	  /*
-	   Main concept is get a magnet link than parse it to get meta data than add a 
-	   torrent in the session of that param
-	   */
-	  /*
-	   *TO GET IMP DATA WHILE DOWNLOADING WE NEED ALERTS
-	   * */
+#include <string_view>
 
-	  /*Get Files to show*/
-	 auto torrent_info = handle.torrent_file();
+namespace {
 
-	auto const& files = torrent_info->files();
+struct CliOptions {
+    std::chrono::milliseconds timeout{120000};
+    std::chrono::seconds duration{0};
+    double bitrate = 1024 * 1024;
+    bool metadata_only = false;
+    bool help = false;
+};
 
-	std::cout << "\nFiles in torrent:\n";
+int parseSeconds(std::string_view argument, int maximum)
+{
+    int seconds = 0;
+    const auto result = std::from_chars(argument.data(), argument.data() + argument.size(), seconds);
+    if (result.ec != std::errc{} || result.ptr != argument.data() + argument.size()
+        || seconds < 1 || seconds > maximum) {
+        throw std::invalid_argument("Seconds must be a whole number from 1 to " + std::to_string(maximum) + ".");
+    }
+    return seconds;
+}
 
-	for (int i = 0; i < files.num_files(); ++i)
-	{
-    		auto file_index = lt::file_index_t{i};
+CliOptions parseOptions(int argc, char* argv[])
+{
+    CliOptions options;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument{argv[index]};
+        if (argument == "--help") options.help = true;
+        else if (argument == "--metadata-only") options.metadata_only = true;
+        else if (argument == "--timeout" || argument == "--simulate-seconds" || argument == "--bitrate") {
+            if (++index >= argc) throw std::invalid_argument("Missing value for " + std::string(argument));
+            const std::string_view value{argv[index]};
+            if (argument == "--timeout") options.timeout = std::chrono::seconds{parseSeconds(value, 3600)};
+            else if (argument == "--simulate-seconds") options.duration = std::chrono::seconds{parseSeconds(value, 86400)};
+            else {
+                const auto parsed = std::from_chars(value.data(), value.data() + value.size(), options.bitrate);
+                if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()
+                    || !std::isfinite(options.bitrate) || options.bitrate <= 0 || options.bitrate > 1e12) {
+                    throw std::invalid_argument("Bitrate must be a positive number of bytes per second (at most 1 TB/s).");
+                }
+            }
+        } else throw std::invalid_argument("Unknown option: " + std::string(argument) + ". Use --help.");
+    }
+    return options;
+}
 
-    		std::cout << "[" << i << "]\t"
-              << files.file_path(file_index)
-              << " -- "
-              << files.file_size(file_index) / (1024.0 * 1024.0)
-              << " MB\n";
-	}
-	  std::string empty;
-	  std::getline(std::cin,empty);
-	 while(1)
-	 {
-		 std::vector<lt::alert*>alerts;
-		 ses.pop_alerts(&alerts);
-		 for(auto alert: alerts)
-		 {
-			 std::cout<<alert->message()<<"\n";
-		 }
-		 auto status = handle.status();
+} // namespace
 
-std::cout << "\nProgress: "
-          << status.progress * 100 << "%";
+int main(int argc, char* argv[])
+{
+    std::ios::sync_with_stdio(false);
+    std::cin.tie(nullptr);
+    try {
+        const auto cli = parseOptions(argc, argv);
+        if (cli.help) {
+            std::cout << "Usage: intezam [--timeout SECONDS] [--metadata-only]\n"
+                      << "               [--bitrate BYTES_PER_SECOND] [--simulate-seconds SECONDS]\n"
+                      << "Retrieve metadata, select a video, then simulate playback through a bounded disk cache.\n"
+                      << "--metadata-only preserves detection/selection without payload downloads.\n"
+                      << "Defaults: metadata timeout 120 seconds, simulated consumption 1048576 bytes/s.\n"
+                      << "VLC and container/codec parsing are not implemented.\n";
+            return EXIT_SUCCESS;
+        }
+        intezam::MetadataOptions options;
+        options.timeout = cli.timeout;
 
-std::cout << "\nDownload speed: "
-          << status.download_rate / 1024.0 << " KB/s";
+        std::cout << "========== INTEZAM CLI ==========\n\n"
+                  << "Libtorrent version: " << LIBTORRENT_VERSION << '\n'
+                  << "Enter your magnet link: " << std::flush;
+        std::string magnet;
+        if (!std::getline(std::cin, magnet)) {
+            std::cout << "\nInput closed.\n";
+            return EXIT_SUCCESS;
+        }
+        const auto first = magnet.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) {
+            throw std::invalid_argument("A magnet link is required.");
+        }
+        magnet = magnet.substr(first, magnet.find_last_not_of(" \t\r\n") - first + 1);
 
-std::cout << "\nPeers: "
-          << status.num_peers;
+        std::cout << "Retrieving metadata only (timeout: "
+                  << options.timeout.count() / 1000 << " seconds)...\n" << std::flush;
+        const auto metadata = intezam::retrieveTorrentMetadata(magnet, options);
+        const auto videos = intezam::detectVideoFiles(*metadata);
+        std::cout << "\nTorrent: " << metadata->name()
+                  << "\nTotal Files: " << metadata->num_files()
+                  << "\nDetected Videos: " << videos.size() << "\n\n";
+        if (videos.empty()) {
+            std::cout << "No supported video files found.\n";
+            return EXIT_SUCCESS;
+        }
 
-std::cout << "\nSeeds: "
-          << status.num_seeds;
-
-std::cout << "\n----------------------\n";
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
-	 }
-	  return 0;
-	}
+        intezam::displayVideos(videos, std::cout);
+        const auto selected_video = intezam::selectVideo(videos, std::cin, std::cout);
+        if (!selected_video) {
+            std::cout << "\nSelection cancelled.\n";
+            return EXIT_SUCCESS;
+        }
+        std::cout << "\nSelected: " << selected_video->path
+                  << "\nTorrent file index: " << static_cast<int>(selected_video->torrent_index)
+                  << "\nSize: " << intezam::formatVideoSize(selected_video->size_bytes)
+                  << " (" << selected_video->size_bytes << " bytes)\n";
+        if (cli.metadata_only) {
+            std::cout << "Metadata-only selection complete. No video data downloaded.\n";
+            return EXIT_SUCCESS;
+        }
+        intezam::CacheSimulationOptions simulation;
+        simulation.cache.playback_bytes_per_second = cli.bitrate;
+        simulation.duration = cli.duration;
+        intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
+        return EXIT_SUCCESS;
+    } catch (const std::exception& error) {
+        std::cerr << "Error: " << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+}

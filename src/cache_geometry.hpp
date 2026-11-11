@@ -1,0 +1,20 @@
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+namespace intezam {
+
+struct PieceGeometry {
+    std::int64_t video_size;
+    std::int64_t video_offset;
+    std::int64_t torrent_size;
+    int piece_length;
+
+    void validate() const;
+    int pieceCount() const;
+    int pieceSize(int piece) const;
+    std::vector<int> piecesForRange(std::int64_t offset, std::int64_t length) const;
+};
+
+} // namespace intezam
