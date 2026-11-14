@@ -234,11 +234,15 @@ void VlcPlayer::seekTo(std::int64_t milliseconds)
     const auto duration = libvlc_media_player_get_length(player_);
     if (milliseconds < 0 || duration <= 0 || milliseconds >= duration) throw std::out_of_range("Seek time exceeds known media duration.");
     if (!libvlc_media_player_is_seekable(player_)) throw std::invalid_argument("VLC does not support time seeking for this stream.");
-    if (auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_)) torrent->beginPlaybackEpoch();
+    if (auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_)) {
+        torrent->beginUserSeek();
+        torrent->beginPlaybackEpoch();
+    }
     buffer_paused_ = false;
     rebuffer_gate_.reset();
     if (!user_paused_) libvlc_media_player_set_pause(player_, 0);
     requested_seek_ = milliseconds;
+    measured_seek_target_ = milliseconds;
     seek_count_at_request_ = seek_count_.load();
     seek_started_ = std::chrono::steady_clock::now();
     libvlc_media_player_set_time(player_, milliseconds);
@@ -277,7 +281,10 @@ PlaybackStatus VlcPlayer::status()
         const auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_);
         const bool input_ready = !torrent || torrent->status().waiting_reads == 0
             || seek_count_.load() != seek_count_at_request_;
-        if (input_ready && std::abs(current - *requested_seek_) <= 250) requested_seek_.reset();
+        if (input_ready && std::abs(current - *requested_seek_) <= 250) {
+            requested_seek_.reset();
+            if (torrent) torrent->completeUserSeek();
+        }
         else if (std::chrono::steady_clock::now() - seek_started_ > std::chrono::milliseconds{750}) {
             // A callback may be blocked on the old location. Cancel it before
             // stopping and reopening; ordinary cached seeks retain the demuxer.
@@ -345,6 +352,13 @@ void VlcPlayer::updateBuffering(const PlaybackStatus& status)
         if (paused != buffer_paused_) {
             buffer_paused_ = paused;
             libvlc_media_player_set_pause(player_, user_paused_ || buffer_paused_);
+        }
+        torrent->observePlayback(status.decoded_video_frames > 0,
+            !user_paused_ && (buffer_paused_ || status.state == libvlc_Buffering));
+        if (measured_seek_target_ && !requested_seek_ && status.decoded_video_frames > 0
+            && std::abs(status.time_ms - *measured_seek_target_) <= 250) {
+            torrent->completeUserSeek();
+            measured_seek_target_.reset();
         }
     }
 }

@@ -55,6 +55,21 @@ void printDiagnostics(const TorrentCacheSession& cache, bool paused)
               << "\nForward Buffer: " << status.forward_buffer_seconds << " seconds"
               << "\nCache Status: " << (paused ? "PAUSED" : status.ready ? "PLAYING (simulated)" : "BUFFERING") << '\n'
               << std::flush;
+    if (status.adaptive_budget) {
+        const auto& network = status.useful_throughput;
+        const auto& target = status.adaptive_target;
+        std::cout << "Useful verified throughput (short / sustainable): " << network.short_bytes_per_second
+                  << " / " << network.sustainable_bytes_per_second << " bytes/s"
+                  << "\nVariation / demand-stall seconds / peers: " << network.variability << " / "
+                  << network.stalled_seconds << " / " << network.peers
+                  << "\nDesired / physical / occupied slot bytes: " << status.desired_capacity_bytes << " / "
+                  << status.physical_capacity_bytes << " / " << status.occupied_capacity_bytes
+                  << "\nForward target / startup / emergency / resume seconds: " << target.forward_seconds << " / "
+                  << target.startup_seconds << " / " << target.emergency_seconds << " / " << target.resume_seconds
+                  << "\nThroughput deficit: " << target.throughput_deficit << "; depletion estimate: " << target.depletion_seconds
+                  << " seconds; shrink deferred: " << status.shrink_deferred
+                  << "\nStorage constraint: " << status.capacity_constraint << '\n';
+    }
 }
 
 bool inputReady()

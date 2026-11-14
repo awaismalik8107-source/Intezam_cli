@@ -100,6 +100,7 @@ private:
     std::unique_ptr<unsigned char, decltype(&std::free)> headless_frame_{nullptr, &std::free};
     std::atomic<int> displayed_frames_{0};
     std::optional<std::int64_t> requested_seek_;
+    std::optional<std::int64_t> measured_seek_target_;
     std::uint64_t seek_count_at_request_ = 0;
     std::chrono::steady_clock::time_point seek_started_;
 };

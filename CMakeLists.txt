@@ -12,6 +12,8 @@ find_package(Threads REQUIRED)
 add_library(intezam_core
     src/cache_geometry.cpp
     src/cache_budget.cpp
+    src/useful_throughput.cpp
+    src/adaptive_cache_budget.cpp
     src/stream_policy.cpp
     src/cache_file.cpp
     src/piece_store.cpp
@@ -51,6 +53,13 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(adaptive_engine_tests test/adaptive_engine_tests.cpp)
+    target_link_libraries(adaptive_engine_tests PRIVATE intezam_core)
+    add_test(NAME adaptive_streaming_engine COMMAND adaptive_engine_tests)
+    add_executable(adaptive_storage_tests test/adaptive_storage_tests.cpp)
+    target_link_libraries(adaptive_storage_tests PRIVATE intezam_core)
+    add_test(NAME adaptive_cache_storage COMMAND adaptive_storage_tests)
+    set_tests_properties(adaptive_cache_storage PROPERTIES TIMEOUT 40)
     if(INTEZAM_QT_UI)
         find_package(Qt6 REQUIRED COMPONENTS Test)
         add_executable(qt_player_tests test/qt_player_tests.cpp)
@@ -103,6 +112,15 @@ if(BUILD_TESTING)
         add_test(NAME cli_magnet_to_playback COMMAND playback_tests --cli
             $<TARGET_FILE:intezam> ${media_directory}/tail.mp4)
         set_tests_properties(cli_magnet_to_playback PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 45)
+        add_test(NAME cli_adaptive_playback COMMAND playback_tests --cli-adaptive
+            $<TARGET_FILE:intezam> ${media_directory}/tail.mp4)
+        set_tests_properties(cli_adaptive_playback PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 45)
+        add_test(NAME vlc_adaptive_playback COMMAND playback_tests --adaptive-playback
+            ${media_directory}/front.mp4 ${media_directory}/tail.mp4
+            ${media_directory}/video.mkv ${media_directory}/video.webm
+            ${media_directory}/video.mov ${media_directory}/video.m4v
+            ${media_directory}/video.avi ${media_directory}/video.ts)
+        set_tests_properties(vlc_adaptive_playback PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 120)
         add_test(NAME cleanup_vlc_media COMMAND ${CMAKE_COMMAND}
             -DDESTINATION=${media_directory} -DCLEANUP=ON
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test/generate_media.cmake)

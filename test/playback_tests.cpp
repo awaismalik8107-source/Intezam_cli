@@ -19,7 +19,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void testsCli(const fs::path& executable, const fs::path& file)
+void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = false)
 {
     test_support::LocalVideoTorrent torrent(file);
     auto pattern = (fs::current_path() / "intezam-cli-test-XXXXXX").string();
@@ -41,8 +41,9 @@ void testsCli(const fs::path& executable, const fs::path& file)
         for (auto& entry : environment) env.push_back(entry.data());
         env.push_back(nullptr);
         auto program = executable.string();
-        char headless[] = "--headless", timeout[] = "--timeout", seconds[] = "20";
-        char* arguments[]{program.data(), headless, timeout, seconds, nullptr};
+        char headless[] = "--headless", timeout[] = "--timeout", seconds[] = "20", strict[] = "--strict-cache";
+        char maximum[] = "--cache-max-mib", mib[] = "32";
+        char* arguments[]{program.data(), headless, timeout, seconds, adaptive ? maximum : strict, adaptive ? mib : nullptr, nullptr};
         posix_spawn_file_actions_t actions;
         require(posix_spawn_file_actions_init(&actions) == 0, "CLI spawn actions");
         int result = posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
@@ -81,7 +82,7 @@ void testsCli(const fs::path& executable, const fs::path& file)
                 }
             }
             peak = std::max(peak, allocated);
-            require(peak <= torrent.video().size_bytes / 40, "CLI actual disk bound");
+            require(peak <= (adaptive ? 32LL * 1024 * 1024 : torrent.video().size_bytes / 40), "CLI actual disk bound");
             require(std::chrono::steady_clock::now() < deadline, "CLI default transport playback timeout; see " + log.string());
             std::this_thread::sleep_for(10ms);
         }
@@ -91,7 +92,7 @@ void testsCli(const fs::path& executable, const fs::path& file)
         require(text.find("moov near EOF") != std::string::npos && text.find("End of video.") != std::string::npos,
                 "complete magnet/selection/container/decode/EOF flow: " + text);
         require(fs::exists(cache) && fs::is_empty(cache), "CLI removed session directory");
-        std::cout << "CLI magnet-to-EOF passed; peak allocation=" << peak << "/" << torrent.video().size_bytes / 40 << " bytes\n";
+        std::cout << "CLI magnet-to-EOF passed; peak allocation=" << peak << " bytes, adaptive=" << adaptive << '\n';
         fs::remove_all(root);
     } catch (...) {
         if (input[0] >= 0) close(input[0]);
@@ -112,7 +113,7 @@ void waitUntil(Predicate complete, const char* message, std::chrono::seconds tim
     }
 }
 
-void checkDisk(const intezam::TorrentVideoSource& source)
+void checkDisk(const intezam::TorrentVideoSource& source, std::int64_t maximum = 0)
 {
     const auto directory = source.directory();
     std::int64_t allocated = 0;
@@ -121,7 +122,7 @@ void checkDisk(const intezam::TorrentVideoSource& source)
         require(lstat(path.c_str(), &status) == 0, "stat actual managed disk allocation");
         allocated += status.st_blocks * 512LL;
     }
-    require(allocated <= source.size() / 40, "actual managed allocation <= 2.5 percent");
+    require(allocated <= (maximum ? maximum : source.size() / 40), "actual managed allocation within selected policy");
     for (const auto& entry : fs::directory_iterator(directory)) {
         require(entry.path().filename() == "session.lock" || entry.path().filename() == "stream.cache",
                 "no full-size payload file in client cache");
@@ -207,11 +208,16 @@ void stopsActiveDownload(const fs::path& file)
     std::cout << "VLC stop during a blocked download callback passed.\n";
 }
 
-void playsContainer(const fs::path& file, bool controls)
+void playsContainer(const fs::path& file, bool controls, bool adaptive = false)
 {
     std::cout << "Playing " << file.filename() << std::endl;
     test_support::LocalVideoTorrent torrent(file);
-    auto source = torrent.source();
+    auto options = torrent.options();
+    if (adaptive) {
+        options.budget.mode = intezam::CacheBudgetMode::adaptive;
+        options.budget.adaptive.maximum_bytes = 32LL * 1024 * 1024;
+    }
+    auto source = torrent.source(options);
     const auto container = intezam::probeContainer(*source);
     source->setContainer(container);
     source->prebuffer();
@@ -235,7 +241,7 @@ void playsContainer(const fs::path& file, bool controls)
                       << " waiting=" << cache.waiting_reads << " received=" << cache.cache.received_bytes << std::endl;
             reported = std::chrono::steady_clock::now();
         }
-        checkDisk(*source);
+        checkDisk(*source, adaptive ? options.budget.adaptive.maximum_bytes : 0);
         return current;
     };
     waitUntil([&] { return status().decoded_video_frames > 1; }, "VLC decoded initial frames");
@@ -249,6 +255,8 @@ void playsContainer(const fs::path& file, bool controls)
         waitUntil([&] { auto s = status(); return s.time_ms >= 1400 && s.decoded_video_frames > 0; }, "VLC forward time seek");
         player.seekTo(300);
         waitUntil([&] { auto s = status(); return s.time_ms >= 250 && s.decoded_video_frames > 0; }, "VLC backward time seek");
+    }
+    if (controls && !adaptive) {
         torrent.seed.pause();
         std::this_thread::sleep_for(50ms);
         player.seekTo(3000);
@@ -264,6 +272,11 @@ void playsContainer(const fs::path& file, bool controls)
     waitUntil([&] { return status().state == libvlc_Ended; }, "VLC reached end of media", 60s);
     require(decoded > 1, "real decoded frames, not just a PLAYING event");
     require(audio > 0, "audio packets were actually decoded");
+    if (adaptive) {
+        const auto metrics = source->status().playback;
+        require(metrics.first_frame_microseconds > 0, "real first-frame timing recorded");
+        if (controls) require(metrics.completed_seeks > 0, "real seek recovery timing recorded");
+    }
     const auto cache = source->status().cache;
     std::cout << container.name << (container.moov_at_end ? " (tail moov)" : "")
               << ": decoded video=" << decoded << ", audio=" << audio << ", allocated=" << cache.allocated_bytes
@@ -278,15 +291,16 @@ int main(int argc, char* argv[])
 {
     try {
         require(argc >= 2, "provide generated fixture paths");
-        if (std::string(argv[1]) == "--cli") {
+        if (std::string(argv[1]) == "--cli" || std::string(argv[1]) == "--cli-adaptive") {
             require(argc == 4, "provide CLI executable and media fixture");
-            testsCli(argv[2], argv[3]);
+            testsCli(argv[2], argv[3], std::string(argv[1]) == "--cli-adaptive");
             return 0;
         }
         int first = 1;
-        if (std::string(argv[1]) == "--play-only") { first = 2; require(argc > 2, "fixture required"); }
+        const bool adaptive = std::string(argv[1]) == "--adaptive-playback";
+        if (std::string(argv[1]) == "--play-only" || adaptive) { first = 2; require(argc > 2, "fixture required"); }
         else { testsBridge(argv[1]); stopsActiveDownload(argv[1]); }
-        for (int index = first; index < argc; ++index) playsContainer(argv[index], index == first);
+        for (int index = first; index < argc; ++index) playsContainer(argv[index], index == first, adaptive);
         return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -12,6 +12,7 @@ PieceStore::PieceStore(PieceGeometry geometry, std::unique_ptr<CacheFile> file,
     : geometry_(geometry), file_(std::move(file))
 {
     const auto slots = slotCount();
+    for (std::size_t index = 0; index < slots; ++index) free_slot_indices_.insert(index);
     const auto maximum = slots > 2 ? slots - 2 : 0;
     reserved_slots_ = reserved_slots.value_or(automaticReservation(slots));
     if (reserved_slots_ > maximum) throw std::invalid_argument("Reserved slots must leave at least two working slots.");
@@ -19,6 +20,29 @@ PieceStore::PieceStore(PieceGeometry geometry, std::unique_ptr<CacheFile> file,
 
 std::size_t PieceStore::automaticReservation(std::size_t slots)
 { return slots < 4 ? 0 : std::min(slots - 2, (slots + 7) / 8); }
+
+std::size_t PieceStore::growthLimitSlots() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return file_->growthLimitSlots();
+}
+
+bool PieceStore::growToSlots(std::size_t slots)
+{
+    // Network writes/hashes, admission and lease reads use this same mutex. A
+    // lease can remain pinned across expansion because its offsets do not move.
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto previous = slotCount();
+    if (!file_->growToSlots(slots)) return false;
+    for (auto index = previous; index < slotCount(); ++index) free_slot_indices_.insert(index);
+    return true;
+}
+
+std::string PieceStore::growthError() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return file_->growthError();
+}
 
 std::size_t PieceStore::reservedSlots() const
 {
@@ -70,18 +94,30 @@ void PieceStore::setProtectedPieces(const std::vector<int>& pieces)
     protected_pieces_ = {pieces.begin(), pieces.end()};
 }
 
+std::vector<int> PieceStore::protectedPieces() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::set<int> pieces = protected_pieces_;
+    for (const auto& [piece, slot] : slots_) if (slot.pins) pieces.insert(piece);
+    return {pieces.begin(), pieces.end()};
+}
+
 bool PieceStore::admitPieceLocked(int piece)
 {
-    if (slots_.count(piece) || slots_.size() == slotCount()) return false;
-    std::vector<bool> used(slotCount(), false);
-    for (const auto& entry : slots_) used[entry.second.index] = true;
-    const auto index = static_cast<std::size_t>(std::find(used.begin(), used.end(), false) - used.begin());
-    std::array<char, 65536> zeroes{};
-    const auto base = static_cast<std::int64_t>(index) * file_->slotSize();
-    for (std::int64_t offset = 0; offset < file_->slotSize(); offset += zeroes.size()) {
-        file_->write(base + offset, zeroes.data(), std::min<std::int64_t>(zeroes.size(), file_->slotSize() - offset));
+    if (slots_.count(piece) || free_slot_indices_.empty()) return false;
+    const auto index = *free_slot_indices_.begin();
+    if (used_slot_indices_.count(index)) {
+        std::array<char, 65536> zeroes{};
+        const auto base = static_cast<std::int64_t>(index) * file_->slotSize();
+        for (std::int64_t offset = 0; offset < file_->slotSize(); offset += zeroes.size()) {
+            file_->write(base + offset, zeroes.data(), std::min<std::int64_t>(zeroes.size(), file_->slotSize() - offset));
+        }
     }
+    // posix_fallocate extends a new file with zeros. Only reused slots need
+    // clearing; selected bytes still cannot be read before hash verification.
     slots_.emplace(piece, Slot{index, false, 0, {}});
+    used_slot_indices_.insert(index);
+    free_slot_indices_.erase(index);
     return true;
 }
 
@@ -126,6 +162,7 @@ std::vector<int> PieceStore::reclaimOutside(const std::vector<int>& keep)
     for (auto entry = slots_.begin(); entry != slots_.end();) {
         if (reclaimableLocked(entry->first, entry->second, wanted)) {
             removed.push_back(entry->first);
+            free_slot_indices_.insert(entry->second.index);
             entry = slots_.erase(entry);
         } else ++entry;
     }
@@ -165,6 +202,7 @@ std::vector<int> PieceStore::reconcile(const std::vector<int>& desired)
             });
             if (victim == slots_.end()) continue;
             evicted.push_back(victim->first);
+            free_slot_indices_.insert(victim->second.index);
             slots_.erase(victim);
         }
         admitPieceLocked(piece);

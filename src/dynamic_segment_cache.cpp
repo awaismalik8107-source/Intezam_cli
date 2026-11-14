@@ -66,6 +66,12 @@ void DynamicSegmentCache::updateBufferHealth(double seconds)
     buffer_seconds_ = seconds;
 }
 
+void DynamicSegmentCache::setAdaptiveForwardSeconds(double seconds)
+{
+    if (!std::isfinite(seconds) || seconds <= 0 || seconds > 600) throw std::invalid_argument("Invalid adaptive forward horizon.");
+    adaptive_forward_seconds_ = seconds;
+}
+
 SegmentWindow DynamicSegmentCache::window(const std::vector<int>& urgent_pieces) const
 {
     const auto total = (geometry_.video_size - 1) / segment_size_ + 1;
@@ -81,11 +87,16 @@ SegmentWindow DynamicSegmentCache::window(const std::vector<int>& urgent_pieces)
         seconds = std::max(seconds, std::min(forward_target_seconds_ * 3.75,
             forward_target_seconds_ * 2.0 + std::min(3.0, ratio) * forward_target_seconds_ * 7.0 / 12.0));
     }
+    if (adaptive_forward_seconds_) seconds = *adaptive_forward_seconds_ * 1.5;
     const auto maximum = std::min<std::int64_t>(total,
         (static_cast<std::int64_t>(slots_) * geometry_.piece_length) / segment_size_);
     auto count = static_cast<std::int64_t>(std::min<double>(maximum,
         std::max(1.0, std::ceil(seconds * bitrate_ / segment_size_))));
-    if (forward_target_seconds_ > 0) {
+    if (adaptive_forward_seconds_) {
+        const auto ahead = static_cast<std::int64_t>(std::max(1.0,
+            std::ceil(*adaptive_forward_seconds_ * bitrate_ / segment_size_)));
+        count = std::min(count, position_ / segment_size_ + ahead);
+    } else if (forward_target_seconds_ > 0) {
         // At the beginning there is no behind region to retain; avoid turning
         // that unused region into an unnecessarily long startup download.
         const auto ahead = static_cast<std::int64_t>(std::max(1.0,

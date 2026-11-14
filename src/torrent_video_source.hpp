@@ -20,6 +20,7 @@ struct VideoSourceStatus {
     std::string error;
     ReadPerformance performance;
     BufferWatermarks buffer_targets{};
+    PlaybackPerformance playback{};
 };
 
 class TorrentVideoSource final : public VideoByteSource {
@@ -39,12 +40,15 @@ public:
     void setContainer(ContainerInfo container);
     void beginPlaybackEpoch();
     void markPlaybackActive();
+    void observePlayback(bool decoded_frame, bool buffering);
+    void beginUserSeek();
+    void completeUserSeek();
     void setEstimatedRate(double bytes_per_second);
     void prebuffer();
     BufferWatermarks bufferTargets() const;
     VideoSourceStatus status() const;
     std::filesystem::path directory() const { return directory_; }
-    std::int64_t capacity() const { return capacity_; }
+    std::int64_t capacity() const { return capacity_.load(); }
 
 private:
     struct ReadSignal {
@@ -76,7 +80,7 @@ private:
     std::atomic<bool> stopping_{false};
     std::unique_ptr<TorrentCacheSession> cache_;
     std::filesystem::path directory_;
-    std::int64_t capacity_;
+    std::atomic<std::int64_t> capacity_{0};
     std::uint64_t probe_limit_;
     std::shared_ptr<ReadSignal> read_signal_ = std::make_shared<ReadSignal>();
     std::mutex stop_mutex_;
@@ -93,6 +97,11 @@ private:
     ContainerInfo container_;
     VideoSourceStatus status_;
     std::thread worker_;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point created_ = Clock::now();
+    Clock::time_point last_playback_observation_ = Clock::now();
+    std::optional<Clock::time_point> user_seek_started_;
+    bool playback_buffering_ = false;
 };
 
 } // namespace intezam

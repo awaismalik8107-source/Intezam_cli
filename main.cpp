@@ -34,7 +34,7 @@ struct CliOptions {
     bool simulate = false;
     bool headless = false;
     bool no_ui = false;
-    intezam::CacheBudgetOptions budget;
+    intezam::CacheBudgetOptions budget{intezam::CacheBudgetMode::adaptive, 25};
 };
 
 int parsePositiveInteger(std::string_view argument, int maximum)
@@ -59,9 +59,22 @@ CliOptions parseOptions(int argc, char* argv[])
         else if (argument == "--headless") options.headless = true;
         else if (argument == "--no-ui") options.no_ui = true;
         else if (argument == "--strict-cache") options.budget.mode = intezam::CacheBudgetMode::strict;
+        else if (argument == "--legacy-cache") options.budget.mode = intezam::CacheBudgetMode::automatic;
+        else if (argument == "--cache-max-mib" || argument == "--cache-free-reserve-mib" || argument == "--buffer-seconds") {
+            if (++index >= argc) throw std::invalid_argument("Missing value for " + std::string(argument));
+            const auto value = parsePositiveInteger(argv[index], argument == "--buffer-seconds" ? 600 : 1048576);
+            if (argument == "--cache-max-mib") options.budget.adaptive.maximum_bytes = std::int64_t{value} * 1024 * 1024;
+            else if (argument == "--cache-free-reserve-mib") options.budget.adaptive.free_space_reserve_bytes = std::int64_t{value} * 1024 * 1024;
+            else {
+                if (value < 12) throw std::invalid_argument("Initial buffer horizon must be 12..600 seconds.");
+                options.budget.adaptive.initial_forward_seconds = value;
+                options.budget.adaptive.maximum_forward_seconds = std::max(90, value);
+            }
+        }
         else if (argument == "--cache-max-percent") {
             if (++index >= argc) throw std::invalid_argument("Missing value for --cache-max-percent");
             options.budget.maximum_percent = parsePositiveInteger(argv[index], 99);
+            options.budget.mode = intezam::CacheBudgetMode::automatic;
             if (options.budget.maximum_percent < 3) throw std::invalid_argument("Cache ceiling must be from 3 to 99 percent.");
         }
         else if (argument == "--timeout" || argument == "--simulate-seconds" || argument == "--bitrate") {
@@ -81,6 +94,7 @@ CliOptions parseOptions(int argc, char* argv[])
             }
         } else throw std::invalid_argument("Unknown option: " + std::string(argument) + ". Use --help.");
     }
+    options.budget.initial_consumption_bytes_per_second = options.bitrate;
     return options;
 }
 
@@ -95,11 +109,13 @@ int main(int argc, char* argv[])
         if (cli.help) {
             std::cout << "Usage: intezam [--timeout SECONDS] [--metadata-only]\n"
                       << "               [--bitrate BYTES_PER_SECOND] [--headless | --no-ui]\n"
-                      << "               [--strict-cache | --cache-max-percent 3..99]\n"
+                      << "               [--cache-max-mib MIB] [--cache-free-reserve-mib MIB] [--buffer-seconds 12..600]\n"
+                      << "               [--strict-cache | --legacy-cache | --cache-max-percent 3..99]\n"
                       << "               [--simulate | --simulate-seconds SECONDS]\n"
                       << "Retrieve metadata, select a video, then play verified cache bytes with LibVLC.\n"
                       << "--metadata-only preserves detection/selection without payload downloads.\n"
-                      << default_playback << "; adaptive cache target 2.5%, automatic ceiling 25%.\n"
+                      << default_playback << "; adaptive time-based cache, absolute maximum 256 MiB.\n"
+                      << "Free-space reserve 256 MiB; initial forward horizon 24 seconds; legacy modes retain percentage limits.\n"
                       << "Defaults: metadata timeout 120 seconds, initial bitrate estimate 1048576 bytes/s.\n"
                       << "--simulate retains the cache test harness; --headless uses memory video/dummy audio.\n";
             return EXIT_SUCCESS;

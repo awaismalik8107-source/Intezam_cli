@@ -1,5 +1,11 @@
 # Playback and cache architecture
 
+The default streaming policy is now [Adaptive Streaming Engine 2.0](docs/adaptive-engine-2.md).
+Its time-based physical sizing, verified-throughput estimator, distinct buffer
+states, append-only expansion and deferred shrinking supersede the legacy budget
+and horizon formulas below. Explicit strict/automatic callers retain those
+formulas. No GUI implementation changed in this update.
+
 ## Inspected repository and reused code
 
 The [upstream repository](https://github.com/awaismalik8107-source/Intezam_cli)

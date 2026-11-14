@@ -5,6 +5,8 @@
 #include "dynamic_segment_cache.hpp"
 #include "torrent_metadata.hpp"
 #include "video_files.hpp"
+#include "adaptive_cache_budget.hpp"
+#include "stream_policy.hpp"
 
 #include <libtorrent/session.hpp>
 #include <libtorrent/torrent_handle.hpp>
@@ -21,7 +23,7 @@ libtorrent::settings_pack streamingSessionSettings();
 
 struct CacheStreamOptions {
     std::filesystem::path root = CacheFile::defaultRoot();
-    CacheBudgetOptions budget;
+    CacheBudgetOptions budget{CacheBudgetMode::adaptive, 25};
     double playback_bytes_per_second = 1024 * 1024;
     double forward_buffer_target_seconds = 12; // 0 retains the shorter legacy horizon
     std::chrono::milliseconds stall_timeout{120000};
@@ -52,6 +54,20 @@ struct CacheDiagnostics {
     std::size_t urgent_pieces;
     CachePerformance performance{};
     double download_bytes_per_second = 0; // current half-second sample; zero when idle
+    ThroughputEstimate useful_throughput{};
+    AdaptiveCacheTarget adaptive_target{};
+    BufferState buffer_state = BufferState::initializing;
+    std::int64_t desired_capacity_bytes = 0;
+    std::int64_t physical_capacity_bytes = 0;
+    std::int64_t occupied_capacity_bytes = 0;
+    bool shrink_deferred = false;
+    std::string capacity_constraint{};
+    bool adaptive_budget = false;
+    int actual_blocking_priority = -1;
+    int planned_blocking_priority = -1;
+    int connected_peers = 0;
+    bool torrent_finished = false;
+    std::string last_peer_error{};
 };
 
 // Control methods are serialized internally. Playback may hold/use ReadLease
@@ -65,6 +81,7 @@ public:
     bool seek(std::int64_t byte_offset);
     void setPlaybackPosition(std::int64_t byte_offset);
     void setPlaybackRate(double bytes_per_second);
+    void setProtectedMetadata(const std::vector<VideoRange>& ranges);
     void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand,
                            PlaybackMovement movement = PlaybackMovement::sequential);
     std::optional<PieceStore::ReadLease> read(std::int64_t offset, std::int64_t length);
@@ -93,9 +110,11 @@ private:
     void publishDeadlines(std::map<int, Clock::time_point> deadlines);
     void rebuild(const AdmissionPlan& plan);
     void observeThroughput();
+    void adaptCache();
     void updateReservation(double bytes_per_second);
     void updatePosition(std::int64_t byte_offset);
     std::vector<int> urgentPieces() const;
+    std::vector<int> currentPieces() const;
     void checkCancelled() const;
     double forwardBufferSeconds() const;
     libtorrent::add_torrent_params safeParams(libtorrent::add_torrent_params params);
@@ -114,6 +133,7 @@ private:
     std::map<int, libtorrent::download_priority_t> scheduled_priorities_;
     std::map<int, Clock::time_point> scheduled_deadlines_;
     bool retime_deadlines_ = false;
+    bool scheduled_buffer_low_ = false;
     std::vector<int> scheduled_urgent_;
     double scheduled_rate_ = 0;
     std::int64_t scheduled_position_ = -1;
@@ -130,6 +150,16 @@ private:
     CachePerformance performance_;
     std::optional<VideoRange> last_window_;
     std::optional<SegmentWindow> planned_window_;
+    UsefulThroughputEstimator throughput_;
+    std::optional<AdaptiveCacheBudgetController> adaptive_budget_;
+    AdaptiveCacheTarget adaptive_target_;
+    AdaptiveBufferController buffer_controller_;
+    Clock::time_point created_ = Clock::now();
+    Clock::time_point last_growth_attempt_{};
+    std::uint64_t sampled_verified_bytes_ = 0;
+    bool seeking_ = false;
+    std::string capacity_constraint_;
+    std::vector<int> metadata_pieces_;
 };
 
 } // namespace intezam

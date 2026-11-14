@@ -34,4 +34,13 @@ struct ReadPerformance {
     std::uint64_t disk_read_microseconds = 0;
 };
 
+struct PlaybackPerformance {
+    std::uint64_t stalls = 0;
+    std::uint64_t buffering_microseconds = 0;
+    std::uint64_t first_frame_microseconds = 0; // from source construction, zero until observed
+    std::uint64_t completed_seeks = 0;
+    std::uint64_t seek_microseconds = 0;
+    std::uint64_t maximum_seek_microseconds = 0;
+};
+
 } // namespace intezam

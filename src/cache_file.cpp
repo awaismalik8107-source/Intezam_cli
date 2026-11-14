@@ -1,6 +1,7 @@
 #include "cache_file.hpp"
 
 #include <cerrno>
+#include <algorithm>
 #include <cstdlib>
 #include <fcntl.h>
 #include <linux/magic.h>
@@ -118,9 +119,15 @@ void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::
     fd_ = open((directory_ / "stream.cache").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd_ < 0) systemFailure("create bounded cache file");
     const auto overhead = allocatedBytes();
-    budget_ = planCacheBudget(video_size, piece_length, block, overhead, options).effective_bytes;
-    slots_ = static_cast<std::size_t>((budget_ - overhead - block) / slot_size_);
-    const auto capacity = static_cast<std::int64_t>(slots_) * slot_size_;
+    const auto available = static_cast<std::int64_t>(std::min<long double>(INT64_MAX,
+        static_cast<long double>(filesystem.f_bavail) * block));
+    const auto plan = planCacheBudget(video_size, piece_length, block, overhead, options, available);
+    adaptive_ = options.mode == CacheBudgetMode::adaptive;
+    free_space_reserve_ = adaptive_ ? options.adaptive.free_space_reserve_bytes : 0;
+    budget_ = adaptive_ ? options.adaptive.maximum_bytes : plan.effective_bytes;
+    slots_ = static_cast<std::size_t>((plan.effective_bytes - overhead - block) / slot_size_);
+    const auto capacity = static_cast<std::int64_t>(slots_.load()) * slot_size_;
+    if (capacity > available - free_space_reserve_) throw std::runtime_error("Insufficient free disk space for cache allocation.");
     const int result = posix_fallocate(fd_, 0, capacity);
     if (result != 0) {
         throw std::system_error(result, std::generic_category(), "preallocate bounded disk cache");
@@ -128,6 +135,45 @@ void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::
     if (allocatedBytes() > budget_) {
         throw std::runtime_error("Filesystem allocation exceeds the effective cache budget; cache refused.");
     }
+}
+
+std::size_t CacheFile::growthLimitSlots() const
+{
+    if (!adaptive_) return slots_.load();
+    struct statvfs filesystem{};
+    if (statvfs(root_.c_str(), &filesystem) != 0) systemFailure("query cache growth space");
+    const auto block = filesystem.f_frsize ? filesystem.f_frsize : filesystem.f_bsize;
+    const auto available = static_cast<std::int64_t>(std::min<long double>(INT64_MAX,
+        static_cast<long double>(filesystem.f_bavail) * block));
+    const auto current = slots_.load();
+    const auto overhead = allocatedBytes() - allocated(directory_ / "stream.cache");
+    const auto absolute = static_cast<std::size_t>(std::max<std::int64_t>(0, budget_ - overhead - block) / slot_size_);
+    const auto extra = static_cast<std::size_t>(std::max<std::int64_t>(0, available - free_space_reserve_) / slot_size_);
+    return std::min(absolute, current + std::min(extra, absolute));
+}
+
+bool CacheFile::growToSlots(std::size_t slots)
+{
+    growth_error_.clear();
+    const auto current = slots_.load();
+    if (slots <= current) return true;
+    if (!adaptive_ || slots > growthLimitSlots()) {
+        growth_error_ = "Cache growth constrained by absolute maximum or free-space reserve.";
+        return false;
+    }
+    const auto previous = static_cast<std::int64_t>(current) * slot_size_;
+    const auto capacity = static_cast<std::int64_t>(slots) * slot_size_;
+    const int result = posix_fallocate(fd_, previous, capacity - previous);
+    if (result != 0 || allocatedBytes() > budget_) {
+        // A failed allocation may have appended extents. No published slot uses
+        // them; truncate only that unpublished suffix under the same I/O lock.
+        if (ftruncate(fd_, previous) != 0) systemFailure("rollback unpublished cache expansion");
+        growth_error_ = result ? std::system_error(result, std::generic_category()).what()
+            : "Filesystem allocation exceeded the absolute cache maximum.";
+        return false;
+    }
+    slots_ = slots;
+    return true;
 }
 
 CacheFile::~CacheFile()
@@ -145,7 +191,7 @@ std::int64_t CacheFile::allocatedBytes() const
 
 void CacheFile::write(std::int64_t offset, const char* bytes, std::size_t length)
 {
-    const auto capacity = static_cast<std::int64_t>(slots_) * slot_size_;
+    const auto capacity = static_cast<std::int64_t>(slots_.load()) * slot_size_;
     if (offset < 0 || offset > capacity || length > static_cast<std::uint64_t>(capacity - offset)) {
         throw std::out_of_range("Write would exceed fixed cache capacity.");
     }
@@ -163,7 +209,7 @@ void CacheFile::write(std::int64_t offset, const char* bytes, std::size_t length
 
 void CacheFile::read(std::int64_t offset, char* bytes, std::size_t length) const
 {
-    const auto capacity = static_cast<std::int64_t>(slots_) * slot_size_;
+    const auto capacity = static_cast<std::int64_t>(slots_.load()) * slot_size_;
     if (offset < 0 || offset > capacity || length > static_cast<std::uint64_t>(capacity - offset)) {
         throw std::out_of_range("Read exceeds fixed cache capacity.");
     }

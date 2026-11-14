@@ -15,6 +15,7 @@ struct CacheDiskState {
     std::atomic<int> active_storages{0};
     std::atomic<std::uint64_t> jobs{0};
     std::atomic<std::uint64_t> work_microseconds{0};
+    std::atomic<std::uint64_t> verified_video_bytes{0};
     void fail(const std::string& message);
     std::string error() const;
 private:

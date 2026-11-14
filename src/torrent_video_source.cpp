@@ -29,7 +29,7 @@ TorrentVideoSource::TorrentVideoSource(const std::string& magnet,
     // Demuxers may read indexes and analyze packets before exposing tracks.
     // Permit bounded startup analysis, always less than the whole selected file.
     probe_limit_ = std::min<std::int64_t>(video_size_ - video_size_ / 10,
-        std::max<std::int64_t>(8 * 1024 * 1024, std::min<std::int64_t>(16 * 1024 * 1024, capacity_ * 8)));
+        std::max<std::int64_t>(8 * 1024 * 1024, std::min<std::int64_t>(16 * 1024 * 1024, capacity_.load() * 8)));
     status_.cache = cache_->diagnostics();
     worker_ = std::thread(&TorrentVideoSource::run, this);
 }
@@ -172,6 +172,7 @@ void TorrentVideoSource::run()
             if (applied_rate != rate) { cache_->setPlaybackRate(rate); applied_rate = rate; }
             cache_->pump(std::chrono::milliseconds{0});
             auto diagnostics = cache_->diagnostics();
+            capacity_ = diagnostics.physical_capacity_bytes;
             {
                 std::unique_lock<std::mutex> lock(read_signal_->mutex);
                 status_.cache = std::move(diagnostics);
@@ -238,6 +239,7 @@ void TorrentVideoSource::seekToByte(std::int64_t offset, PlaybackMovement moveme
 
 void TorrentVideoSource::setContainer(ContainerInfo container)
 {
+    cache_->setProtectedMetadata(container.metadata_ranges);
     std::lock_guard<std::mutex> lock(read_signal_->mutex);
     container_ = std::move(container);
 }
@@ -257,6 +259,38 @@ void TorrentVideoSource::markPlaybackActive()
     probing_ = false;
 }
 
+void TorrentVideoSource::observePlayback(bool decoded_frame, bool buffering)
+{
+    std::lock_guard<std::mutex> lock(read_signal_->mutex);
+    const auto now = Clock::now();
+    auto& metrics = status_.playback;
+    if (playback_buffering_) metrics.buffering_microseconds +=
+        std::chrono::duration_cast<std::chrono::microseconds>(now - last_playback_observation_).count();
+    if (decoded_frame && metrics.first_frame_microseconds == 0) metrics.first_frame_microseconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(now - created_).count();
+    // Startup time and user pauses are distinct from post-start playback stalls.
+    if (buffering && !playback_buffering_ && metrics.first_frame_microseconds) ++metrics.stalls;
+    playback_buffering_ = buffering;
+    last_playback_observation_ = now;
+}
+
+void TorrentVideoSource::beginUserSeek()
+{
+    std::lock_guard<std::mutex> lock(read_signal_->mutex);
+    user_seek_started_ = Clock::now();
+}
+
+void TorrentVideoSource::completeUserSeek()
+{
+    std::lock_guard<std::mutex> lock(read_signal_->mutex);
+    if (!user_seek_started_) return;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - *user_seek_started_).count();
+    ++status_.playback.completed_seeks;
+    status_.playback.seek_microseconds += elapsed;
+    status_.playback.maximum_seek_microseconds = std::max<std::uint64_t>(status_.playback.maximum_seek_microseconds, elapsed);
+    user_seek_started_.reset();
+}
+
 void TorrentVideoSource::setEstimatedRate(double bytes_per_second)
 {
     if (!std::isfinite(bytes_per_second) || bytes_per_second <= 0 || bytes_per_second > 1e12) return;
@@ -266,13 +300,16 @@ void TorrentVideoSource::setEstimatedRate(double bytes_per_second)
 
 void TorrentVideoSource::prebuffer()
 {
-    const auto targets = bufferTargets();
     double rate;
     { std::lock_guard<std::mutex> lock(read_signal_->mutex); rate = requested_rate_; }
-    const auto target = std::min<std::int64_t>({video_size_, capacity_ / 3,
-        std::max<std::int64_t>(16384, static_cast<std::int64_t>(rate * targets.high_seconds))});
     std::array<unsigned char, 16384> bytes{};
-    for (std::int64_t offset = 0; offset < target;) {
+    for (std::int64_t offset = 0;;) {
+        const auto snapshot = status();
+        const auto seconds = snapshot.cache.adaptive_budget ? snapshot.cache.adaptive_target.startup_seconds
+            : snapshot.buffer_targets.high_seconds;
+        const auto target = std::min<std::int64_t>({video_size_, capacity_.load() / 3,
+            std::max<std::int64_t>(16384, static_cast<std::int64_t>(rate * seconds))});
+        if (offset >= target) break;
         offset += readVerified(offset, bytes.data(), std::min<std::int64_t>(bytes.size(), target - offset), ReadPurpose::prebuffer);
     }
 }
@@ -286,8 +323,13 @@ BufferWatermarks TorrentVideoSource::bufferTargets() const
 BufferWatermarks TorrentVideoSource::bufferTargetsLocked() const
 {
     const auto remaining = std::max<std::int64_t>(0, video_size_ - status_.cache.playback_position);
-    const auto forward_capacity = std::min({remaining, capacity_ / 3,
+    const auto forward_capacity = std::min({remaining, capacity_.load() / 3,
         std::max<std::int64_t>(0, status_.cache.desired.end_byte - status_.cache.playback_position)});
+    if (status_.cache.adaptive_budget) {
+        const auto& targets = status_.cache.adaptive_target;
+        const auto high = std::min(targets.resume_seconds, forward_capacity / std::max(1.0, requested_rate_));
+        return {std::min(targets.emergency_seconds, high / 3), high};
+    }
     return bufferWatermarks(requested_rate_, status_.cache.network_bytes_per_second, forward_capacity);
 }
 

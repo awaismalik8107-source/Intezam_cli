@@ -201,6 +201,7 @@ void runsSlidingCache(const fs::path& root, TorrentKind kind)
     const auto videos = intezam::detectVideoFiles(*client_metadata);
     require(videos.size() == 1, "selected fixture video");
     intezam::CacheStreamOptions options;
+    options.budget.mode = intezam::CacheBudgetMode::automatic;
     options.root = root;
     options.settings = loopbackSettings();
     options.playback_bytes_per_second = 65536;
