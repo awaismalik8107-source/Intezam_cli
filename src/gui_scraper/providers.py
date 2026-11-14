@@ -205,30 +205,48 @@ class NyaaSourceProvider(SourceProvider):
     def normalize_result(self, raw_result: ScrapedItem) -> TorrentRelease:
         tech = infer_technical_metadata(raw_result.title)
         parsed = parse_release_title(raw_result.title)
-        info_hash = raw_result.info_hash or extract_info_hash(raw_result.magnet_link or raw_result.resolved_link)
-        view_id = (raw_result.view_url or "").rstrip("/").split("/")[-1] or str(raw_result.id)
+        raw_hash = raw_result.info_hash or extract_info_hash(raw_result.magnet_link or raw_result.resolved_link)
+        info_hash = raw_hash.lower() if len(raw_hash) == 40 else raw_hash
+        view_id = (
+            raw_result.torrent_id
+            or (raw_result.view_url or "").rstrip("/").split("/")[-1]
+            or str(raw_result.id)
+        )
         return TorrentRelease(
             release_id=f"nyaa:{view_id}",
             provider_id=self.provider_id,
             provider_name=self.provider_name,
             title=raw_result.title,
-            magnet_uri=raw_result.magnet_link or "",
-            torrent_url=raw_result.torrent_link or "",
+            release_title=raw_result.release_title or raw_result.title,
+            display_title=raw_result.display_title,
+            alternative_title=raw_result.alternative_title,
+            torrent_id=raw_result.torrent_id or view_id,
+            row_class=raw_result.row_class or "default",
+            category_code=raw_result.category_code or raw_result.category or "1_2",
+            category_name=raw_result.category_name,
+            magnet_uri=raw_result.magnet_uri or raw_result.magnet_link or "",
+            torrent_url=raw_result.torrent_url or raw_result.torrent_link or "",
             view_url=raw_result.view_url or "",
+            details_url=raw_result.details_url or raw_result.view_url or "",
             info_hash=info_hash,
+            magnet_tracker_count=raw_result.magnet_tracker_count,
+            trackers=list(raw_result.trackers) if raw_result.trackers else [],
             size=raw_result.size,
+            file_size=raw_result.file_size or raw_result.size,
             size_bytes=parse_size_to_bytes(raw_result.size),
             date=raw_result.date,
+            upload_date=raw_result.upload_date or raw_result.date,
+            timestamp=raw_result.timestamp,
             relative_date=raw_result.relative_date,
             seeders=raw_result.seeders,
             leechers=raw_result.leechers,
             downloads=raw_result.downloads,
-            category=raw_result.category or "1_0",
+            category=raw_result.category_code or raw_result.category or "1_0",
             resolution=raw_result.resolution or tech["resolution"],
             codec=raw_result.codec or tech["codec"],
             container=tech["container"],
             subtitle_lang=raw_result.subtitle_lang or tech["subtitle_lang"],
-            release_group=parsed.release_group,
+            release_group=raw_result.release_group or parsed.release_group,
             is_valid=raw_result.is_valid,
             verification_msg=raw_result.verification_msg,
             mirror_providers=[self.provider_name],

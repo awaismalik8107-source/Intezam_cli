@@ -33,6 +33,42 @@ class ScrapedItem:
     resolution: str = ""
     codec: str = ""
     subtitle_lang: str = ""
+    release_title: str = ""
+    display_title: str = ""
+    alternative_title: str = ""
+    release_group: str = ""
+    torrent_id: str = ""
+    row_class: str = ""
+    category_code: str = ""
+    category_name: str = ""
+    details_url: str = ""
+    torrent_url: str = ""
+    magnet_uri: str = ""
+    file_size: str = ""
+    upload_date: str = ""
+    timestamp: str = ""
+    magnet_tracker_count: int = 0
+    trackers: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.release_title and self.title:
+            self.release_title = self.title
+        if not self.details_url and self.view_url:
+            self.details_url = self.view_url
+        if not self.torrent_url and self.torrent_link:
+            self.torrent_url = self.torrent_link
+        if not self.magnet_uri and self.magnet_link:
+            self.magnet_uri = self.magnet_link
+        if not self.file_size and self.size:
+            self.file_size = self.size
+        if not self.upload_date and self.date:
+            self.upload_date = self.date
+        if not self.category_code and self.category:
+            self.category_code = self.category
+        if not self.category and self.category_code:
+            self.category = self.category_code
+        if self.trackers and self.magnet_tracker_count == 0:
+            self.magnet_tracker_count = len(self.trackers)
 
 
 @dataclass(slots=True)
@@ -158,6 +194,19 @@ class TorrentRelease:
     container: str = ""
     subtitle_lang: str = ""
     release_group: str = ""
+    release_title: str = ""
+    display_title: str = ""
+    alternative_title: str = ""
+    torrent_id: str = ""
+    row_class: str = ""
+    category_code: str = ""
+    category_name: str = ""
+    details_url: str = ""
+    file_size: str = ""
+    upload_date: str = ""
+    timestamp: str = ""
+    magnet_tracker_count: int = 0
+    trackers: list[str] = field(default_factory=list)
     is_valid: bool = True
     verification_msg: str = ""
     mirror_providers: list[str] = field(default_factory=list)
@@ -185,11 +234,27 @@ class TorrentRelease:
             downloads=self.downloads,
             provider_id=self.provider_id,
             provider_name=self.provider_name,
-            category=self.category,
+            category=self.category or self.category_code,
             info_hash=self.info_hash,
             resolution=self.resolution,
             codec=self.codec,
             subtitle_lang=self.subtitle_lang,
+            release_title=self.release_title or self.title,
+            display_title=self.display_title,
+            alternative_title=self.alternative_title,
+            release_group=self.release_group,
+            torrent_id=self.torrent_id,
+            row_class=self.row_class,
+            category_code=self.category_code or self.category,
+            category_name=self.category_name,
+            details_url=self.view_url,
+            torrent_url=self.torrent_url,
+            magnet_uri=self.magnet_uri,
+            file_size=self.size or "N/A",
+            upload_date=self.date or "N/A",
+            timestamp=self.timestamp,
+            magnet_tracker_count=self.magnet_tracker_count or len(self.trackers),
+            trackers=list(self.trackers),
         )
 
     def to_dict(self) -> dict[str, Any]:

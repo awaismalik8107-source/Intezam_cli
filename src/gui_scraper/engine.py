@@ -225,43 +225,155 @@ class ConfigurableTableScraper:
         has_next = (next_link is not None and not next_disabled) or (current_page < max_page)
         return (has_next, max_page)
 
+    include_all_statuses: bool = False
+
+    @staticmethod
+    def derive_nyaa_title_fields(release_title: str) -> tuple[str, str, str]:
+        """Derive ``(display_title, release_group, alternative_title)`` without mutating ``release_title``."""
+        raw = (release_title or "").strip()
+        if not raw:
+            return ("Untitled", "", "")
+
+        alternative_title = ""
+        main_part = raw
+        if "|" in raw:
+            parts = [p.strip() for p in raw.split("|") if p.strip()]
+            if len(parts) >= 2:
+                main_part = parts[0]
+                alternative_title = " | ".join(parts[1:])
+
+        main_part = re.sub(r"\.(?:mkv|mp4|avi|cbz|zip|rar)$", "", main_part, flags=re.IGNORECASE).strip()
+
+        release_group = ""
+        leading_group = re.match(r"^\[([^\[\]]+)\]\s*(.+)$", main_part)
+        if leading_group:
+            release_group = leading_group.group(1).strip()
+            main_part = leading_group.group(2).strip()
+
+        main_part = re.sub(r"\[[0-9A-Fa-f]{8}\]", "", main_part).strip()
+
+        for bracket_match in re.findall(r"\[([^\[\]]+)\]", main_part):
+            candidate = bracket_match.strip()
+            if not release_group and not re.search(
+                r"\b(?:1080p|720p|2160p|480p|4k|bd|web|hevc|av1|x264|x265|h264|h265|aac|opus|flac|sub|subtitle|multi|dual|audio|batch)\b",
+                candidate,
+                re.IGNORECASE,
+            ):
+                release_group = candidate
+        main_part = re.sub(r"\[[^\[\]]*\]", "", main_part).strip()
+
+        def _keep_or_strip_paren(match: re.Match[str]) -> str:
+            inner = match.group(1).strip()
+            if re.fullmatch(r"(?:19|20)\d{2}", inner):
+                return f"({inner})"
+            return ""
+
+        main_part = re.sub(r"\(([^()]*)\)", _keep_or_strip_paren, main_part).strip()
+        main_part = re.sub(
+            r"\s+(?:BD|BDRip|BluRay|WEB-DL|WEBRip|HDTV|2160p|1080p|720p|480p|4K|HEVC|AV1|x264|x265|H\.?264|H\.?265|AAC|Opus|FLAC|10bit|Dual[\s-]*Audio|Multi[\s-]*Audio)\b.*$",
+            "",
+            main_part,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        display_title = re.sub(r"\s{2,}", " ", main_part).strip(" -_/")
+        return (display_title or raw, release_group, alternative_title)
+
+
     def parse_html(
         self,
         html: str,
         base_url: str | None = None,
         start_index: int = 1,
+        include_all_statuses: bool | None = None,
     ) -> list[ScrapedItem]:
-        """Parse Nyaa ``table.torrent-list tbody tr`` rows into validated :class:`ScrapedItem` objects."""
+        """Parse Nyaa ``table.torrent-list`` rows into validated :class:`ScrapedItem` objects."""
+        from urllib.parse import parse_qs, urlsplit
+
         soup = BeautifulSoup(html, "html.parser")
         effective_base = (base_url or self.base_url or BASE_URL).strip()
         selector = self.row_selector.strip() or ROW_SELECTOR
-        rows = soup.select(selector)
-        if not rows and selector != "table tbody tr":
-            rows = soup.select("table tbody tr")
+        all_statuses = (
+            include_all_statuses
+            if include_all_statuses is not None
+            else getattr(self, "include_all_statuses", False)
+        )
+
+        status_selector = (
+            "table.torrent-list tr.default, table.torrent-list tr.success, "
+            "table.torrent-list tr.danger, table.torrent-list tr.warning"
+        )
+        if all_statuses:
+            rows = [r for r in soup.select(status_selector) if r.find_parent("thead") is None]
+        else:
+            rows = [
+                r
+                for r in soup.select("table.torrent-list tr.default")
+                if r.find_parent("thead") is None
+            ]
+
+        # Fallback for generic/synthetic tables that do not use Nyaa row status classes
+        if not rows and not soup.select(status_selector):
+            rows = [r for r in soup.select(selector) if r.find_parent("thead") is None]
+            if not rows and selector != "table tbody tr":
+                rows = [r for r in soup.select("table tbody tr") if r.find_parent("thead") is None]
 
         items: list[ScrapedItem] = []
         idx = start_index - 1
 
         for row in rows:
+            if row.find_parent("thead") is not None:
+                continue
             tds = row.find_all("td")
             if len(tds) < 8:
                 continue
 
-            idx += 1
-
             # 1. Title & View Link (tds[1] / td[colspan="2"])
             title_tag = row.select_one('td[colspan="2"] a[href^="/view/"]:not(.comments)')
             if title_tag is None:
-                title_tag = tds[1].select_one('a[href^="/view/"]:not(.comments)') or tds[1].select_one("a")
-            title = (
+                title_tag = (
+                    tds[1].select_one('a[href^="/view/"]:not(.comments)')
+                    or tds[1].select_one("a:not(.comments)")
+                )
+            if title_tag is None:
+                continue
+
+            release_title = (
                 self._attr_str(title_tag, "title")
-                or (title_tag.get_text(strip=True) if title_tag is not None else "")
-                or "Untitled"
+                or title_tag.get_text(strip=True)
             )
+            if not release_title:
+                continue
+
+            idx += 1
+            display_title, release_group, alternative_title = self.derive_nyaa_title_fields(release_title)
+
             view_href = self._attr_str(title_tag, "href")
             view_url = urljoin(effective_base, view_href) if view_href else ""
+            id_match = re.search(r"/view/(\d+)", view_href)
+            torrent_id = id_match.group(1) if id_match else ""
 
-            # 2. Magnet & .torrent Links (tds[2] / td.text-center)
+            # 2. Category & Row Status (tds[0] & tr class)
+            row_classes = row.get("class") or []
+            if isinstance(row_classes, str):
+                row_classes = row_classes.split()
+            row_class = next(
+                (c for c in row_classes if c in ("default", "success", "danger", "warning")),
+                row_classes[0] if row_classes else "default",
+            )
+
+            cat_cell = tds[0]
+            cat_anchor = cat_cell.select_one('a[href*="c="]') or cat_cell.select_one("a")
+            cat_img = cat_cell.select_one("img.category-icon") or cat_cell.select_one("img")
+            cat_href = self._attr_str(cat_anchor, "href")
+            cat_code_match = re.search(r"[?&]c=([0-9]+_[0-9]+)", cat_href)
+            if not cat_code_match:
+                cat_src = self._attr_str(cat_img, "src")
+                cat_code_match = re.search(r"/([0-9]+_[0-9]+)\.[a-zA-Z0-9]+$", cat_src)
+            category_code = cat_code_match.group(1) if cat_code_match else ""
+            category_name = self._attr_str(cat_anchor, "title") or self._attr_str(cat_img, "alt")
+
+            # 3. Magnet & .torrent Links (tds[2] / td.text-center)
             links_cell = tds[2]
             magnet_tag = links_cell.select_one('a[href^="magnet:?"]') or self._find_anchor_with_icon(
                 links_cell, "fa-magnet"
@@ -274,15 +386,22 @@ class ConfigurableTableScraper:
             torrent_href = self._attr_str(torrent_tag, "href")
             torrent_link = urljoin(effective_base, torrent_href) if torrent_href else ""
 
-            # 3. Size, Date & Peer Metrics (tds[3]..tds[7])
+            raw_hash = extract_info_hash(magnet_link) if magnet_link else ""
+            info_hash = raw_hash.lower() if len(raw_hash) == 40 else raw_hash
+            trackers = parse_qs(urlsplit(magnet_link).query).get("tr", []) if magnet_link else []
+            magnet_tracker_count = len(trackers)
+
+            # 4. Size, Date, Timestamp & Peer Metrics (tds[3]..tds[7])
             size = tds[3].get_text(strip=True) or "N/A"
             date = tds[4].get_text(strip=True) or "N/A"
             relative_date = self._attr_str(tds[4], "title")
+            raw_timestamp = self._attr_str(tds[4], "data-timestamp")
+            timestamp = raw_timestamp if raw_timestamp.isdigit() else ""
             seeders = self._parse_int(tds[5].get_text(strip=True))
             leechers = self._parse_int(tds[6].get_text(strip=True))
             downloads = self._parse_int(tds[7].get_text(strip=True))
 
-            # 4. Link verification (valid if Magnet BTIH OR Nyaa .torrent URL passes)
+            # 5. Link verification (valid if Magnet BTIH OR Nyaa .torrent URL passes)
             is_valid, verification_msg = validate_nyaa_links(magnet_link, torrent_link)
             primary_link = magnet_link or torrent_link
             stats_summary = f"S: {seeders:,} / L: {leechers:,} / D: {downloads:,}"
@@ -290,17 +409,34 @@ class ConfigurableTableScraper:
             items.append(
                 ScrapedItem(
                     id=idx,
-                    title=title,
+                    title=release_title,
+                    release_title=release_title,
+                    display_title=display_title,
+                    alternative_title=alternative_title,
+                    release_group=release_group,
+                    torrent_id=torrent_id,
+                    row_class=row_class,
+                    category_code=category_code,
+                    category_name=category_name,
                     size=size,
+                    file_size=size,
                     date=date,
+                    upload_date=date,
+                    timestamp=timestamp,
                     stats=stats_summary,
                     raw_link=primary_link,
                     resolved_link=primary_link,
                     is_valid=is_valid,
                     verification_msg=verification_msg,
                     view_url=view_url,
+                    details_url=view_url,
                     magnet_link=magnet_link,
+                    magnet_uri=magnet_link,
                     torrent_link=torrent_link,
+                    torrent_url=torrent_link,
+                    info_hash=info_hash,
+                    magnet_tracker_count=magnet_tracker_count,
+                    trackers=trackers,
                     relative_date=relative_date,
                     seeders=seeders,
                     leechers=leechers,

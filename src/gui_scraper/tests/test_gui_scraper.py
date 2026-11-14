@@ -987,4 +987,252 @@ def test_multi_provider_discovery_deduplication_and_failure_isolation(tmp_path: 
     assert any("SubsPlease" in s["provider_name"] for s in sources_resp["provider_statuses"])
 
 
+FIXTURES_DIR = Path(__file__).parent / "fixtures"
+EXPECTED_DEFAULT_ROW_MAGNET = (
+    "magnet:?xt=urn:btih:139a24d3f1f57ca2c371ecd55ecffacef0576ed5"
+    "&dn=%5BPHTMini%5D%20Your%20Name.%20%282016%29%20%28BD%201080p%20AV1%20Opus%205.1%29"
+    "%20%28Multi-Audio%29%20%28German%2FDeutsch%29%20%7C%20Kimi%20no%20Na%20wa."
+    "&tr=http%3A%2F%2Fnyaa.tracker.wf%3A7777%2Fannounce"
+    "&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce"
+    "&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce"
+    "&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce"
+    "&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce"
+)
+
+
+def _load_fixture(name: str) -> str:
+    return (FIXTURES_DIR / name).read_text(encoding="utf-8")
+
+
+def test_nyaa_default_row_extraction() -> None:
+    """Assert every expected Stage 4 value from the authoritative nyaa_default_row.html fixture."""
+    from gui_scraper.providers import NyaaSourceProvider
+
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    items = scraper.parse_html(html)
+
+    assert len(items) == 1
+    item = items[0]
+
+    assert item.row_class == "default"
+    assert item.category_code == "1_2"
+    assert item.category_name == "Anime - English-translated"
+    assert item.torrent_id == "2184213"
+    assert item.details_url == "https://nyaa.si/view/2184213"
+    assert item.view_url == "https://nyaa.si/view/2184213"
+    assert item.release_title == (
+        "[PHTMini] Your Name. (2016) (BD 1080p AV1 Opus 5.1) "
+        "(Multi-Audio) (German/Deutsch) | Kimi no Na wa."
+    )
+    assert item.display_title == "Your Name. (2016)"
+    assert item.alternative_title == "Kimi no Na wa."
+    assert item.release_group == "PHTMini"
+    assert item.torrent_url == "https://nyaa.si/download/2184213.torrent"
+    assert item.torrent_link == "https://nyaa.si/download/2184213.torrent"
+    assert item.magnet_uri == EXPECTED_DEFAULT_ROW_MAGNET
+    assert item.magnet_link == EXPECTED_DEFAULT_ROW_MAGNET
+    assert item.info_hash == "139a24d3f1f57ca2c371ecd55ecffacef0576ed5"
+    assert item.magnet_tracker_count == 5
+    assert item.file_size == "2.1 GiB"
+    assert item.size == "2.1 GiB"
+    assert item.upload_date == "2026-11-09 07:22"
+    assert item.date == "2026-11-09 07:22"
+    assert item.timestamp == "1794190924"
+    assert item.seeders == 7
+    assert item.leechers == 5
+    assert item.downloads == 73
+
+    # Verify NyaaSourceProvider.normalize_result preserves every field on TorrentRelease
+    provider = NyaaSourceProvider(scraper=scraper)
+    release = provider.normalize_result(item)
+    assert release.row_class == "default"
+    assert release.category_code == "1_2"
+    assert release.category_name == "Anime - English-translated"
+    assert release.torrent_id == "2184213"
+    assert release.details_url == "https://nyaa.si/view/2184213"
+    assert release.release_title == item.release_title
+    assert release.display_title == "Your Name. (2016)"
+    assert release.alternative_title == "Kimi no Na wa."
+    assert release.release_group == "PHTMini"
+    assert release.torrent_url == "https://nyaa.si/download/2184213.torrent"
+    assert release.magnet_uri == EXPECTED_DEFAULT_ROW_MAGNET
+    assert release.info_hash == "139a24d3f1f57ca2c371ecd55ecffacef0576ed5"
+    assert release.magnet_tracker_count == 5
+    assert release.file_size == "2.1 GiB"
+    assert release.upload_date == "2026-11-09 07:22"
+    assert release.timestamp == "1794190924"
+    assert release.seeders == 7
+    assert release.leechers == 5
+    assert release.downloads == 73
+
+
+def test_full_release_title_preserved() -> None:
+    """Confirm the raw release title is never truncated or overwritten."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    expected_raw = (
+        "[PHTMini] Your Name. (2016) (BD 1080p AV1 Opus 5.1) "
+        "(Multi-Audio) (German/Deutsch) | Kimi no Na wa."
+    )
+    assert item.release_title == expected_raw
+    assert item.title == expected_raw
+
+
+def test_display_title_extraction() -> None:
+    """Confirm display_title, release_group, and alternative_title are derived cleanly without mutating release_title."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert item.display_title == "Your Name. (2016)"
+    assert item.release_group == "PHTMini"
+    assert item.alternative_title == "Kimi no Na wa."
+    assert item.release_title.startswith("[PHTMini] Your Name. (2016)")
+
+
+def test_magnet_uri_preserved_exactly() -> None:
+    """Confirm &amp; is decoded to & while all percent-encoded query parameters remain intact."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert "&amp;" not in item.magnet_uri
+    assert item.magnet_uri == EXPECTED_DEFAULT_ROW_MAGNET
+    assert "dn=%5BPHTMini%5D%20Your%20Name.%20%282016%29" in item.magnet_uri
+
+
+def test_all_five_trackers_preserved() -> None:
+    """Confirm all 5 trackers in the magnet link are preserved in exact order."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert item.magnet_tracker_count == 5
+    assert item.trackers == [
+        "http://nyaa.tracker.wf:7777/announce",
+        "udp://open.stealth.si:80/announce",
+        "udp://tracker.opentrackr.org:1337/announce",
+        "udp://exodus.desync.com:6969/announce",
+        "udp://tracker.torrent.eu.org:451/announce",
+    ]
+
+
+def test_category_and_status_extraction() -> None:
+    """Confirm category_code, category_name, and row_class are extracted accurately."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert item.category_code == "1_2"
+    assert item.category_name == "Anime - English-translated"
+    assert item.row_class == "default"
+
+
+def test_timestamp_and_peer_counts() -> None:
+    """Confirm timestamp and integer peer counts (seeders, leechers, downloads) are extracted."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert item.timestamp == "1794190924"
+    assert item.upload_date == "2026-11-09 07:22"
+    assert item.seeders == 7
+    assert isinstance(item.seeders, int)
+    assert item.leechers == 5
+    assert isinstance(item.leechers, int)
+    assert item.downloads == 73
+    assert isinstance(item.downloads, int)
+
+
+def test_relative_urls_become_absolute() -> None:
+    """Confirm relative /view/... and /download/... links are resolved against https://nyaa.si."""
+    html = _load_fixture("nyaa_default_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    item = scraper.parse_html(html)[0]
+
+    assert item.details_url == "https://nyaa.si/view/2184213"
+    assert item.torrent_url == "https://nyaa.si/download/2184213.torrent"
+
+
+def test_multiple_distinct_torrents_preserved() -> None:
+    """Confirm 3 distinct Your Name. (2016) releases with different torrent IDs/hashes are all preserved."""
+    from gui_scraper.providers import NyaaSourceProvider, deduplicate_releases
+
+    html = _load_fixture("nyaa_multiple_distinct_rows.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    items = scraper.parse_html(html)
+
+    assert len(items) == 3
+    assert [i.torrent_id for i in items] == ["2184213", "2184214", "2184215"]
+    assert [i.release_group for i in items] == ["PHTMini", "GroupB", "GroupC"]
+    assert all(i.display_title == "Your Name. (2016)" for i in items)
+    assert len({i.info_hash for i in items}) == 3
+    assert len({i.magnet_uri for i in items}) == 3
+    assert len({i.torrent_url for i in items}) == 3
+
+    # Verify provider normalization & deduplication also preserve all 3 distinct hashes
+    provider = NyaaSourceProvider(scraper=scraper)
+    releases = [provider.normalize_result(i) for i in items]
+    deduped = deduplicate_releases(releases)
+    assert len(deduped) == 3
+
+
+def test_missing_magnet_does_not_remove_torrent() -> None:
+    """Confirm a row with a valid .torrent download link and no magnet link is still extracted."""
+    html = _load_fixture("nyaa_missing_magnet_row.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    items = scraper.parse_html(html)
+
+    assert len(items) == 1
+    item = items[0]
+    assert item.torrent_id == "2184300"
+    assert item.magnet_uri == ""
+    assert item.magnet_link == ""
+    assert item.info_hash == ""
+    assert item.magnet_tracker_count == 0
+    assert item.torrent_url == "https://nyaa.si/download/2184300.torrent"
+    assert item.is_valid is True
+
+
+def test_other_valid_row_statuses() -> None:
+    """Confirm default mode extracts tr.default while include_all_statuses extracts default, success, and danger."""
+    html = _load_fixture("nyaa_status_rows.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+
+    default_only = scraper.parse_html(html)
+    assert len(default_only) == 1
+    assert default_only[0].row_class == "default"
+    assert default_only[0].torrent_id == "2184213"
+
+    all_rows = scraper.parse_html(html, include_all_statuses=True)
+    assert len(all_rows) == 3
+    assert [r.row_class for r in all_rows] == ["default", "success", "danger"]
+    assert [r.torrent_id for r in all_rows] == ["2184213", "2184220", "2184221"]
+
+
+def test_malformed_row_is_handled_safely() -> None:
+    """Confirm malformed rows (too few cells, missing title link, non-numeric peers) do not crash extraction."""
+    html = _load_fixture("nyaa_malformed_rows.html")
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    items = scraper.parse_html(html)
+
+    assert len(items) == 2
+    bad_numeric_row, valid_row = items[0], items[1]
+
+    assert bad_numeric_row.torrent_id == "2184998"
+    assert bad_numeric_row.timestamp == ""
+    assert bad_numeric_row.seeders == 0
+    assert bad_numeric_row.leechers == 0
+    assert bad_numeric_row.downloads == 0
+
+    assert valid_row.torrent_id == "2184999"
+    assert valid_row.seeders == 9
+    assert valid_row.leechers == 1
+    assert valid_row.downloads == 25
+
+
+
 
