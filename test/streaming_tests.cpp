@@ -227,6 +227,10 @@ void runsSlidingCache(const fs::path& root, TorrentKind kind)
         reader.reset();
         cache.setPlaybackRate(262144); // Fill available slots after the reader releases one.
         cache.pump(10ms);
+        // Batch reclamation may retain the released piece until space is needed.
+        // Force another cold window before testing eviction and re-download.
+        cache.seek(10 * 1024 * 1024);
+        waitForRange(cache, 10 * 1024 * 1024);
         verifyMeasuredDisk(cache);
         require(cache.diagnostics().torrent_rebuilds > 0, "eviction synchronized through public resume API");
 

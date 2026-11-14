@@ -32,11 +32,17 @@ PieceGeometry geometryFor(const std::shared_ptr<const lt::torrent_info>& metadat
 
 class VerifiedPiecePlugin final : public lt::torrent_plugin {
 public:
-    explicit VerifiedPiecePlugin(std::shared_ptr<PieceStore> store) : store_(std::move(store)) {}
-    void on_piece_pass(lt::piece_index_t piece) override { store_->markVerified(static_cast<int>(piece)); }
+    VerifiedPiecePlugin(std::shared_ptr<PieceStore> store, std::function<void(int)> notification)
+        : store_(std::move(store)), notification_(std::move(notification)) {}
+    void on_piece_pass(lt::piece_index_t piece) override
+    {
+        store_->markVerified(static_cast<int>(piece));
+        if (notification_) notification_(static_cast<int>(piece));
+    }
     void on_piece_failed(lt::piece_index_t piece) override { store_->invalidate(static_cast<int>(piece)); }
 private:
     std::shared_ptr<PieceStore> store_;
+    std::function<void(int)> notification_;
 };
 
 } // namespace
@@ -51,11 +57,12 @@ lt::settings_pack streamingSessionSettings()
 TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
     std::shared_ptr<const lt::torrent_info> metadata, const VideoFile& video, const CacheStreamOptions& options)
     : metadata_(std::move(metadata)), geometry_(geometryFor(metadata_, video)), options_(options),
-      store_(PieceStore::create(geometry_, options.root)),
+      store_(PieceStore::create(geometry_, options.root, options.reserved_slots)),
       controller_(geometry_, store_->slotCount(), options.playback_bytes_per_second),
       disk_state_(std::make_shared<CacheDiskState>())
 {
     if (options.stall_timeout <= 0ms) throw std::invalid_argument("Cache stall timeout must be positive.");
+    updateReservation(options.playback_bytes_per_second);
     lt::error_code error;
     auto params = lt::parse_magnet_uri(magnet, error);
     if (error) throw std::invalid_argument("Invalid cache magnet: " + error.message());
@@ -79,8 +86,10 @@ TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
     session_params.settings.set_int(lt::settings_pack::min_reconnect_time, 1);
     session_params.disk_io_constructor = cacheDiskConstructor(store_, geometry_, disk_state_);
     session_ = std::make_unique<lt::session>(std::move(session_params));
-    store_->reconcile(controller_.window().pieces);
-    addTorrent(std::move(params));
+    const auto initial = planAdmissions();
+    store_->setProtectedPieces(initial.required);
+    store_->admit(initial.required, initial.prefetch);
+    addTorrent(std::move(params), initial);
     schedule();
 }
 
@@ -117,8 +126,8 @@ lt::add_torrent_params TorrentCacheSession::safeParams(lt::add_torrent_params pa
         if (!blocks.none_set()) params.unfinished_pieces.emplace(lt::piece_index_t{piece}, std::move(blocks));
     }
     params.extensions.clear();
-    params.extensions.push_back([store = store_](const lt::torrent_handle&, lt::client_data_t) {
-        return std::make_shared<VerifiedPiecePlugin>(store);
+    params.extensions.push_back([store = store_, notification = options_.on_piece_verified](const lt::torrent_handle&, lt::client_data_t) {
+        return std::make_shared<VerifiedPiecePlugin>(store, notification);
     });
     for (const auto& peer : known_peers_) {
         if (std::find(params.peers.begin(), params.peers.end(), peer) == params.peers.end()) params.peers.push_back(peer);
@@ -126,7 +135,7 @@ lt::add_torrent_params TorrentCacheSession::safeParams(lt::add_torrent_params pa
     return params;
 }
 
-void TorrentCacheSession::addTorrent(lt::add_torrent_params params)
+void TorrentCacheSession::addTorrent(lt::add_torrent_params params, const AdmissionPlan& plan)
 {
     lt::error_code error;
     torrent_ = session_->add_torrent(safeParams(std::move(params)), error);
@@ -137,7 +146,9 @@ void TorrentCacheSession::addTorrent(lt::add_torrent_params params)
     });
     scheduled_.clear();
     last_torrent_bytes_ = 0;
-    schedule(); // publish reserved piece priorities before leaving upload-only mode
+    // Storage was admitted by the constructor or quiescent rebuild. Publishing
+    // priorities here must never recursively initiate another rebuild.
+    applyPriorities(plan);
     torrent_.unset_flags(lt::torrent_flags::upload_mode);
     torrent_.resume();
     for (const auto& peer : known_peers_) torrent_.connect_peer(peer);
@@ -182,8 +193,10 @@ void TorrentCacheSession::waitUntil(const std::function<bool()>& complete)
     }
 }
 
-void TorrentCacheSession::rebuild(const std::vector<int>& desired)
+void TorrentCacheSession::rebuild(const AdmissionPlan& plan)
 {
+    const auto started = Clock::now();
+    const auto resident_before = store_->residentPieces().size();
     torrent_.pause();
     bool paused = false;
     const auto deadline = Clock::now() + 10s;
@@ -209,15 +222,34 @@ void TorrentCacheSession::rebuild(const std::vector<int>& desired)
     }
     session_->remove_torrent(torrent_);
     waitUntil([&] { return disk_state_->active_storages.load() == 0; });
-    store_->reconcile(desired);
-    addTorrent(std::move(*resume));
+    const auto evicted = store_->reclaimOutside(plan.keep);
+    store_->admit(plan.required, plan.prefetch);
+    performance_.pieces_evicted += evicted.size();
+    performance_.pieces_admitted += store_->residentPieces().size() - (resident_before - evicted.size());
+    addTorrent(std::move(*resume), plan);
     ++rebuilds_;
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count();
+    performance_.rebuild_microseconds += elapsed;
+    performance_.maximum_rebuild_microseconds = std::max<std::uint64_t>(performance_.maximum_rebuild_microseconds, elapsed);
 }
 
 void TorrentCacheSession::schedule()
 {
+    const auto plan = planAdmissions();
+    const VideoRange bounds{plan.window.begin_byte, plan.window.end_byte - plan.window.begin_byte};
+    if (last_window_ != bounds) { ++performance_.window_movements; last_window_ = bounds; }
+    store_->setProtectedPieces(plan.required);
+    const auto admitted = store_->admit(plan.required, plan.prefetch);
+    if (shouldRebuild(plan, admitted)) rebuild(plan);
+    applyPriorities(plan);
+}
+
+TorrentCacheSession::AdmissionPlan TorrentCacheSession::planAdmissions()
+{
     const auto urgent = urgentPieces();
-    auto desired = controller_.window(urgent).pieces;
+    const auto window = controller_.planWindow(urgent);
+    planned_window_ = window;
+    auto desired = window.pieces;
     for (int piece : urgent) {
         if (std::find(desired.begin(), desired.end(), piece) == desired.end()) desired.push_back(piece);
     }
@@ -230,11 +262,32 @@ void TorrentCacheSession::schedule()
         };
         return rank(left) < rank(right);
     });
-    if (store_->needsEviction(desired)) rebuild(desired);
-    else store_->reconcile(desired);
+    AdmissionPlan plan{window, urgent, {}, desired};
+    const auto begin = window.current_segment * controller_.segmentSize();
+    const auto current_pieces = geometry_.piecesForRange(begin, std::min(controller_.segmentSize(), geometry_.video_size - begin));
+    for (int piece : current_pieces) {
+        if (std::find(plan.required.begin(), plan.required.end(), piece) == plan.required.end()) plan.required.push_back(piece);
+    }
+    for (int piece : desired) {
+        if (std::find(plan.required.begin(), plan.required.end(), piece) == plan.required.end()) plan.prefetch.push_back(piece);
+    }
+    return plan;
+}
 
+bool TorrentCacheSession::shouldRebuild(const AdmissionPlan& plan, const AdmissionResult& admission) const
+{
+    if (admission.deferred_required.empty() && admission.deferred_prefetch.empty()) return false;
+    const auto eligible = store_->reclaimablePieces(plan.keep).size();
+    if (eligible == 0) return false; // pins cannot justify an empty rebuild
+    if (!admission.deferred_required.empty()) return true;
+    return eligible >= std::max<std::size_t>(2, store_->reservedSlots());
+}
+
+void TorrentCacheSession::applyPriorities(const AdmissionPlan& plan)
+{
     std::vector<int> admitted;
-    for (int piece : desired) if (store_->contains(piece)) admitted.push_back(piece);
+    for (int piece : plan.required) if (store_->contains(piece)) admitted.push_back(piece);
+    for (int piece : plan.prefetch) if (store_->contains(piece)) admitted.push_back(piece);
     if (admitted == scheduled_) return;
     torrent_.clear_piece_deadlines();
     std::vector<lt::download_priority_t> priorities(metadata_->num_pieces(), lt::dont_download);
@@ -312,7 +365,9 @@ bool TorrentCacheSession::seek(std::int64_t byte_offset)
 {
     std::lock_guard<std::mutex> control(control_mutex_);
     const bool hit = store_->isRangeCached(byte_offset, 1);
-    updatePosition(byte_offset);
+    controller_.reposition(byte_offset);
+    last_progress_ = Clock::now();
+    schedule();
     return hit;
 }
 
@@ -333,15 +388,31 @@ void TorrentCacheSession::setPlaybackRate(double bytes_per_second)
 {
     std::lock_guard<std::mutex> control(control_mutex_);
     controller_.updateVideoBitrate(bytes_per_second);
+    updateReservation(bytes_per_second);
     schedule();
 }
 
-void TorrentCacheSession::updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand)
+void TorrentCacheSession::updateReservation(double bytes_per_second)
+{
+    auto reserved = options_.reserved_slots.value_or(PieceStore::automaticReservation(store_->slotCount()));
+    if (!options_.reserved_slots) {
+        const auto coverage = dataCapacity() / bytes_per_second;
+        if (coverage < 1.0 || (store_->reservedSlots() == 0 && coverage < 1.25)) reserved = 0;
+    }
+    // Changing the target never discards a live slot. Any reservation debt is
+    // repaid only when future admissions require the normal quiescent boundary.
+    store_->setReservedSlots(reserved);
+    controller_.updateCapacity(store_->slotCount() - reserved);
+}
+
+void TorrentCacheSession::updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand,
+                                           PlaybackMovement movement)
 {
     std::lock_guard<std::mutex> control(control_mutex_);
     if (demand) geometry_.piecesForRange(demand->offset, demand->length);
-    if (playback_offset != controller_.playbackPosition()) {
-        controller_.updatePlaybackPosition(playback_offset);
+    if (movement == PlaybackMovement::seek || playback_offset != controller_.playbackPosition()) {
+        if (movement == PlaybackMovement::seek) controller_.reposition(playback_offset);
+        else controller_.updatePlaybackPosition(playback_offset);
         last_progress_ = Clock::now();
     }
     read_demand_ = demand;
@@ -358,7 +429,7 @@ CacheDiagnostics TorrentCacheSession::diagnostics() const
 {
     std::lock_guard<std::mutex> control(control_mutex_);
     const auto urgent = urgentPieces();
-    const auto window = controller_.window(urgent);
+    const auto window = *planned_window_;
     auto required = window.pieces;
     for (int piece : urgent) if (std::find(required.begin(), required.end(), piece) == required.end()) required.push_back(piece);
     std::set<int> in_flight;
@@ -389,11 +460,20 @@ CacheDiagnostics TorrentCacheSession::diagnostics() const
         }
     }
     const double buffered = forwardBufferSeconds();
+    auto performance = performance_;
+    const auto inventory = store_->inventory();
+    performance.total_slots = inventory.total;
+    performance.free_slots = inventory.free;
+    performance.reserved_slots = inventory.reserved_target;
+    performance.protected_slots = inventory.protected_slots;
+    performance.pinned_slots = inventory.pinned_slots;
+    performance.disk_jobs = disk_state_->jobs.load();
+    performance.disk_microseconds = disk_state_->work_microseconds.load();
     return {window, controller_.playbackPosition(), store_->budgetBytes(), store_->allocatedBytes(),
             received_bytes_, store_->residentPieces().size(), store_->verifiedPieces().size(), in_flight.size(),
             pending - std::min(pending, in_flight.size()),
             verified_segments, downloading_segments, deferred, rebuilds_, controller_.networkSpeed(),
-            controller_.videoBitrate(), buffered, buffered > 0, urgent.size()};
+            controller_.videoBitrate(), buffered, buffered > 0, urgent.size(), performance};
 }
 
 } // namespace intezam

@@ -181,6 +181,9 @@ void testsBridge(const fs::path& file)
     source->cancelPendingReads();
     require(waiting.wait_for(1s) == std::future_status::ready && waiting.get() == 0, "seek cancellation wakes blocked read");
     source->resumeReads();
+    const auto measured = source->status().performance;
+    require(measured.cache_hits >= 1001 && measured.cache_misses >= 3, "read metrics classify each request once");
+    require(measured.wait_microseconds >= 300000 && measured.stalls >= 2, "interruption/throttling waits are measured");
     checkDisk(*source);
     const auto directory = source->directory();
     source->stop();
@@ -246,6 +249,17 @@ void playsContainer(const fs::path& file, bool controls)
         waitUntil([&] { auto s = status(); return s.time_ms >= 1400 && s.decoded_video_frames > 0; }, "VLC forward time seek");
         player.seekTo(300);
         waitUntil([&] { auto s = status(); return s.time_ms >= 250 && s.decoded_video_frames > 0; }, "VLC backward time seek");
+        torrent.seed.pause();
+        std::this_thread::sleep_for(50ms);
+        player.seekTo(3000);
+        waitUntil([&] { status(); return source->status().waiting_reads > 0; }, "VLC buffers after peer disconnection");
+        std::this_thread::sleep_for(200ms);
+        torrent.seed.resume();
+        waitUntil([&] { auto s = status(); return s.state == libvlc_Playing && s.time_ms >= 2800; },
+                  "VLC resumes after peer recovery");
+        player.seekTo(300);
+        waitUntil([&] { auto s = status(); return s.time_ms >= 250 && s.time_ms < 2000; },
+                  "backward seek after peer recovery");
     }
     waitUntil([&] { return status().state == libvlc_Ended; }, "VLC reached end of media", 60s);
     require(decoded > 1, "real decoded frames, not just a PLAYING event");

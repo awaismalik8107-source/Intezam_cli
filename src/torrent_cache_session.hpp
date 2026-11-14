@@ -1,6 +1,7 @@
 #pragma once
 
 #include "cache_disk_io.hpp"
+#include "cache_metrics.hpp"
 #include "dynamic_segment_cache.hpp"
 #include "torrent_metadata.hpp"
 #include "video_files.hpp"
@@ -23,6 +24,8 @@ struct CacheStreamOptions {
     std::chrono::milliseconds stall_timeout{120000};
     libtorrent::settings_pack settings = streamingSessionSettings();
     std::function<bool()> cancelled;
+    std::optional<std::size_t> reserved_slots; // automatic when unset; no extra disk allocation
+    std::function<void(int)> on_piece_verified; // network thread; must not throw or call control APIs
 };
 
 struct CacheDiagnostics {
@@ -44,6 +47,7 @@ struct CacheDiagnostics {
     double forward_buffer_seconds;
     bool ready;
     std::size_t urgent_pieces;
+    CachePerformance performance{};
 };
 
 // Control methods are serialized internally. Playback may hold/use ReadLease
@@ -57,7 +61,8 @@ public:
     bool seek(std::int64_t byte_offset);
     void setPlaybackPosition(std::int64_t byte_offset);
     void setPlaybackRate(double bytes_per_second);
-    void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand);
+    void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand,
+                           PlaybackMovement movement = PlaybackMovement::sequential);
     std::optional<PieceStore::ReadLease> read(std::int64_t offset, std::int64_t length);
     bool isRangeCached(std::int64_t offset, std::int64_t length) const;
     CacheDiagnostics diagnostics() const;
@@ -65,14 +70,24 @@ public:
     std::int64_t dataCapacity() const { return static_cast<std::int64_t>(store_->slotCount()) * geometry_.piece_length; }
 
 private:
+    struct AdmissionPlan {
+        SegmentWindow window;
+        std::vector<int> required;
+        std::vector<int> prefetch;
+        std::vector<int> keep;
+    };
     using Clock = std::chrono::steady_clock;
     void drain(std::chrono::milliseconds wait,
                const std::function<void(libtorrent::alert*)>& inspect = {});
     void waitUntil(const std::function<bool()>& complete);
-    void addTorrent(libtorrent::add_torrent_params params);
+    void addTorrent(libtorrent::add_torrent_params params, const AdmissionPlan& plan);
     void schedule();
-    void rebuild(const std::vector<int>& desired);
+    AdmissionPlan planAdmissions();
+    bool shouldRebuild(const AdmissionPlan& plan, const AdmissionResult& admission) const;
+    void applyPriorities(const AdmissionPlan& plan);
+    void rebuild(const AdmissionPlan& plan);
     void observeThroughput();
+    void updateReservation(double bytes_per_second);
     void updatePosition(std::int64_t byte_offset);
     std::vector<int> urgentPieces() const;
     void checkCancelled() const;
@@ -99,6 +114,9 @@ private:
     std::string last_peer_error_;
     std::optional<VideoRange> read_demand_;
     std::size_t rebuilds_ = 0;
+    CachePerformance performance_;
+    std::optional<VideoRange> last_window_;
+    std::optional<SegmentWindow> planned_window_;
 };
 
 } // namespace intezam

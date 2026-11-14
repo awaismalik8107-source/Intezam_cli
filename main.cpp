@@ -115,7 +115,9 @@ int main(int argc, char* argv[])
         }
 
         intezam::displayVideos(videos, std::cout);
-        const auto selected_video = intezam::selectVideo(videos, std::cin, std::cout);
+        const auto selected_video = cli.metadata_only
+            ? intezam::selectVideo(videos, std::cin, std::cout)
+            : intezam::selectStreamingVideo(videos, metadata->piece_length(), std::cin, std::cout);
         if (!selected_video) {
             std::cout << "\nSelection cancelled.\n";
             return EXIT_SUCCESS;

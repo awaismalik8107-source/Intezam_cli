@@ -10,6 +10,7 @@
 #include <boost/asio/post.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <new>
@@ -33,6 +34,20 @@ std::string CacheDiskState::error() const
 }
 
 namespace {
+
+class DiskWorkTimer {
+public:
+    explicit DiskWorkTimer(CacheDiskState& state) : state_(state) {}
+    ~DiskWorkTimer()
+    {
+        ++state_.jobs;
+        state_.work_microseconds += std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started_).count();
+    }
+private:
+    CacheDiskState& state_;
+    std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
+};
 
 class CacheDiskIO final : public lt::disk_interface, public lt::buffer_allocator_interface {
 public:
@@ -202,6 +217,7 @@ private:
     template<class Operation>
     lt::storage_error perform(lt::operation_t operation, Operation execute)
     {
+        DiskWorkTimer timer(*state_);
         try {
             execute();
             return {};

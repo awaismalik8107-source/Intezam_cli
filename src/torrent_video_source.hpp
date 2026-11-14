@@ -17,6 +17,7 @@ struct VideoSourceStatus {
     std::uint64_t delivered_bytes = 0;
     bool stopped = false;
     std::string error;
+    ReadPerformance performance;
 };
 
 class TorrentVideoSource final : public VideoByteSource {
@@ -29,6 +30,7 @@ public:
     std::size_t read(std::int64_t offset, void* buffer, std::size_t length) override;
     std::size_t readMetadata(std::int64_t offset, void* buffer, std::size_t length) override;
     void seek(std::int64_t offset) override;
+    void seekForDemux(std::int64_t offset) override;
     void cancelPendingReads() override;
     void resumeReads() override;
     void stop() override;
@@ -42,6 +44,17 @@ public:
     std::int64_t capacity() const { return capacity_; }
 
 private:
+    struct ReadSignal {
+        std::mutex mutex;
+        std::condition_variable changed;
+        void notify()
+        {
+            // Synchronize with the predicate check -> wait handoff, preventing
+            // a verification/stop notification from being lost between them.
+            std::lock_guard<std::mutex> lock(mutex);
+            changed.notify_all();
+        }
+    };
     struct PendingRead {
         VideoRange range;
         std::uint64_t epoch;
@@ -50,6 +63,7 @@ private:
     void run();
     void checkReadState(std::uint64_t epoch) const;
     void accountProbeRange(std::int64_t offset, std::size_t length);
+    void seekToByte(std::int64_t offset, PlaybackMovement movement);
     const std::int64_t video_size_;
     const std::int64_t torrent_offset_;
     const int piece_length_;
@@ -59,9 +73,8 @@ private:
     std::filesystem::path directory_;
     std::int64_t capacity_;
     std::uint64_t probe_limit_;
-    mutable std::mutex mutex_;
+    std::shared_ptr<ReadSignal> read_signal_ = std::make_shared<ReadSignal>();
     std::mutex stop_mutex_;
-    std::condition_variable changed_;
     std::deque<std::shared_ptr<PendingRead>> pending_;
     std::uint64_t epoch_ = 0;
     std::uint64_t probe_bytes_ = 0;
@@ -69,6 +82,8 @@ private:
     bool probing_ = true;
     bool suspended_ = false;
     std::int64_t playback_offset_ = 0;
+    bool seek_requested_ = false;
+    bool reposition_next_demux_seek_ = false;
     double requested_rate_;
     ContainerInfo container_;
     VideoSourceStatus status_;

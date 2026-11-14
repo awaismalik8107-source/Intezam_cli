@@ -52,6 +52,11 @@ In Fish, replace the command substitution with
 Paste a magnet and choose a video by its displayed number. Original zero-based
 torrent indexes, full paths, extensions and sizes are retained. Metadata retrieval
 remains payload-free and writes no files. `--metadata-only` exits after selection.
+Playback skips candidates whose 2.5% budget is below one torrent piece. If only
+one candidate remains from a multi-video list, it is selected automatically using
+its original number. This avoids selecting an undersized sample instead of the
+main film. Other lists keep manual selection; filesystem/container capacity is
+still checked when playback starts. Metadata-only mode keeps all candidates.
 The default metadata timeout is 120 seconds (`--timeout`: 1–3600 seconds).
 
 Default mode probes the actual container bytes, buffers a capacity-limited startup
@@ -107,7 +112,9 @@ is rejected instead of allowing an automatic whole-file scan.
 
 `TorrentVideoSource` owns a cache worker. Missing read ranges become urgent piece
 requests; callback threads sleep on a condition variable while libtorrent runs
-independently. Reads are limited to 16 KiB and one torrent piece at a time. A pinned
+independently. Verification wakes readers immediately, and blocked demands wake
+the controller without waiting for its normal 20 ms coalescing interval.
+Reads are limited to 16 KiB and one torrent piece at a time. A pinned
 read lease protects verified disk data while it is copied into VLC's buffer.
 Incomplete or unverified pieces are never exposed. Zero means actual EOF; waiting,
 timeout, cancellation and errors are separate paths.
@@ -174,6 +181,29 @@ otherwise repeats optimistic uTP negotiation after each re-add, even for a TCP-o
 peer. Embedders can override `CacheStreamOptions::settings` when uTP-only outbound
 access is needed, with the corresponding reconnect cost.
 
+## Reserved slots and rebuilds
+
+The cache normally keeps `ceil(slot_count / 8)` slots available for urgent reads
+(zero below four slots, capped to leave two working slots). Prefetch uses the
+remaining window; urgent playback/container reads may borrow the reserve.
+Automatic reservation turns off when the whole cache holds less than one second
+at the current consumption estimate, and returns above 1.25 seconds. This preserves
+forward buffering for short/high-bitrate media. C++ callers may set
+`CacheStreamOptions::reserved_slots` explicitly; zero disables reservation.
+
+Expired pieces are reclaimed together at the existing pause/snapshot/remove/re-add
+boundary. Verified overlap, active pins and required playback pieces survive.
+Small speculative deficits wait for a batch; required misses bypass that delay.
+Rolling and resize hysteresis limit window oscillation, while explicit user seeks
+reposition immediately. Every occupied/reserved slot belongs to the same fixed
+2.5% allocation; no additional payload file is created.
+
+Local three-run medians: sequential rebuilds **111 -> 14**, seeking **25 -> 7**,
+and short-clip VLC **97 -> 91**. VLC verified-data waiting fell **501 -> 210 ms**.
+Individual batch rebuilds cost more, and these figures are not WAN guarantees.
+See the [measured comparison](docs/cache-performance.md) and
+[algorithm, configuration, examples and reproduction steps](docs/cache-optimization.md).
+
 ## Tests
 
 FFmpeg is optional for the application and is used only to generate test media:
@@ -205,7 +235,9 @@ validated by that headless test. These require separate manual/compatibility tes
 FFmpeg absence is reported at configure time and skips the real-media test;
 container/cache/unit tests still run.
 
-The local normal run passed all **9 CTest checks**. Separate CLI smoke runs also
+The local normal run passed all **12 CTest checks**. These include reserved-slot,
+batch reconstruction, window stability and VLC peer-outage recovery regressions.
+Separate CLI smoke runs also
 verified quitting during startup and SIGTERM cleanup. Tail-MP4 playback peaked at
 **327,680 allocated bytes against a 347,812-byte budget**, including managed
 directories and lock/cache files.
@@ -231,6 +263,17 @@ checks separately while retaining leak checking on the non-playback tests:
 ```bash
 ctest --test-dir build-sanitize --output-on-failure -E 'generate_vlc_media|vlc_cache_playback|cli_magnet_to_playback|cleanup_vlc_media'
 ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-sanitize --output-on-failure -R 'vlc_cache_playback|cli_magnet_to_playback'
+```
+
+ThreadSanitizer checks for storage and concurrent reconstruction also passed:
+
+```bash
+cmake -S . -B build-thread-sanitize -DCMAKE_BUILD_TYPE=Debug \
+    '-DCMAKE_CXX_FLAGS=-fsanitize=thread -fno-omit-frame-pointer' \
+    '-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread'
+cmake --build build-thread-sanitize --target reserved_slot_tests batch_eviction_tests cache_tests -j2
+ctest --test-dir build-thread-sanitize --output-on-failure \
+    -R 'reserved_slot_admission|batched_torrent_reconstruction|bounded_disk_cache'
 ```
 
 Set `INTEZAM_VLC_DEBUG=1` for verbose VLC diagnostics. Normal playback reports

@@ -20,6 +20,8 @@ public:
     virtual std::size_t readMetadata(std::int64_t offset, void* buffer, std::size_t length)
     { return read(offset, buffer, length); }
     virtual void seek(std::int64_t offset) = 0;
+    // Container-internal repositioning need not force a new rolling window.
+    virtual void seekForDemux(std::int64_t offset) { seek(offset); }
     virtual void cancelPendingReads() = 0;
     virtual void resumeReads() {}
     virtual void stop() = 0;

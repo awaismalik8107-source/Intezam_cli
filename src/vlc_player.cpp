@@ -73,7 +73,7 @@ int VlcPlayer::openInput(void* opaque, void** cursor, std::uint64_t* size) noexc
 {
     auto& self = *static_cast<VlcPlayer*>(opaque);
     try {
-        self.source_->seek(0);
+        self.source_->seekForDemux(0);
         *cursor = new Cursor{&self, self.source_, 0};
         *size = self.source_->size();
         return 0;
@@ -101,7 +101,7 @@ int VlcPlayer::seekInput(void* opaque, std::uint64_t offset) noexcept
     auto& cursor = *static_cast<Cursor*>(opaque);
     if (cursor.owner->suspended_.load() || offset > static_cast<std::uint64_t>(cursor.source->size())) return -1;
     try {
-        cursor.source->seek(static_cast<std::int64_t>(offset));
+        cursor.source->seekForDemux(static_cast<std::int64_t>(offset));
         cursor.offset = offset;
         ++cursor.owner->seek_count_;
         return 0;

@@ -5,6 +5,8 @@
 
 namespace intezam {
 
+enum class PlaybackMovement { sequential, seek };
+
 struct VideoRange {
     std::int64_t offset;
     std::int64_t length;

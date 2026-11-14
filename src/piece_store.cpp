@@ -7,14 +7,129 @@
 
 namespace intezam {
 
-PieceStore::PieceStore(PieceGeometry geometry, std::unique_ptr<CacheFile> file)
-    : geometry_(geometry), file_(std::move(file)) {}
+PieceStore::PieceStore(PieceGeometry geometry, std::unique_ptr<CacheFile> file,
+                       std::optional<std::size_t> reserved_slots)
+    : geometry_(geometry), file_(std::move(file))
+{
+    const auto slots = slotCount();
+    const auto maximum = slots > 2 ? slots - 2 : 0;
+    reserved_slots_ = reserved_slots.value_or(automaticReservation(slots));
+    if (reserved_slots_ > maximum) throw std::invalid_argument("Reserved slots must leave at least two working slots.");
+}
 
-std::shared_ptr<PieceStore> PieceStore::create(const PieceGeometry& geometry, const std::filesystem::path& root)
+std::size_t PieceStore::automaticReservation(std::size_t slots)
+{ return slots < 4 ? 0 : std::min(slots - 2, (slots + 7) / 8); }
+
+std::size_t PieceStore::reservedSlots() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reserved_slots_;
+}
+
+void PieceStore::setReservedSlots(std::size_t slots)
+{
+    if (slots > (slotCount() > 2 ? slotCount() - 2 : 0)) {
+        throw std::invalid_argument("Reserved slots must leave at least two working slots.");
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    reserved_slots_ = slots;
+}
+
+std::shared_ptr<PieceStore> PieceStore::create(const PieceGeometry& geometry, const std::filesystem::path& root,
+                                             std::optional<std::size_t> reserved_slots)
 {
     geometry.validate();
     return std::shared_ptr<PieceStore>(new PieceStore(geometry,
-        CacheFile::create(geometry.video_size, geometry.piece_length, root)));
+        CacheFile::create(geometry.video_size, geometry.piece_length, root), reserved_slots));
+}
+
+void PieceStore::validatePieces(const std::vector<int>& pieces) const
+{ for (int piece : pieces) geometry_.pieceSize(piece); }
+
+SlotInventory PieceStore::inventory() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    SlotInventory result;
+    result.total = slotCount();
+    result.occupied = slots_.size();
+    result.free = result.total - result.occupied;
+    result.reserved_target = reserved_slots_;
+    result.reserved_free = std::min(result.free, reserved_slots_);
+    result.prefetch_free = result.free - result.reserved_free;
+    for (const auto& entry : slots_) {
+        if (entry.second.pins) ++result.pinned_slots;
+        if (entry.second.pins || protected_pieces_.count(entry.first)) ++result.protected_slots;
+    }
+    return result;
+}
+
+void PieceStore::setProtectedPieces(const std::vector<int>& pieces)
+{
+    validatePieces(pieces);
+    std::lock_guard<std::mutex> lock(mutex_);
+    protected_pieces_ = {pieces.begin(), pieces.end()};
+}
+
+bool PieceStore::admitPieceLocked(int piece)
+{
+    if (slots_.count(piece) || slots_.size() == slotCount()) return false;
+    std::vector<bool> used(slotCount(), false);
+    for (const auto& entry : slots_) used[entry.second.index] = true;
+    const auto index = static_cast<std::size_t>(std::find(used.begin(), used.end(), false) - used.begin());
+    std::array<char, 65536> zeroes{};
+    const auto base = static_cast<std::int64_t>(index) * file_->slotSize();
+    for (std::int64_t offset = 0; offset < file_->slotSize(); offset += zeroes.size()) {
+        file_->write(base + offset, zeroes.data(), std::min<std::int64_t>(zeroes.size(), file_->slotSize() - offset));
+    }
+    slots_.emplace(piece, Slot{index, false, 0, {}});
+    return true;
+}
+
+AdmissionResult PieceStore::admit(const std::vector<int>& required, const std::vector<int>& prefetch)
+{
+    validatePieces(required);
+    validatePieces(prefetch);
+    std::lock_guard<std::mutex> lock(mutex_);
+    AdmissionResult result;
+    for (int piece : required) {
+        if (slots_.count(piece)) continue;
+        if (admitPieceLocked(piece)) result.admitted.push_back(piece);
+        else result.deferred_required.push_back(piece);
+    }
+    for (int piece : prefetch) {
+        if (slots_.count(piece)) continue;
+        if (slotCount() - slots_.size() > reserved_slots_ && admitPieceLocked(piece)) result.admitted.push_back(piece);
+        else result.deferred_prefetch.push_back(piece);
+    }
+    return result;
+}
+
+bool PieceStore::reclaimableLocked(int piece, const Slot& slot, const std::set<int>& keep) const
+{ return !keep.count(piece) && !protected_pieces_.count(piece) && slot.pins == 0; }
+
+std::vector<int> PieceStore::reclaimablePieces(const std::vector<int>& keep) const
+{
+    validatePieces(keep);
+    const std::set<int> wanted(keep.begin(), keep.end());
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> pieces;
+    for (const auto& entry : slots_) if (reclaimableLocked(entry.first, entry.second, wanted)) pieces.push_back(entry.first);
+    return pieces;
+}
+
+std::vector<int> PieceStore::reclaimOutside(const std::vector<int>& keep)
+{
+    validatePieces(keep);
+    const std::set<int> wanted(keep.begin(), keep.end());
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<int> removed;
+    for (auto entry = slots_.begin(); entry != slots_.end();) {
+        if (reclaimableLocked(entry->first, entry->second, wanted)) {
+            removed.push_back(entry->first);
+            entry = slots_.erase(entry);
+        } else ++entry;
+    }
+    return removed;
 }
 
 std::int64_t PieceStore::allocatedBytes() const
@@ -31,39 +146,28 @@ bool PieceStore::needsEviction(const std::vector<int>& desired) const
     for (int piece : wanted) if (slots_.count(piece) == 0) ++missing;
     if (missing <= slotCount() - slots_.size()) return false;
     for (const auto& entry : slots_) {
-        if (wanted.count(entry.first) == 0 && entry.second.pins == 0) return true;
+        if (reclaimableLocked(entry.first, entry.second, wanted)) return true;
     }
     return false;
 }
 
 std::vector<int> PieceStore::reconcile(const std::vector<int>& desired)
 {
+    validatePieces(desired);
     std::lock_guard<std::mutex> lock(mutex_);
     const std::set<int> wanted(desired.begin(), desired.end());
     std::vector<int> evicted;
     for (int piece : desired) {
-        geometry_.pieceSize(piece); // validate before mutating storage
         if (slots_.count(piece)) continue;
         if (slots_.size() == slotCount()) {
             auto victim = std::find_if(slots_.begin(), slots_.end(), [&](const auto& entry) {
-                return wanted.count(entry.first) == 0 && entry.second.pins == 0;
+                return reclaimableLocked(entry.first, entry.second, wanted);
             });
             if (victim == slots_.end()) continue;
             evicted.push_back(victim->first);
             slots_.erase(victim);
         }
-        std::set<std::size_t> used;
-        for (const auto& entry : slots_) used.insert(entry.second.index);
-        std::size_t index = 0;
-        while (used.count(index)) ++index;
-        // Clear reused slots, including implicit padding bytes. Never grow the file.
-        std::array<char, 65536> zeroes{};
-        const auto base = static_cast<std::int64_t>(index) * file_->slotSize();
-        for (std::int64_t offset = 0; offset < file_->slotSize(); offset += zeroes.size()) {
-            file_->write(base + offset, zeroes.data(),
-                std::min<std::int64_t>(zeroes.size(), file_->slotSize() - offset));
-        }
-        slots_.emplace(piece, Slot{index, false, 0, {}});
+        admitPieceLocked(piece);
     }
     return evicted;
 }

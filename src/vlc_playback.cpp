@@ -90,6 +90,10 @@ void displayPlayback(const VideoSourceStatus& source, const PlaybackStatus& play
               << "\nVLC Buffering: " << std::clamp(player.buffering_percent, 0.0f, 100.0f) << "%"
               << "\nNetwork Speed: " << formatVideoSize(static_cast<std::int64_t>(cache.network_bytes_per_second)) << "/s"
               << "\nCache Usage: " << cache.allocated_bytes << " / " << cache.budget_bytes << " bytes"
+              << "\nFree / Reserved Slots: " << cache.performance.free_slots << " / " << cache.performance.reserved_slots
+              << "\nTorrent Rebuilds: " << cache.torrent_rebuilds
+              << "\nVerified Read Wait: " << source.performance.wait_microseconds / 1000 << " ms; stalls >=50ms: "
+              << source.performance.stalls
               << "\nCached Window (target): S" << cache.desired.first_segment << " - S" << cache.desired.last_segment
               << "\nVerified / Downloading / Queued Pieces: " << cache.verified_pieces << " / "
               << cache.downloading_pieces << " / " << cache.queued_pieces

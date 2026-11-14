@@ -95,6 +95,48 @@ void displaysPathsFormatsSizesAndIndexes(const std::vector<intezam::VideoFile>& 
     require(intezam::formatVideoSize(0) == "0.00 MiB", "zero-byte size");
 }
 
+void selectsTheOnlyVideoWithEnoughPieceBudget()
+{
+    const intezam::VideoFile sample{lt::file_index_t{3}, "Sample/sample.mkv", ".mkv", 60879760, 0};
+    const intezam::VideoFile movie{lt::file_index_t{6}, "main-film.mkv", ".mkv", 5869802096, 60879760};
+    std::istringstream no_choice;
+    std::ostringstream output;
+    const auto selected = intezam::selectStreamingVideo({sample, movie}, 2097152, no_choice, output);
+    require(selected && selected->torrent_index == movie.torrent_index && selected->torrent_offset == movie.torrent_offset,
+            "auto-select second/main video without changing its torrent identity");
+    require(output.str().find("Automatically selecting [2]") != std::string::npos, "explain second-option selection");
+    require(output.str().find("[1] unavailable") != std::string::npos, "explain sample cache limitation");
+
+    std::istringstream reversed_input;
+    std::ostringstream reversed_output;
+    const auto first = intezam::selectStreamingVideo({movie, sample}, 2097152, reversed_input, reversed_output);
+    require(first && first->torrent_index == movie.torrent_index, "do not hard-code option two for other torrents");
+    require(reversed_output.str().find("Automatically selecting [1]") != std::string::npos, "preserve display numbering");
+
+    std::istringstream metadata_choice("1\n");
+    const auto metadata_only = intezam::selectVideo({sample, movie}, metadata_choice, output);
+    require(metadata_only && metadata_only->torrent_index == sample.torrent_index, "metadata-only selection still permits small videos");
+}
+
+void keepsManualChoiceWhenMultipleVideosHaveEnoughBudget()
+{
+    const std::vector<intezam::VideoFile> videos{
+        {lt::file_index_t{1}, "sample.mkv", ".mkv", 1024 * 1024, 0},
+        {lt::file_index_t{4}, "episode-one.mkv", ".mkv", 512LL * 1024 * 1024, 1024 * 1024},
+        {lt::file_index_t{7}, "episode-two.mkv", ".mkv", 512LL * 1024 * 1024, 513LL * 1024 * 1024}};
+    std::istringstream input("1\n3\n");
+    std::ostringstream output;
+    const auto selected = intezam::selectStreamingVideo(videos, 2097152, input, output);
+    require(selected && selected->torrent_index == lt::file_index_t{7}, "reject small sample then accept original option three");
+    std::istringstream cancel("q\n");
+    require(!intezam::selectStreamingVideo(videos, 2097152, cancel, output), "streaming selection can be cancelled");
+    bool rejected = false;
+    std::istringstream unused;
+    try { intezam::selectStreamingVideo({videos.front()}, 2097152, unused, output); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "report when no video budget can fit a piece");
+}
+
 } // namespace
 
 int main()
@@ -104,6 +146,8 @@ int main()
         const auto videos = detectsVideosWithOriginalIndexes();
         validatesSelectionAndKeepsOriginalIdentity(videos);
         displaysPathsFormatsSizesAndIndexes(videos);
+        selectsTheOnlyVideoWithEnoughPieceBudget();
+        keepsManualChoiceWhenMultipleVideosHaveEnoughBudget();
         std::cout << "Video detection and selection tests passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

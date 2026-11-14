@@ -127,7 +127,9 @@ public:
         return options;
     }
     std::shared_ptr<intezam::TorrentVideoSource> source() const
-    { return std::make_shared<intezam::TorrentVideoSource>(magnet_, metadata_, video_, options()); }
+    { return source(options()); }
+    std::shared_ptr<intezam::TorrentVideoSource> source(const intezam::CacheStreamOptions& configuration) const
+    { return std::make_shared<intezam::TorrentVideoSource>(magnet_, metadata_, video_, configuration); }
     std::vector<unsigned char> expected(std::int64_t offset, std::size_t length) const
     {
         std::ifstream file(source_file_, std::ios::binary);
@@ -138,6 +140,7 @@ public:
         return bytes;
     }
     const intezam::VideoFile& video() const { return video_; }
+    std::shared_ptr<const lt::torrent_info> metadata() const { return metadata_; }
     const std::string& magnet() const { return magnet_; }
     RequestCounts counts;
     lt::torrent_handle seed;

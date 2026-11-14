@@ -25,8 +25,8 @@ for playback, after selection. The older simulation remains opt-in.
 |---|---|
 | `cache_geometry.*` | Validated selected-file geometry and torrent-global piece mapping |
 | `cache_file.*` | Filesystem-aligned preallocation, budget, pwrite/pread bounds, lock and cleanup |
-| `piece_store.*` | Piece-to-slot mapping, partial write coverage, verification and pinned read leases |
-| `dynamic_segment_cache.*` | Adaptive horizon and 1/3-behind, 2/3-ahead segment positioning |
+| `piece_store.*` | Piece mapping, reserved/free inventory, protected reclamation, verification and pinned leases |
+| `dynamic_segment_cache.*` | Adaptive horizon, rolling/resize hysteresis and approximate 1/3-behind, 2/3-ahead positioning |
 | `cache_disk_io.*` | libtorrent 2.1 `disk_interface`, disk reads/writes and SHA-1/SHA-256 hash callbacks |
 | `torrent_cache_session.*` | Safe torrent lifecycle, piece priorities/deadlines, eviction barrier and diagnostics |
 | `video_byte_source.hpp` | Seekable byte source contract, metadata reads and explicit cancellation |
@@ -87,6 +87,13 @@ of exceeding the budget.
 This policy is deliberately explicit and tunable; no constant four-segment
 window or claim of universal optimal buffering is involved.
 
+The effective working capacity excludes the automatic urgent reserve: normally
+`ceil(physical_slots/8)`, zero below four slots, capped to leave two working slots.
+Coverage below one second releases the reserve; re-enabling requires 1.25 seconds.
+An explicit `CacheStreamOptions::reserved_slots` overrides this policy. Required
+pieces can borrow the reserve; speculative admissions cannot. All occupied slots
+still fit the original physical allocation.
+
 For current segment `c`, count `n`, total segments `t`:
 
 ```text
@@ -98,6 +105,12 @@ This recalculates on playback movement and throughput/buffer updates, rather
 than waiting for the end of a window. Pins may prevent full admission; missing
 target pieces remain deferred and playback buffers if the requested bytes are
 not verified. Window size is never equated with availability.
+
+The formula proposes the ideal window. `planWindow()` latches it with a resize
+threshold of `max(2,n/8)` segments and rolls after drift exceeds `floor(n/12)`.
+Explicit seeks, changed capacity and urgent-piece constraints bypass the latch.
+`window()` remains the exact stateless sizing policy. Container byte movement
+uses `seekForDemux()`; genuine source/time seeks request immediate repositioning.
 
 ## Storage and verification states
 
@@ -135,8 +148,9 @@ slots must be reused:
 2. Request `save_resume_data(save_info_dict)` and move the returned parameters
    into memory; no resume file or `.torrent` file is written.
 3. Remove the torrent and wait for the custom backend's storage holder to release.
-4. Reconcile slots: retain overlap and pins, reuse only unneeded unpinned slots,
-   and postpone admission if pins leave insufficient space.
+4. Reclaim all expired unprotected/unpinned pieces outside the target window as
+   one batch. Retain overlap and pins; admit required pieces first and prefetch
+   only above the reserve. Postpone admission if pins leave insufficient space.
 5. Re-add the torrent paused/upload-only. Build `have_pieces` solely from actual
    resident verified pieces; restore complete retained 16 KiB blocks as
    `unfinished_pieces`. Retain peers, trackers and v2 merkle state from the snapshot.
@@ -149,6 +163,12 @@ can read immediately; outside seeking reports a miss and waits for verification.
 Re-adding costs connection churn and can cause rebuffering. This avoids internal
 libtorrent headers or unsupported modifications to its piece picker, but a future
 upstream availability-reset API could make eviction smoother.
+
+Free-slot admissions need no rebuild. Small prefetch deficits wait until at least
+`max(2,reserved_slots)` expired pieces are eligible; required misses bypass that
+threshold. The decision and reclamation recheck pins. See
+[the concrete example and full design](docs/cache-optimization.md) and
+[measured before/after tables](docs/cache-performance.md).
 
 Default streaming settings use outgoing TCP, incoming TCP/uTP and a one-second
 minimum reconnect backoff. Libtorrent optimistically retries uTP for newly added
@@ -168,7 +188,10 @@ end and one torrent-piece boundary, including unaligned selected files.
 A callback queues its exact range under the source mutex. It first attempts a
 verified `ReadLease`; otherwise it sleeps on a condition variable. The worker
 updates the playback anchor and urgent range, pumps libtorrent and publishes
-diagnostics every 20 ms. The callback never pumps the session or requests a
+diagnostics on a normal 20 ms coalescing interval. A new blocked demand or explicit
+seek wakes it immediately. Verification callbacks signal a shared reader mutex/CV
+as soon as data is readable, rather than waiting for that interval. The callback
+never pumps the session or requests a
 rebuild itself. A lease remains pinned through the disk read and copy to VLC.
 Only EOF (or a zero-length request) returns zero. Timeout, cancellation and storage
 errors have separate exception paths; all C callbacks catch exceptions and return
@@ -187,6 +210,11 @@ the cache worker is cancelled/joined and its session is destroyed. This ordering
 also handles stopping during probing or an active network wait. SIGINT/SIGTERM
 only set a signal flag; normal control flow performs teardown. Terminal mode is
 restored by RAII. A closed stdin disables controls while media continues to EOF.
+
+The session is moved out under the reader mutex and destroyed after releasing
+that mutex, so network-thread verification notifications cannot deadlock teardown.
+The notification state has shared ownership and can outlive source construction
+failure or network shutdown without referencing a destroyed source.
 
 ## Containers, startup and seeking
 
