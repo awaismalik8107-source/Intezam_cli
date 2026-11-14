@@ -1,5 +1,6 @@
 import { Bookmark, Check, Play } from "lucide-react";
 import { m } from "motion/react";
+import { buildEpisodeCatalog } from "../lib/episodeCatalog";
 import { CARD_LIST_VARIANTS, CARD_SPRING } from "../lib/motion";
 import type { MediaEntry } from "../lib/types";
 import { PosterArtwork } from "./PosterArtwork";
@@ -21,6 +22,7 @@ export function PosterCard({
   onToggleLibrary,
   compactWidth = false,
 }: PosterCardProps) {
+  const knownEpisodes = buildEpisodeCatalog(media.sources).episodes.length;
   return (
     <m.article
       custom={index}
@@ -50,13 +52,13 @@ export function PosterCard({
             />
           </div>
 
-          {/* Hover Play / Inspect Overlay */}
+          {/* Open details overlay */}
           <div
             aria-hidden="true"
             className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/35 opacity-0 transition-opacity duration-200 group-hover:opacity-100"
           >
             <div className="flex h-11 w-11 items-center justify-center rounded-full border border-white/25 bg-[#786BFF]/90 text-[#F8FAFC] shadow-lg shadow-[#786BFF]/30">
-              <Play className="ml-0.5 h-4 w-4 fill-current" />
+              <Play className="ml-0.5 h-4 w-4" />
             </div>
           </div>
         </button>
@@ -90,12 +92,12 @@ export function PosterCard({
         onClick={() => onSelect(media)}
         className="mt-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] rounded"
       >
-        <h3 className="line-clamp-1 text-[13px] font-medium text-[#F8FAFC] transition-colors group-hover:text-white">
+        <h3 className="line-clamp-2 min-h-9 break-words text-[13px] font-medium text-[#F8FAFC] transition-colors group-hover:text-white">
           {media.title}
         </h3>
         <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[#949CAF]">
           <span>
-            {media.sources.length} {media.sources.length === 1 ? "source" : "sources"}
+            {knownEpisodes > 0 ? `${knownEpisodes} episode${knownEpisodes === 1 ? "" : "s"}` : `${media.sources.length} release${media.sources.length === 1 ? "" : "s"}`}
           </span>
           {media.verifiedCount > 0 && (
             <>
