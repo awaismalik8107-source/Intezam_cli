@@ -5,6 +5,7 @@
 
 #include <iosfwd>
 #include <optional>
+#include <functional>
 
 namespace intezam {
 
@@ -14,8 +15,13 @@ void displayVideos(const std::vector<VideoFile>& videos, std::ostream& output);
 // EOF or q cancels without changing torrent state.
 std::optional<VideoFile> selectVideo(
     const std::vector<VideoFile>& videos, std::istream& input, std::ostream& output);
+std::optional<VideoFile> selectVideo(const std::vector<VideoFile>& videos,
+    std::istream& input, std::ostream& output, const std::function<bool()>& cancelled);
 // Adaptive mode retains manual choice; allocation is checked again on the real filesystem.
 std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
     int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget = {});
+std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
+    int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget,
+    const std::function<bool()>& cancelled);
 
 } // namespace intezam

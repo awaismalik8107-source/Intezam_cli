@@ -3,6 +3,7 @@
 #include "src/video_selection.hpp"
 #include "src/cache_simulation.hpp"
 #include "src/vlc_playback.hpp"
+#include "src/playback_preparation.hpp"
 #ifdef INTEZAM_QT_UI
 #include "src/player_window.hpp"
 #endif
@@ -11,14 +12,27 @@
 
 #include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 namespace {
+volatile std::sig_atomic_t selection_interrupted = 0;
+void interruptSelection(int) { selection_interrupted = 1; }
+class SelectionSignals {
+public:
+    SelectionSignals() : interrupt_(std::signal(SIGINT, interruptSelection)),
+        terminate_(std::signal(SIGTERM, interruptSelection)) { selection_interrupted = 0; }
+    ~SelectionSignals() { std::signal(SIGINT, interrupt_); std::signal(SIGTERM, terminate_); }
+private:
+    using Handler = void (*)(int);
+    Handler interrupt_, terminate_;
+};
 #ifdef INTEZAM_QT_UI
 constexpr const char* default_playback = "Default Qt playback window";
 #else
@@ -34,6 +48,7 @@ struct CliOptions {
     bool simulate = false;
     bool headless = false;
     bool no_ui = false;
+    bool bitrate_explicit = false;
     intezam::CacheBudgetOptions budget{intezam::CacheBudgetMode::adaptive, 25};
     intezam::CliStatusOptions monitoring;
 };
@@ -96,6 +111,7 @@ CliOptions parseOptions(int argc, char* argv[])
                 options.simulate = true;
             }
             else {
+                options.bitrate_explicit = true;
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), options.bitrate);
                 if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()
                     || !std::isfinite(options.bitrate) || options.bitrate <= 0 || options.bitrate > 1e12) {
@@ -125,9 +141,11 @@ int main(int argc, char* argv[])
                       << "               [--simulate | --simulate-seconds SECONDS]\n"
                       << "Retrieve metadata, select a video, then play verified cache bytes with LibVLC.\n"
                       << "--metadata-only preserves detection/selection without payload downloads.\n"
+                      << "Normal playback prefetches bounded headers while you choose a video.\n"
                       << default_playback << "; adaptive time-based cache, absolute maximum 256 MiB.\n"
                       << "Free-space reserve 256 MiB; initial forward horizon 24 seconds; legacy modes retain percentage limits.\n"
-                      << "Defaults: metadata timeout 120 seconds, initial bitrate estimate 1048576 bytes/s.\n"
+                      << "Defaults: metadata timeout 120 seconds; header-derived bitrate, fallback 1048576 bytes/s.\n"
+                      << "--bitrate overrides the header-derived startup estimate.\n"
                       << "--simulate retains the cache test harness; --headless uses memory video/dummy audio.\n";
             return EXIT_SUCCESS;
         }
@@ -162,13 +180,36 @@ int main(int argc, char* argv[])
         }
 
         intezam::displayVideos(videos, std::cout);
+        SelectionSignals selection_signals;
+        std::optional<intezam::PlaybackOptions> playback;
+        if (!cli.metadata_only && !cli.simulate) {
+            playback.emplace();
+            playback->cache.bootstrap_peers = discovery.peers;
+            playback->cache.playback_bytes_per_second = cli.bitrate;
+            playback->cache.budget = cli.budget;
+            playback->cache.estimate_bitrate_from_headers = !cli.bitrate_explicit;
+            playback->monitoring = cli.monitoring;
+            playback->vlc.headless = cli.headless;
+            if (const auto candidate = intezam::headerPrefetchCandidate(videos, metadata->piece_length(), cli.budget)) {
+                std::cout << "Preparing bounded headers in background: " << candidate->path
+                    << "\nChoose any video; playback still requires your selection.\n" << std::flush;
+                playback->preparation = std::make_shared<intezam::PlaybackPreparation>(magnet, metadata, *candidate, playback->cache);
+            }
+        }
         const auto selected_video = cli.metadata_only
-            ? intezam::selectVideo(videos, std::cin, std::cout)
-            : intezam::selectStreamingVideo(videos, metadata->piece_length(), std::cin, std::cout, cli.budget);
-        if (!selected_video) {
+            ? intezam::selectVideo(videos, std::cin, std::cout, [] { return selection_interrupted != 0; })
+            : intezam::selectStreamingVideo(videos, metadata->piece_length(), std::cin, std::cout, cli.budget,
+                [] { return selection_interrupted != 0; });
+        if (!selected_video || selection_interrupted) {
             std::cout << "\nSelection cancelled.\n";
             return EXIT_SUCCESS;
         }
+        if (playback && playback->preparation) {
+            const auto prepared = playback->preparation->snapshot();
+            if (!playback->preparation->matches(*selected_video) || !prepared.error.empty()
+                || (prepared.source && !prepared.source->status().error.empty())) playback->preparation.reset();
+        }
+        if (selection_interrupted) { std::cout << "\nSelection cancelled.\n"; return EXIT_SUCCESS; }
         std::cout << "\nSelected: " << selected_video->path
                   << "\nTorrent file index: " << static_cast<int>(selected_video->torrent_index)
                   << "\nSize: " << intezam::formatVideoSize(selected_video->size_bytes)
@@ -184,17 +225,11 @@ int main(int argc, char* argv[])
             simulation.duration = cli.duration;
             intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
         } else {
-            intezam::PlaybackOptions playback;
-            playback.cache.bootstrap_peers = discovery.peers;
-            playback.cache.playback_bytes_per_second = cli.bitrate;
-            playback.cache.budget = cli.budget;
-            playback.monitoring = cli.monitoring;
-            playback.vlc.headless = cli.headless;
 #ifdef INTEZAM_QT_UI
-            if (!cli.headless && !cli.no_ui) intezam::runQtPlayback(magnet, metadata, *selected_video, playback);
+            if (!cli.headless && !cli.no_ui) intezam::runQtPlayback(magnet, metadata, *selected_video, *playback);
             else
 #endif
-                intezam::runVlcPlayback(magnet, metadata, *selected_video, playback);
+                intezam::runVlcPlayback(magnet, metadata, *selected_video, *playback);
         }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

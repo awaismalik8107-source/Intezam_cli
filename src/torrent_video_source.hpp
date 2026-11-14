@@ -21,6 +21,8 @@ struct VideoSourceStatus {
     ReadPerformance performance;
     BufferWatermarks buffer_targets{};
     PlaybackPerformance playback{};
+    double estimated_playback_bytes_per_second = 0;
+    std::int64_t startup_buffer_target_bytes = 0;
 };
 
 class TorrentVideoSource final : public VideoByteSource {
@@ -38,6 +40,7 @@ public:
     void resumeReads() override;
     void stop() override;
     void setContainer(ContainerInfo container);
+    void finishHeaderPreparation(ContainerInfo container, double bytes_per_second);
     void beginPlaybackEpoch();
     void markPlaybackActive();
     void observePlayback(bool decoded_frame, bool buffering);

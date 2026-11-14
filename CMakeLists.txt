@@ -27,6 +27,7 @@ add_library(intezam_core
     src/vlc_playback.cpp
     src/cli_status_renderer.cpp
     src/playback_controller.cpp
+    src/playback_preparation.cpp
     src/torrent_metadata.cpp
     src/video_files.cpp
     src/video_selection.cpp
@@ -100,6 +101,10 @@ if(BUILD_TESTING)
             -DFFMPEG=${FFMPEG_EXECUTABLE} -DDESTINATION=${media_directory}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/test/generate_media.cmake)
         set_tests_properties(generate_vlc_media PROPERTIES FIXTURES_SETUP vlc_media TIMEOUT 120)
+        add_executable(preparation_tests test/preparation_tests.cpp)
+        target_link_libraries(preparation_tests PRIVATE intezam_core)
+        add_test(NAME bounded_startup_preparation COMMAND preparation_tests ${media_directory}/front.mp4)
+        set_tests_properties(bounded_startup_preparation PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 35)
         add_test(NAME vlc_cache_playback COMMAND playback_tests
             ${media_directory}/front.mp4 ${media_directory}/tail.mp4
             ${media_directory}/video.mkv ${media_directory}/video.webm

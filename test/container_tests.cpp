@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <map>
 #include <stdexcept>
@@ -65,6 +66,38 @@ int main()
         front.put(24, atom(128, "moov"));
         front.put(152, atom(3944, "mdat"));
         require(!intezam::probeContainer(front).moov_at_end, "front moov");
+        SparseSource duration_mp4(4096);
+        duration_mp4.put(0, atom(24, "ftyp"));
+        duration_mp4.put(24, atom(36, "moov"));
+        duration_mp4.put(32, atom(28, "mvhd"));
+        std::vector<unsigned char> movie_header(20, 0);
+        movie_header[14] = 3; movie_header[15] = 232; // 1000 ticks/second
+        movie_header[17] = 1; movie_header[18] = 0xd4; movie_header[19] = 0xc0; // 120000 ticks
+        duration_mp4.put(40, movie_header);
+        const auto duration_info = intezam::probeContainer(duration_mp4);
+        require(duration_info.duration_seconds && *duration_info.duration_seconds == 120,
+            "read MP4 movie duration before VLC startup");
+        require(intezam::initialVideoRate(24 * 1024 * 1024, duration_info, 1048576) == 24 * 1024 * 1024 / 120.0,
+            "estimate startup consumption from file size and duration");
+        require(intezam::initialVideoRate(1000000, {}, 1048576) == 1048576,
+            "unknown duration preserves the configured fallback");
+        movie_header[14] = movie_header[15] = 0;
+        duration_mp4.put(40, movie_header);
+        require(!intezam::probeContainer(duration_mp4).duration_seconds, "zero MP4 timescale is not a bitrate estimate");
+        duration_mp4.put(24, atom(48, "moov"));
+        duration_mp4.put(32, atom(40, "mvhd"));
+        movie_header.assign(32, 0);
+        movie_header[0] = 1;
+        movie_header[22] = 3; movie_header[23] = 232;
+        movie_header[27] = 1; // 2^32 ticks, requiring the version-1 64-bit field
+        duration_mp4.put(40, movie_header);
+        require(*intezam::probeContainer(duration_mp4).duration_seconds == 4294967296.0 / 1000,
+            "read the 64-bit version-1 movie duration");
+        require(intezam::initialVideoRate(1000000, intezam::probeContainer(duration_mp4), 1048576) == 1048576,
+            "implausible duration keeps the safe startup fallback");
+        std::fill(movie_header.begin() + 24, movie_header.end(), 255);
+        duration_mp4.put(40, movie_header);
+        require(!intezam::probeContainer(duration_mp4).duration_seconds, "unknown 64-bit duration is not interpreted as playback time");
         SparseSource fragmented(length);
         fragmented.put(0, atom(24, "ftyp"));
         fragmented.put(24, atom(128, "moov"));
@@ -92,6 +125,34 @@ int main()
             require(kind == (doc == "webm" ? intezam::ContainerType::webm : intezam::ContainerType::matroska),
                     "EBML DocType detection");
         }
+        SparseSource timed_ebml(4096);
+        std::vector<unsigned char> timed_header{0x1a,0x45,0xdf,0xa3,0x87,0x42,0x82,0x84,'w','e','b','m',
+            0x18,0x53,0x80,0x67,0xff, // unknown-length Segment
+            0x15,0x49,0xa9,0x66,0x92, // Info, 18 bytes
+            0x2a,0xd7,0xb1,0x83,0x0f,0x42,0x40, // 1000000 ns timescale
+            0x44,0x89,0x88};
+        double ticks = 120000;
+        std::uint64_t bits;
+        std::memcpy(&bits, &ticks, sizeof(bits));
+        for (int shift = 56; shift >= 0; shift -= 8) timed_header.push_back(static_cast<unsigned char>(bits >> shift));
+        timed_ebml.put(0, timed_header);
+        const auto timed_info = intezam::probeContainer(timed_ebml);
+        require(timed_info.duration_seconds && std::abs(*timed_info.duration_seconds - 120) < 0.001,
+            "read WebM/Matroska duration from bounded Segment Info");
+        require(timed_ebml.delivered < 8192, "duration probing does not scan media clusters");
+        SparseSource float_ebml(4096);
+        timed_header.resize(17);
+        const std::vector<unsigned char> float_info{0x15,0x49,0xa9,0x66,0x8e,
+            0x2a,0xd7,0xb1,0x83,0x0f,0x42,0x40,0x44,0x89,0x84,0x47,0xea,0x60,0x00};
+        timed_header.insert(timed_header.end(), float_info.begin(), float_info.end());
+        float_ebml.put(0, timed_header);
+        require(*intezam::probeContainer(float_ebml).duration_seconds == 120, "32-bit Matroska duration is supported");
+        SparseSource cluster_first(1024 * 1024);
+        timed_header.resize(17);
+        timed_header.insert(timed_header.end(), {0x1f,0x43,0xb6,0x75,0xff});
+        cluster_first.put(0, timed_header);
+        require(!intezam::probeContainer(cluster_first).duration_seconds && cluster_first.delivered < 8192,
+            "duration fallback stops before media clusters");
         SparseSource avi(4096);
         avi.put(0, {'R','I','F','F',0,0,0,0,'A','V','I',' '});
         require(intezam::probeContainer(avi).type == intezam::ContainerType::avi, "RIFF AVI");

@@ -19,7 +19,10 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = false)
+enum class SelectionAction { play, cancel, interrupt, metadata_only };
+
+void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = false,
+    SelectionAction action = SelectionAction::play)
 {
     test_support::LocalVideoTorrent torrent(file);
     auto pattern = (fs::current_path() / "intezam-cli-test-XXXXXX").string();
@@ -43,7 +46,9 @@ void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = 
         auto program = executable.string();
         char headless[] = "--headless", timeout[] = "--timeout", seconds[] = "20", strict[] = "--strict-cache";
         char maximum[] = "--cache-max-mib", mib[] = "32";
-        char* arguments[]{program.data(), headless, timeout, seconds, adaptive ? maximum : strict, adaptive ? mib : nullptr, nullptr};
+        char metadata_only[] = "--metadata-only";
+        char* arguments[]{program.data(), action == SelectionAction::metadata_only ? metadata_only : headless,
+            timeout, seconds, adaptive ? maximum : strict, adaptive ? mib : nullptr, nullptr};
         posix_spawn_file_actions_t actions;
         require(posix_spawn_file_actions_init(&actions) == 0, "CLI spawn actions");
         int result = posix_spawn_file_actions_adddup2(&actions, input[0], STDIN_FILENO);
@@ -57,17 +62,9 @@ void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = 
         require(result == 0, "spawn complete CLI");
         close(input[0]);
         input[0] = -1;
-        const auto selection = torrent.magnet() + "\n1\n";
-        require(write(input[1], selection.data(), selection.size()) == static_cast<ssize_t>(selection.size()), "CLI magnet and selection");
-        close(input[1]);
-        input_open = false;
         const auto deadline = std::chrono::steady_clock::now() + 35s;
         std::int64_t peak = 0;
-        int exit_status = 0;
-        for (;;) {
-            const auto exited = waitpid(child, &exit_status, WNOHANG);
-            require(exited >= 0, "wait for CLI");
-            if (exited == child) { child = -1; break; }
+        const auto measure_cache = [&] {
             std::int64_t allocated = 0;
             const auto measure = [&](const fs::path& path) {
                 struct stat status{};
@@ -77,21 +74,55 @@ void testsCli(const fs::path& executable, const fs::path& file, bool adaptive = 
             if (fs::exists(cache)) {
                 std::error_code error;
                 for (fs::recursive_directory_iterator entry(cache, error), end; entry != end; entry.increment(error)) {
+                    if (error == std::errc::no_such_file_or_directory) break;
                     require(!error, "inspect CLI cache");
                     measure(entry->path());
                 }
             }
             peak = std::max(peak, allocated);
             require(peak <= (adaptive ? 32LL * 1024 * 1024 : torrent.video().size_bytes / 40), "CLI actual disk bound");
+        };
+        const auto magnet = torrent.magnet() + '\n';
+        require(write(input[1], magnet.data(), magnet.size()) == static_cast<ssize_t>(magnet.size()), "CLI magnet");
+        // Keep stdin open without a choice while the background job starts.
+        for (;;) {
+            std::ifstream output(log);
+            const std::string text{std::istreambuf_iterator<char>{output}, {}};
+            require(text.find("Playback started.") == std::string::npos, "prefetch never auto-plays the candidate");
+            if (text.find("Select a video (") != std::string::npos
+                && (action == SelectionAction::metadata_only || fs::exists(cache))) break;
+            require(std::chrono::steady_clock::now() < deadline, "CLI waiting for manual selection: " + text);
+            std::this_thread::sleep_for(10ms);
+        }
+        measure_cache();
+        if (action == SelectionAction::interrupt) {
+            require(kill(child, SIGINT) == 0, "interrupt while choosing a video");
+        } else {
+            const std::string choice = action == SelectionAction::cancel ? "q\n" : "1\n";
+            require(write(input[1], choice.data(), choice.size()) == static_cast<ssize_t>(choice.size()), "CLI manual choice");
+            close(input[1]);
+            input_open = false;
+        }
+        int exit_status = 0;
+        for (;;) {
+            const auto exited = waitpid(child, &exit_status, WNOHANG);
+            require(exited >= 0, "wait for CLI");
+            if (exited == child) { child = -1; break; }
+            measure_cache();
             require(std::chrono::steady_clock::now() < deadline, "CLI default transport playback timeout; see " + log.string());
             std::this_thread::sleep_for(10ms);
         }
         std::ifstream output(log);
         const std::string text{std::istreambuf_iterator<char>{output}, {}};
         require(WIFEXITED(exit_status) && WEXITSTATUS(exit_status) == 0, "CLI exit: " + text);
-        require(text.find("moov near EOF") != std::string::npos && text.find("End of video.") != std::string::npos,
+        if (action == SelectionAction::play) require(text.find("moov near EOF") != std::string::npos && text.find("End of video.") != std::string::npos,
                 "complete magnet/selection/container/decode/EOF flow: " + text);
-        require(fs::exists(cache) && fs::is_empty(cache), "CLI removed session directory");
+        else require(text.find("Playback started.") == std::string::npos, "cancelled/metadata-only selection never starts a decoder");
+        if (action == SelectionAction::metadata_only) {
+            require(!fs::exists(cache) && peak == 0 && torrent.seed.status().total_payload_upload == 0,
+                "metadata-only CLI never creates a speculative cache or downloads payload");
+        } else require(fs::exists(cache) && fs::is_empty(cache), "CLI removed session directory");
+        if (input_open) { close(input[1]); input_open = false; }
         std::cout << "CLI magnet-to-EOF passed; peak allocation=" << peak << " bytes, adaptive=" << adaptive << '\n';
         fs::remove_all(root);
     } catch (...) {
@@ -294,6 +325,9 @@ int main(int argc, char* argv[])
         if (std::string(argv[1]) == "--cli" || std::string(argv[1]) == "--cli-adaptive") {
             require(argc == 4, "provide CLI executable and media fixture");
             testsCli(argv[2], argv[3], std::string(argv[1]) == "--cli-adaptive");
+            testsCli(argv[2], argv[3], std::string(argv[1]) == "--cli-adaptive", SelectionAction::cancel);
+            testsCli(argv[2], argv[3], std::string(argv[1]) == "--cli-adaptive", SelectionAction::interrupt);
+            testsCli(argv[2], argv[3], std::string(argv[1]) == "--cli-adaptive", SelectionAction::metadata_only);
             return 0;
         }
         int first = 1;

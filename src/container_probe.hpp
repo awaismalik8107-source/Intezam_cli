@@ -4,6 +4,7 @@
 #include "video_byte_source.hpp"
 
 #include <string>
+#include <optional>
 
 namespace intezam {
 
@@ -14,11 +15,13 @@ struct ContainerInfo {
     std::string name = "Unknown (VLC probing)";
     std::vector<VideoRange> metadata_ranges;
     bool moov_at_end = false;
+    std::optional<double> duration_seconds;
     bool isMetadata(std::int64_t offset) const;
 };
 
 // Signature/header probing only. VLC remains responsible for demuxing/decoding.
 // ISO BMFF payload boxes are skipped with byte offsets, not read through.
 ContainerInfo probeContainer(VideoByteSource& source);
+double initialVideoRate(std::int64_t file_bytes, const ContainerInfo& container, double fallback);
 
 } // namespace intezam

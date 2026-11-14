@@ -1,5 +1,6 @@
 #include "vlc_playback.hpp"
 #include "torrent_video_source.hpp"
+#include "playback_preparation.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -83,11 +84,24 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
     monitor.event("Selected Video: " + video.path);
     monitor.event("Initializing VLC and bounded torrent cache...");
     monitor.event("Controls: P/Space pause, F forward 10s, B backward 10s, S stop, Q quit");
-    auto source = std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
+    cache_options.header_read_mode = true;
+    if (options.preparation && !options.preparation->matches(video))
+        throw std::invalid_argument("Prepared headers belong to a different selected video.");
+    if (options.preparation) {
+        while (!interrupted && !options.preparation->snapshot().source && !options.preparation->snapshot().finished)
+            std::this_thread::sleep_for(std::chrono::milliseconds{50});
+        if (interrupted) { options.preparation->cancel(); monitor.event("Playback cancelled."); return; }
+    }
+    auto source = options.preparation ? options.preparation->waitForSource()
+        : std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
     VlcPlayer player(source, options.vlc);
-    auto preparation = std::async(std::launch::async, [source] {
-        auto container = probeContainer(*source);
-        source->setContainer(container);
+    auto preparation = std::async(std::launch::async, [source, options] {
+        const auto cached_headers = options.preparation ? options.preparation->waitForHeaders() : std::optional<ContainerInfo>{};
+        auto container = cached_headers ? *cached_headers : probeContainer(*source);
+        const auto rate = options.cache.estimate_bitrate_from_headers
+            ? initialVideoRate(source->size(), container, options.cache.playback_bytes_per_second)
+            : options.cache.playback_bytes_per_second;
+        source->finishHeaderPreparation(container, rate);
         source->prebuffer();
         return container;
     });
@@ -139,6 +153,7 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
                 }
             }
         }
+        if (options.preparation) options.preparation->cancel();
         player.stop();
         if (preparation.valid()) {
             try { preparation.get(); }
@@ -147,6 +162,7 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
         }
     } catch (...) {
         const auto failure = std::current_exception();
+        if (options.preparation) options.preparation->cancel();
         player.stop();
         if (preparation.valid()) { try { preparation.get(); } catch (...) {} }
         std::rethrow_exception(failure);

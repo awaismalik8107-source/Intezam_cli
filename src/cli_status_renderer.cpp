@@ -56,6 +56,8 @@ std::string debugDetails(const VideoSourceStatus& source)
 {
     const auto& cache = source.cache;
     return " | Queued " + std::to_string(cache.queued_pieces)
+        + " | HeaderOnly " + (cache.header_read_mode ? "1" : "0")
+        + " | BlockingPriority " + std::to_string(cache.actual_blocking_priority)
         + " | Desired " + std::to_string(cache.desired_capacity_bytes)
         + " | Physical " + std::to_string(cache.physical_capacity_bytes)
         + " | ReadWait_us " + std::to_string(source.performance.wait_microseconds)

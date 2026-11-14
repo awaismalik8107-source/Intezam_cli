@@ -95,7 +95,7 @@ void displaysPathsFormatsSizesAndIndexes(const std::vector<intezam::VideoFile>& 
     require(intezam::formatVideoSize(0) == "0.00 MiB", "zero-byte size");
 }
 
-void selectsTheOnlyVideoWithEnoughPieceBudget()
+void requiresManualSelectionEvenWhenOnlyOneVideoFits()
 {
     const intezam::VideoFile sample{lt::file_index_t{3}, "Sample/sample.mkv", ".mkv", 60879760, 0};
     const intezam::VideoFile movie{lt::file_index_t{6}, "main-film.mkv", ".mkv", 5869802096, 60879760};
@@ -104,19 +104,21 @@ void selectsTheOnlyVideoWithEnoughPieceBudget()
     const auto adaptive = intezam::selectStreamingVideo({sample, movie}, 2097152, sample_choice, adaptive_output);
     require(adaptive && adaptive->torrent_index == sample.torrent_index, "adaptive budget restores manual sample choice");
     require(adaptive_output.str().find("Automatically") == std::string::npos, "adaptive mode does not force main video");
-    std::istringstream no_choice;
+    std::istringstream main_choice("2\n");
     std::ostringstream output;
-    const auto selected = intezam::selectStreamingVideo({sample, movie}, 2097152, no_choice, output, {intezam::CacheBudgetMode::strict, 25});
+    const auto selected = intezam::selectStreamingVideo({sample, movie}, 2097152, main_choice, output, {intezam::CacheBudgetMode::strict, 25});
     require(selected && selected->torrent_index == movie.torrent_index && selected->torrent_offset == movie.torrent_offset,
-            "auto-select second/main video without changing its torrent identity");
-    require(output.str().find("Automatically selecting [2]") != std::string::npos, "explain second-option selection");
+            "manual main-video selection preserves its torrent identity");
+    require(output.str().find("Automatically") == std::string::npos, "prefetch never substitutes for manual selection");
     require(output.str().find("[1] unavailable") != std::string::npos, "explain sample cache limitation");
 
-    std::istringstream reversed_input;
+    std::istringstream reversed_input("1\n");
     std::ostringstream reversed_output;
     const auto first = intezam::selectStreamingVideo({movie, sample}, 2097152, reversed_input, reversed_output, {intezam::CacheBudgetMode::strict, 25});
     require(first && first->torrent_index == movie.torrent_index, "do not hard-code option two for other torrents");
-    require(reversed_output.str().find("Automatically selecting [1]") != std::string::npos, "preserve display numbering");
+    std::istringstream no_choice;
+    require(!intezam::selectStreamingVideo({sample, movie}, 2097152, no_choice, output, {intezam::CacheBudgetMode::strict, 25}),
+        "EOF cancels even when one eligible candidate was prefetched");
 
     std::istringstream metadata_choice("1\n");
     const auto metadata_only = intezam::selectVideo({sample, movie}, metadata_choice, output);
@@ -135,6 +137,9 @@ void keepsManualChoiceWhenMultipleVideosHaveEnoughBudget()
     require(selected && selected->torrent_index == lt::file_index_t{7}, "reject small sample then accept original option three");
     std::istringstream cancel("q\n");
     require(!intezam::selectStreamingVideo(videos, 2097152, cancel, output), "streaming selection can be cancelled");
+    std::istringstream interrupted("3\n");
+    require(!intezam::selectStreamingVideo(videos, 2097152, interrupted, output, {}, [] { return true; }),
+        "selection cancellation does not accept or auto-play a pending choice");
     bool rejected = false;
     std::istringstream unused;
     try { intezam::selectStreamingVideo({videos.front()}, 2097152, unused, output); }
@@ -151,7 +156,7 @@ int main()
         const auto videos = detectsVideosWithOriginalIndexes();
         validatesSelectionAndKeepsOriginalIdentity(videos);
         displaysPathsFormatsSizesAndIndexes(videos);
-        selectsTheOnlyVideoWithEnoughPieceBudget();
+        requiresManualSelectionEvenWhenOnlyOneVideoFits();
         keepsManualChoiceWhenMultipleVideosHaveEnoughBudget();
         std::cout << "Video detection and selection tests passed.\n";
         return EXIT_SUCCESS;

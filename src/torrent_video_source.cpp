@@ -149,7 +149,8 @@ void TorrentVideoSource::run()
 {
     std::optional<VideoRange> applied_demand;
     std::int64_t applied_offset = -1;
-    double applied_rate = requested_rate_;
+    double applied_rate;
+    { std::lock_guard<std::mutex> lock(read_signal_->mutex); applied_rate = requested_rate_; }
     try {
         while (!stopping_.load()) {
             std::optional<VideoRange> demand;
@@ -244,6 +245,16 @@ void TorrentVideoSource::setContainer(ContainerInfo container)
     container_ = std::move(container);
 }
 
+void TorrentVideoSource::finishHeaderPreparation(ContainerInfo container, double bytes_per_second)
+{
+    setContainer(std::move(container));
+    setEstimatedRate(bytes_per_second);
+    // Apply the rate before enabling rolling downloads, so they start with the
+    // header-derived horizon rather than the old provisional byte rate.
+    cache_->setPlaybackRate(bytes_per_second);
+    cache_->setHeaderReadMode(false);
+}
+
 void TorrentVideoSource::beginPlaybackEpoch()
 {
     std::lock_guard<std::mutex> lock(read_signal_->mutex);
@@ -300,15 +311,10 @@ void TorrentVideoSource::setEstimatedRate(double bytes_per_second)
 
 void TorrentVideoSource::prebuffer()
 {
-    double rate;
-    { std::lock_guard<std::mutex> lock(read_signal_->mutex); rate = requested_rate_; }
     std::array<unsigned char, 16384> bytes{};
     for (std::int64_t offset = 0;;) {
         const auto snapshot = status();
-        const auto seconds = snapshot.cache.adaptive_budget ? snapshot.cache.adaptive_target.startup_seconds
-            : snapshot.buffer_targets.high_seconds;
-        const auto target = std::min<std::int64_t>({video_size_, capacity_.load() / 3,
-            std::max<std::int64_t>(16384, static_cast<std::int64_t>(rate * seconds))});
+        const auto target = snapshot.startup_buffer_target_bytes;
         if (offset >= target) break;
         offset += readVerified(offset, bytes.data(), std::min<std::int64_t>(bytes.size(), target - offset), ReadPurpose::prebuffer);
     }
@@ -340,6 +346,11 @@ VideoSourceStatus TorrentVideoSource::status() const
     status.waiting_reads = pending_.size();
     status.stopped = stopping_.load();
     status.buffer_targets = bufferTargetsLocked();
+    status.estimated_playback_bytes_per_second = requested_rate_;
+    const auto seconds = status.cache.adaptive_budget ? status.cache.adaptive_target.startup_seconds
+        : status.buffer_targets.high_seconds;
+    status.startup_buffer_target_bytes = std::min<std::int64_t>({video_size_, capacity_.load() / 3,
+        std::max<std::int64_t>(16384, static_cast<std::int64_t>(requested_rate_ * seconds))});
     return status;
 }
 

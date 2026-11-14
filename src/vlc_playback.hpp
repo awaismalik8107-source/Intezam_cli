@@ -5,11 +5,13 @@
 #include "cli_status_renderer.hpp"
 
 namespace intezam {
+class PlaybackPreparation;
 
 struct PlaybackOptions {
     CacheStreamOptions cache;
     VlcOptions vlc;
     CliStatusOptions monitoring{};
+    std::shared_ptr<PlaybackPreparation> preparation;
 };
 
 void runVlcPlayback(const std::string& magnet,

@@ -1,14 +1,32 @@
 [
   {
+    "query": "Overgeared",
+    "mode": "mock",
+    "result_count": 1,
+    "searched_at": "2026-11-14T21:20:58.465610+00:00"
+  },
+  {
+    "query": "Steins",
+    "mode": "mock",
+    "result_count": 1,
+    "searched_at": "2026-11-14T21:20:51.051186+00:00"
+  },
+  {
+    "query": "Demon Slayer",
+    "mode": "mock",
+    "result_count": 1,
+    "searched_at": "2026-11-14T21:20:30.642883+00:00"
+  },
+  {
+    "query": "Demon",
+    "mode": "mock",
+    "result_count": 1,
+    "searched_at": "2026-11-14T21:20:24.879451+00:00"
+  },
+  {
     "query": "Frieren",
     "mode": "mock",
     "result_count": 1,
     "searched_at": "2026-11-14T20:16:04.204152+00:00"
-  },
-  {
-    "query": "demon slayer",
-    "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T20:14:28.748821+00:00"
   }
 ]

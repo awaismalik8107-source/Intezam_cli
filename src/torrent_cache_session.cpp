@@ -80,6 +80,7 @@ TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
       controller_(geometry_, store_->slotCount(), options.playback_bytes_per_second, options.forward_buffer_target_seconds),
       disk_state_(std::make_shared<CacheDiskState>())
 {
+    header_read_mode_ = options.header_read_mode;
     if (options.stall_timeout <= 0ms) throw std::invalid_argument("Cache stall timeout must be positive.");
     if (options.budget.mode == CacheBudgetMode::adaptive) {
         adaptive_budget_.emplace(geometry_, options.budget.adaptive);
@@ -111,7 +112,7 @@ TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
     // A streaming read must recover promptly when a temporarily unavailable peer
     // returns, rather than inheriting the default minute-long reconnect backoff.
     session_params.settings.set_int(lt::settings_pack::min_reconnect_time, 1);
-    if (adaptive_budget_) {
+    if (adaptive_budget_ || header_read_mode_) {
         // Finishing the current rolling window is temporary. Libtorrent's
         // default sends upload-only and disconnects seeds at that point, even
         // though later playback will need more pieces from those same peers.
@@ -288,6 +289,12 @@ TorrentCacheSession::AdmissionPlan TorrentCacheSession::planAdmissions()
     const auto urgent = urgentPieces();
     const auto window = controller_.planWindow(urgent);
     planned_window_ = window;
+    if (header_read_mode_) {
+        auto headers = window;
+        headers.pieces = urgent;
+        planned_window_ = headers;
+        return {headers, urgent, {}, urgent};
+    }
     auto desired = window.pieces;
     for (int piece : urgent) {
         if (std::find(desired.begin(), desired.end(), piece) == desired.end()) desired.push_back(piece);
@@ -415,7 +422,13 @@ void TorrentCacheSession::publishPriorities(std::map<int, lt::download_priority_
 
 std::vector<int> TorrentCacheSession::urgentPieces() const
 {
-    auto pieces = metadata_pieces_;
+    auto pieces = header_read_mode_ ? std::vector<int>{} : metadata_pieces_;
+    if (header_read_mode_ && !read_demand_) {
+        const int first = static_cast<int>(geometry_.video_offset / geometry_.piece_length);
+        // Start with one genuinely needed header piece, rather than briefly
+        // advertising an empty/finished torrent before the reader can enqueue it.
+        if (!store_->isVerified(first)) pieces.push_back(first);
+    }
     if (read_demand_) {
         const auto demand = geometry_.piecesForRange(read_demand_->offset, read_demand_->length);
         pieces.insert(pieces.end(), demand.begin(), demand.end());
@@ -519,7 +532,8 @@ void TorrentCacheSession::pump(std::chrono::milliseconds wait)
         last_progress_ = Clock::now();
         last_verified_ = verified;
     }
-    if (forwardBufferSeconds() == 0 && Clock::now() - last_progress_ > options_.stall_timeout) {
+    if ((!header_read_mode_ || read_demand_) && forwardBufferSeconds() == 0
+        && Clock::now() - last_progress_ > options_.stall_timeout) {
         const auto status = torrent_.status();
         throw std::runtime_error("Playback cache starved: no verified playback data before stall timeout. Peers: "
             + std::to_string(status.num_peers) + ". " + last_peer_error_);
@@ -558,6 +572,20 @@ void TorrentCacheSession::setPlaybackRate(double bytes_per_second)
     adaptCache();
     updateReservation(bytes_per_second);
     schedule();
+}
+
+void TorrentCacheSession::setHeaderReadMode(bool enabled)
+{
+    std::lock_guard<std::mutex> control(control_mutex_);
+    if (header_read_mode_ == enabled) return;
+    header_read_mode_ = enabled;
+    last_progress_ = Clock::now();
+    controller_.reposition(controller_.playbackPosition());
+    schedule();
+    if (!enabled) {
+        torrent_.unset_flags(lt::torrent_flags::upload_mode);
+        for (const auto& peer : known_peers_) torrent_.connect_peer(peer);
+    }
 }
 
 void TorrentCacheSession::setProtectedMetadata(const std::vector<VideoRange>& ranges)
@@ -620,6 +648,7 @@ void TorrentCacheSession::updateReadRequest(std::int64_t playback_offset, std::o
         else controller_.updatePlaybackPosition(playback_offset);
         last_progress_ = Clock::now();
     }
+    if (demand && demand != read_demand_) last_progress_ = Clock::now();
     read_demand_ = demand;
     schedule();
 }
@@ -692,6 +721,7 @@ CacheDiagnostics TorrentCacheSession::diagnostics() const
     result.connected_peers = status.num_peers;
     result.torrent_finished = status.is_finished;
     result.last_peer_error = last_peer_error_;
+    result.header_read_mode = header_read_mode_;
     if (read_demand_) {
         const auto pieces = geometry_.piecesForRange(read_demand_->offset, read_demand_->length);
         if (!pieces.empty() && !store_->isVerified(pieces.front())) {

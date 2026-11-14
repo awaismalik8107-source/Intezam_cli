@@ -56,6 +56,22 @@ cmake --build build-cli -j2
 Paste a magnet and choose a video by its displayed number. Original zero-based
 torrent indexes, full paths, extensions and sizes are retained. Metadata retrieval
 remains payload-free and writes no files. `--metadata-only` exits after selection.
+For normal playback, bounded header prefetch begins while the selection menu is
+open, using the largest video that fits the chosen budget. This prepares at most
+four distinct pieces, limited to 8 MiB unless one whole piece is larger. Choosing
+that candidate reuses its source, connections and verified cache; choosing another
+video cancels and removes the speculative cache first. A video is never selected
+or played automatically. `q`, EOF and Ctrl+C cancel preparation and clean up.
+`--metadata-only` and `--simulate` do not enable this speculative step.
+
+Header loading temporarily requests only the necessary header pieces; normal
+lookahead resumes afterwards. MP4/MOV/M4V and Matroska/WebM headers can supply a
+duration for the initial file-size/duration bitrate estimate, reducing unnecessary
+buffering for low-bitrate videos. Unsupported, missing or implausible durations
+retain the 1 MiB/s fallback; `--bitrate` overrides this startup estimate. VLC can
+refine the rate once its own duration is available. Buffer safety thresholds,
+verification and disk limits remain in effect.
+
 The default **Adaptive Streaming Engine 2.0** sizes the cache from estimated
 consumption, useful verified throughput, network variability and forward-buffer
 requirements. It starts with a 24-second forward horizon, at least four aligned
@@ -67,15 +83,16 @@ controls are unchanged. See [formulas, configuration, tests and measurements](do
 `--legacy-cache` restores the former automatic 2.5% target/four-piece minimum,
 bounded by 25% of the selected video. `--cache-max-percent N` selects that legacy
 mode with a different ceiling (3–99). `--strict-cache` keeps the original 2.5%
-limit and its only-eligible-video automatic selection. Filesystem
+limit. Selection stays manual even when only one video fits. Filesystem
 allocation is checked again when playback starts. The default metadata timeout
 is 120 seconds (`--timeout`: 1–3600 seconds).
 
 After selection, the default **Qt 6 playback window** opens while the container
 and startup buffer load. It embeds LibVLC video directly and provides play/pause,
 stop, ±10 seconds, a seek-on-release timeline, volume/mute, fullscreen, elapsed
-time, buffered seconds, network speed, cache usage and the effective budget
-percentage. Stop or close cancels reads and removes the session cache; the UI
+time and duration. The loading view shows the current stage, elapsed time and
+estimated startup-buffer progress until the first decoded frame. Technical
+network and cache metrics appear in the CLI. Stop or close cancels reads and removes the session cache; the UI
 stays responsive during preparation and shutdown.
 
 Keyboard shortcuts: **Space** play/pause, **Left/Right** ±10 seconds, **M** mute,
@@ -193,7 +210,7 @@ Priority 7/deadlines cover blocking or imminent data; priority 6 covers near
 future data, 4 distant prefetch and 1 backward retention. Highest priority does
 not increase physical bandwidth. Completing a temporary window retains peers.
 
-The UI labels the readout **estimated verified data ahead of VLC's byte reader**;
+The CLI labels the readout **estimated verified data ahead of VLC's byte reader**;
 VLC's decoded queues are separate. Brief prefetch waits do not label active
 playback as buffering. Download speed uses the current half-second transfer sample,
 while scheduling keeps a separate smoothed throughput estimate. When the bounded

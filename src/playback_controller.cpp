@@ -1,4 +1,5 @@
 #include "playback_controller.hpp"
+#include "playback_preparation.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -38,6 +39,7 @@ void PlaybackController::submit(PlaybackCommand command)
 void PlaybackController::requestStop()
 {
     stopping_ = true;
+    if (options_.preparation) options_.preparation->cancel();
     std::shared_ptr<TorrentVideoSource> source;
     { std::lock_guard<std::mutex> lock(mutex_); source = source_; }
     if (source) source->cancelPendingReads();
@@ -50,17 +52,10 @@ PlaybackSnapshot PlaybackController::snapshot() const
     { std::lock_guard<std::mutex> lock(mutex_); result = snapshot_; source = source_; }
     if (source && !result.finished) {
         result.source = source->status();
-        const auto& cache = result.source.cache;
-        result.startup.buffered_seconds = cache.forward_buffer_seconds;
+        result.startup.buffered_seconds = result.source.cache.forward_buffer_seconds;
         if (result.startup.stage == StartupStage::buffering) {
-            const auto rate = options_.cache.playback_bytes_per_second;
-            const auto seconds = cache.adaptive_budget ? cache.adaptive_target.startup_seconds
-                : result.source.buffer_targets.high_seconds;
-            // Report the estimated prebuffer goal, including its selected-file
-            // and physical-capacity bounds. This does not alter that policy.
-            const auto bytes = std::min<double>({double(source->size()), double(source->capacity() / 3),
-                std::max(16384.0, rate * seconds)});
-            result.startup.target_seconds = bytes / rate;
+            result.startup.target_seconds = result.source.startup_buffer_target_bytes
+                / std::max(1.0, result.source.estimated_playback_bytes_per_second);
         }
     }
     return result;
@@ -98,12 +93,21 @@ void PlaybackController::run(const std::string& magnet, std::shared_ptr<const li
         auto cache_options = options_.cache;
         const auto external = cache_options.cancelled;
         cache_options.cancelled = [this, external] { return stopping_.load() || (external && external()); };
+        cache_options.header_read_mode = true;
         if (stopping_) throw ReadCancelled{};
-        source = std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
+        if (options_.preparation && !options_.preparation->matches(video))
+            throw std::invalid_argument("Prepared headers belong to a different selected video.");
+        source = options_.preparation ? options_.preparation->waitForSource()
+            : std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
         { std::lock_guard<std::mutex> lock(mutex_); source_ = source; }
         if (stopping_) { source->cancelPendingReads(); throw ReadCancelled{}; }
         setStartupStage(StartupStage::reading_container, "Reading video headers");
-        source->setContainer(probeContainer(*source));
+        const auto cached_headers = options_.preparation ? options_.preparation->waitForHeaders() : std::optional<ContainerInfo>{};
+        const auto container = cached_headers ? *cached_headers : probeContainer(*source);
+        const auto rate = cache_options.estimate_bitrate_from_headers
+            ? initialVideoRate(source->size(), container, cache_options.playback_bytes_per_second)
+            : cache_options.playback_bytes_per_second;
+        source->finishHeaderPreparation(container, rate);
         setStartupStage(StartupStage::buffering, "Building startup buffer");
         source->prebuffer();
         if (stopping_) throw ReadCancelled{};

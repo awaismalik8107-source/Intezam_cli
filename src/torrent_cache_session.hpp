@@ -32,6 +32,8 @@ struct CacheStreamOptions {
     std::optional<std::size_t> reserved_slots; // automatic when unset; no extra disk allocation
     std::function<void(int)> on_piece_verified; // network thread; must not throw or call control APIs
     std::vector<libtorrent::tcp::endpoint> bootstrap_peers; // discovered by the metadata session
+    bool header_read_mode = false; // download demanded header pieces before rolling prefetch
+    bool estimate_bitrate_from_headers = true;
 };
 
 struct CacheDiagnostics {
@@ -69,6 +71,7 @@ struct CacheDiagnostics {
     int connected_peers = 0;
     bool torrent_finished = false;
     std::string last_peer_error{};
+    bool header_read_mode = false;
 };
 
 // Control methods are serialized internally. Playback may hold/use ReadLease
@@ -82,6 +85,7 @@ public:
     bool seek(std::int64_t byte_offset);
     void setPlaybackPosition(std::int64_t byte_offset);
     void setPlaybackRate(double bytes_per_second);
+    void setHeaderReadMode(bool enabled);
     void setProtectedMetadata(const std::vector<VideoRange>& ranges);
     void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand,
                            PlaybackMovement movement = PlaybackMovement::sequential);
@@ -160,6 +164,7 @@ private:
     std::uint64_t sampled_verified_bytes_ = 0;
     bool seeking_ = false;
     std::string capacity_constraint_;
+    bool header_read_mode_ = false;
     std::vector<int> metadata_pieces_;
 };
 

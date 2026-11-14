@@ -5,6 +5,10 @@
 #include <cctype>
 #include <iomanip>
 #include <istream>
+#include <iostream>
+#include <cerrno>
+#include <poll.h>
+#include <unistd.h>
 #include <locale>
 #include <ostream>
 #include <sstream>
@@ -12,6 +16,27 @@
 #include <string_view>
 
 namespace intezam {
+namespace {
+bool readSelectionLine(std::istream& input, std::string& line, const std::function<bool()>& cancelled)
+{
+    if (cancelled && cancelled()) return false;
+    if (!cancelled || &input != &std::cin) return static_cast<bool>(std::getline(input, line));
+    line.clear();
+    while (!cancelled()) {
+        if (input.rdbuf()->in_avail() <= 0) {
+            pollfd descriptor{STDIN_FILENO, POLLIN, 0};
+            const int ready = poll(&descriptor, 1, 100);
+            if (ready < 0 && errno != EINTR) throw std::runtime_error("Cannot poll video selection input.");
+            if (ready <= 0) continue;
+        }
+        const int character = input.get();
+        if (character == std::char_traits<char>::eof()) return !line.empty();
+        if (character == '\n') return true;
+        line.push_back(static_cast<char>(character));
+    }
+    return false;
+}
+}
 
 std::string formatVideoSize(std::int64_t size_bytes)
 {
@@ -42,6 +67,10 @@ void displayVideos(const std::vector<VideoFile>& videos, std::ostream& output)
 
 std::optional<VideoFile> selectVideo(
     const std::vector<VideoFile>& videos, std::istream& input, std::ostream& output)
+{ return selectVideo(videos, input, output, {}); }
+
+std::optional<VideoFile> selectVideo(const std::vector<VideoFile>& videos,
+    std::istream& input, std::ostream& output, const std::function<bool()>& cancelled)
 {
     if (videos.empty()) {
         return std::nullopt;
@@ -50,7 +79,7 @@ std::optional<VideoFile> selectVideo(
         output << "Select a video (1-" << videos.size()
                << ", q to cancel): " << std::flush;
         std::string line;
-        if (!std::getline(input, line)) {
+        if (!readSelectionLine(input, line, cancelled)) {
             return std::nullopt;
         }
         const auto first = line.find_first_not_of(" \t\r\n");
@@ -73,8 +102,14 @@ std::optional<VideoFile> selectVideo(
 
 std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
     int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget)
+{ return selectStreamingVideo(videos, piece_length, input, output, budget, {}); }
+
+std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
+    int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget,
+    const std::function<bool()>& cancelled)
 {
     if (piece_length <= 0) throw std::invalid_argument("Torrent piece length must be positive.");
+    if (cancelled && cancelled()) return std::nullopt;
     if (videos.empty()) return std::nullopt;
     const auto fits_piece = [piece_length, budget](const VideoFile& video) {
         if (budget.mode == CacheBudgetMode::strict) return video.size_bytes / 40 >= piece_length;
@@ -88,14 +123,8 @@ std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& vide
         }
     }
     if (eligible == 0) throw std::runtime_error("No video fits the selected cache budget policy.");
-    if (budget.mode == CacheBudgetMode::strict && eligible == 1 && videos.size() > 1) {
-        const auto selected = std::find_if(videos.begin(), videos.end(), fits_piece);
-        output << "Automatically selecting [" << std::distance(videos.begin(), selected) + 1 << "]: "
-               << selected->path << " (the only candidate with enough piece budget).\n" << std::flush;
-        return *selected;
-    }
     for (;;) {
-        auto selected = selectVideo(videos, input, output);
+        auto selected = selectVideo(videos, input, output, cancelled);
         if (!selected || fits_piece(*selected)) return selected;
         output << "That video does not fit the selected cache budget policy. Choose another video.\n";
     }
