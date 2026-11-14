@@ -99,25 +99,6 @@ function extractSeasonEpisode(title: string): string | null {
   return seasonOnly ? seasonOnly[1].toUpperCase() : null;
 }
 
-function cleanDisplayTitle(rawTitle: string): string {
-  // Preserve genuine title while trimming release group tags and mirror suffixes for grouping
-  let cleaned = rawTitle
-    .replace(/^\[[^\]]+\]\s*/, "")
-    .replace(/\s+—\s+(Official Release.*|Magnet Mirror.*|Minimal NetInstall.*|Base32 Magnet.*|Documentation.*|Malformed.*|Broken.*)$/i, "")
-    .replace(/\s*\((?:40-char Hex BTIH|Validation Test|PDF\/ZIP|Season \d+ Batch)\)\s*$/i, "")
-    .replace(/\s*-\s*\d{1,3}(?:v\d)?\b.*$/i, "")
-    .trim();
-
-  // Strip trailing release codec/resolution clutter only if meaningful text remains
-  const stripped = cleaned
-    .replace(/[\s._\-\[\(]+(?:2160p|1080p|720p|480p|x264|x265|hevc|web-?dl|bluray|remux).*$/i, "")
-    .trim();
-  if (stripped.length >= 3) {
-    cleaned = stripped;
-  }
-  return cleaned || rawTitle;
-}
-
 export function adaptScrapedItem(item: ScrapedItem, providerName: string): MediaSource {
   const quality = inferQuality(item.title);
   const parsedPeers = parsePeers(item.stats);
