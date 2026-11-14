@@ -72,7 +72,7 @@ export function SearchView({
   onSelectPage,
   onLoadMore,
 }: SearchViewProps) {
-  const [viewMode, setViewMode] = useState<"grid" | "cards">("grid");
+  const [viewMode, setViewMode] = useState<"grid" | "cards">("cards");
 
   return (
     <m.div
