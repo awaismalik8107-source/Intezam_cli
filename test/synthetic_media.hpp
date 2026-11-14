@@ -7,7 +7,7 @@ namespace test_support {
 // Seeder input only. Client storage is always the separate managed slot cache.
 class SyntheticMedia {
 public:
-    SyntheticMedia()
+    explicit SyntheticMedia(int size_mebibytes = 32)
     {
         auto pattern = (fs::current_path() / "intezam-benchmark-XXXXXX").string();
         require(mkdtemp(pattern.data()) != nullptr, "benchmark directory");
@@ -15,7 +15,7 @@ public:
         std::ofstream file(path(), std::ios::binary);
         std::vector<char> block(1024 * 1024);
         for (std::size_t index = 0; index < block.size(); ++index) block[index] = static_cast<char>(index % 251);
-        for (int count = 0; count < 32; ++count) file.write(block.data(), block.size());
+        for (int count = 0; count < size_mebibytes; ++count) file.write(block.data(), block.size());
         if (!file.good()) {
             file.close();
             fs::remove_all(directory_);

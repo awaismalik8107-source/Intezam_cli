@@ -12,7 +12,7 @@ API. Tested locally with libtorrent **2.1.2**, LibVLC **3.0.24**, and GCC 16.2.1
 LibVLC 4 has different lifecycle APIs and is rejected by this CMake configuration.
 
 ```bash
-sudo pacman -S --needed base-devel pkgconf cmake libtorrent-rasterbar libvlc vlc vlc-plugins-all
+sudo pacman -S --needed base-devel pkgconf cmake libtorrent-rasterbar libvlc vlc vlc-plugins-all qt6-base libx11
 pkg-config --modversion libtorrent-rasterbar libvlc
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
@@ -22,27 +22,28 @@ cmake --build build -j2
 `vlc-plugins-all` supplies the runtime demuxers, codecs and output modules. A
 minimal installation can use the corresponding individual VLC plugin packages;
 headers/libvlc alone do not guarantee codec availability. No FFmpeg development
-library, HTTP framework, Qt application or external player process is required.
+library, HTTP framework or external player process is required. Qt 6 Widgets
+and X11 are linked for the native controller (Qt Test is used by UI tests).
 The [Arch plugin package](https://archlinux.org/packages/extra/x86_64/vlc-plugins-all/)
 documents its runtime dependencies.
 
 Use `build/intezam`; historical binaries in the repository root are unchanged.
-CMake commands work in Bash and Fish. A direct Bash build is also supported:
+CMake commands work in Bash and Fish. For a terminal-only build without Qt:
 
 ```bash
-mkdir -p build
-g++ -std=c++17 -Wall -Wextra -Wpedantic main.cpp src/*.cpp \
-    $(pkg-config --cflags --libs libtorrent-rasterbar libvlc) -pthread -o build/intezam
+cmake -S . -B build-cli -DCMAKE_BUILD_TYPE=Release -DINTEZAM_QT_UI=OFF
+cmake --build build-cli -j2
+./build-cli/intezam
 ```
-
-In Fish, replace the command substitution with
-`(pkg-config --cflags --libs libtorrent-rasterbar libvlc | string split ' ')`.
 
 ## Playback
 
 ```bash
 ./build/intezam
 ./build/intezam --timeout 60 --bitrate 1048576
+./build/intezam --no-ui
+./build/intezam --strict-cache
+./build/intezam --cache-max-percent 30
 ./build/intezam --headless
 ./build/intezam --metadata-only
 ./build/intezam --simulate
@@ -52,15 +53,32 @@ In Fish, replace the command substitution with
 Paste a magnet and choose a video by its displayed number. Original zero-based
 torrent indexes, full paths, extensions and sizes are retained. Metadata retrieval
 remains payload-free and writes no files. `--metadata-only` exits after selection.
-Playback skips candidates whose 2.5% budget is below one torrent piece. If only
-one candidate remains from a multi-video list, it is selected automatically using
-its original number. This avoids selecting an undersized sample instead of the
-main film. Other lists keep manual selection; filesystem/container capacity is
-still checked when playback starts. Metadata-only mode keeps all candidates.
-The default metadata timeout is 120 seconds (`--timeout`: 1–3600 seconds).
+Adaptive mode keeps manual selection, including samples whose 2.5% target is
+smaller than a torrent piece. It raises the budget only enough to provide four
+whole aligned pieces plus filesystem overhead, up to 25% of the selected video.
+`--cache-max-percent N` changes that ceiling (3–99); `--strict-cache` keeps the
+original 2.5% limit and its only-eligible-video automatic selection. Filesystem
+allocation is checked again when playback starts. The default metadata timeout
+is 120 seconds (`--timeout`: 1–3600 seconds).
 
-Default mode probes the actual container bytes, buffers a capacity-limited startup
-range, then starts LibVLC. Terminal controls do not require Enter on a TTY:
+After selection, the default **Qt 6 playback window** opens while the container
+and startup buffer load. It embeds LibVLC video directly and provides play/pause,
+stop, ±10 seconds, a seek-on-release timeline, volume/mute, fullscreen, elapsed
+time, buffered seconds, network speed, cache usage and the effective budget
+percentage. Stop or close cancels reads and removes the session cache; the UI
+stays responsive during preparation and shutdown.
+
+Keyboard shortcuts: **Space** play/pause, **Left/Right** ±10 seconds, **M** mute,
+**F/F11** fullscreen, **Escape** leave fullscreen, **Ctrl+Q** close. Buttons and
+keyboard controls provide alternatives to dragging. The magnet and video choice
+remain in the terminal.
+
+LibVLC 3 native embedding uses **X11/XWayland**, so `DISPLAY` must be available.
+The process selects Qt's `xcb` backend before creating the application; no global
+Qt setting is changed. `--no-ui` retains VLC's separate output window and the
+terminal controls below. `--headless` also uses terminal controls.
+
+Terminal controls do not require Enter on a TTY:
 
 | Key | Action |
 |---|---|
@@ -71,7 +89,7 @@ range, then starts LibVLC. Terminal controls do not require Enter on a TTY:
 | Q | Quit and remove the cache |
 
 SIGINT/SIGTERM also cancel reads and unwind the session. Terminal settings are
-restored on exit. Closing stdin disables controls while playback continues to
+restored on exit. In terminal mode, closing stdin disables controls while playback continues to
 media EOF; a piped magnet/selection can therefore play unattended. Status displays
 VLC's time/duration, buffering, observed network speed, allocated cache bytes and
 the desired/verified/downloading window state.
@@ -142,6 +160,25 @@ rejects unusually expensive probing/index reconstruction rather than fetching th
 whole video. Decoder buffers and parsed metadata in VLC remain separate from
 the managed on-disk video cache.
 
+Startup/resume watermarks adapt to observed network speed versus estimated
+consumption: 6 seconds for a fast swarm, 8 seconds near parity, 12 seconds for a
+slow/unknown swarm, clipped by the actual forward window, one third of capacity
+and remaining bytes. The download horizon grows to about 30 seconds ahead when
+the cache can hold it, while retaining approximately one third behind. A low-water
+miss lasting 250 ms pauses until the high-water target returns. A user pause always takes precedence. Piece deadlines use byte
+distance divided by estimated consumption, with a 500 ms verification margin;
+urgent reads are immediate and behind-window retention has lower priority. Existing
+forward deadlines stay in place; only changes are published. When verified runway
+falls below two piece durations (at least 0.5 seconds), forward refill can reclaim
+a single cold slot rather than waiting until the next piece becomes an urgent miss.
+
+The UI labels the readout **estimated verified data ahead of VLC's byte reader**;
+VLC's decoded queues are separate. Brief prefetch waits do not label active
+playback as buffering. Download speed uses the current half-second transfer sample,
+while scheduling keeps a separate smoothed throughput estimate. When the bounded
+forward window is full, downloads can idle until playback makes room.
+See [the refill and smooth playback follow-up](docs/smooth-playback.md).
+
 ## Disk budget and cleanup
 
 The disk cache architecture is retained: one preallocated slot file under
@@ -152,7 +189,11 @@ stream.cache   # fixed size; whole-piece slots reused in place
 session.lock   # empty advisory lock; mappings/resume state stay in memory
 ```
 
-Maximum budget is `floor(video_size / 40)` bytes. Complete pieces, filesystem
+The target is `floor(video_size / 40)` bytes. Automatic mode fixes the session
+budget to `max(target, 4 * aligned_piece_size + measured_overhead + allocation_unit)`.
+It refuses to allocate above `floor(video_size * maximum_percent / 100)` (25% by
+default). The budget never grows during playback. Strict mode uses the target
+alone. Complete pieces, filesystem
 alignment, session/root directory blocks, lock allocation and an allocation-unit
 reserve are accounted for before requesting payload. Actual allocated blocks
 (`st_blocks * 512`) are checked after preallocation and writes. Container metadata,
@@ -196,7 +237,7 @@ boundary. Verified overlap, active pins and required playback pieces survive.
 Small speculative deficits wait for a batch; required misses bypass that delay.
 Rolling and resize hysteresis limit window oscillation, while explicit user seeks
 reposition immediately. Every occupied/reserved slot belongs to the same fixed
-2.5% allocation; no additional payload file is created.
+effective allocation; no additional payload file is created.
 
 Local three-run medians: sequential rebuilds **111 -> 14**, seeking **25 -> 7**,
 and short-clip VLC **97 -> 91**. VLC verified-data waiting fell **501 -> 210 ms**.
@@ -228,14 +269,22 @@ Container unit tests verify bounded atom scanning and malformed
 headers. Existing metadata-only, file-selection, v1/v2/hybrid cache, reader-pin,
 allocation-failure and stale-session tests remain in CTest.
 
-The automated output test uses memory video and dummy audio outputs. Visual
+Qt tests also verify one seek per drag release, disabled loading controls,
+command dispatch, volume/mute, preserving pause while seeking, fullscreen,
+cancellation during blocked startup, asynchronous close and cleanup. The Qt
+integration test uses a real loopback torrent and LibVLC with offscreen controls.
+Run `build/qt_streaming_tests PATH_TO_FIXTURE --native` on X11/XWayland to exercise
+the embedded native output (a local native run also decoded video and audio).
+See [adaptive playback design and measured comparison](docs/adaptive-playback.md).
+
+The automated output tests use memory video and dummy audio outputs. Visual
 desktop rendering, audible sound, hardware decoding, arbitrary codecs, damaged
 or encrypted media, public swarms and sustained WAN performance are **not**
 validated by that headless test. These require separate manual/compatibility tests.
 FFmpeg absence is reported at configure time and skips the real-media test;
 container/cache/unit tests still run.
 
-The local normal run passed all **12 CTest checks**. These include reserved-slot,
+The updated local normal run passed all **16 CTest checks**. These include reserved-slot,
 batch reconstruction, window stability and VLC peer-outage recovery regressions.
 Separate CLI smoke runs also
 verified quitting during startup and SIGTERM cleanup. Tail-MP4 playback peaked at
@@ -261,8 +310,8 @@ observed. This is **not** a leak-clean sanitizer result. To run the address/UB
 checks separately while retaining leak checking on the non-playback tests:
 
 ```bash
-ctest --test-dir build-sanitize --output-on-failure -E 'generate_vlc_media|vlc_cache_playback|cli_magnet_to_playback|cleanup_vlc_media'
-ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-sanitize --output-on-failure -R 'vlc_cache_playback|cli_magnet_to_playback'
+ctest --test-dir build-sanitize --output-on-failure -E 'qt_|generate_vlc_media|vlc_cache_playback|cli_magnet_to_playback|cleanup_vlc_media'
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-sanitize --output-on-failure -R 'qt_|vlc_cache_playback|cli_magnet_to_playback'
 ```
 
 ThreadSanitizer checks for storage and concurrent reconstruction also passed:

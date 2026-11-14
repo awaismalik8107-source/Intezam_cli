@@ -72,23 +72,23 @@ std::optional<VideoFile> selectVideo(
 }
 
 std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
-    int piece_length, std::istream& input, std::ostream& output)
+    int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget)
 {
     if (piece_length <= 0) throw std::invalid_argument("Torrent piece length must be positive.");
     if (videos.empty()) return std::nullopt;
-    const auto fits_piece = [piece_length](const VideoFile& video) {
-        return video.size_bytes / 40 >= piece_length;
+    const auto fits_piece = [piece_length, budget](const VideoFile& video) {
+        if (budget.mode == CacheBudgetMode::strict) return video.size_bytes / 40 >= piece_length;
+        try { planCacheBudget(video.size_bytes, piece_length, 4096, 8192, budget); return true; }
+        catch (const std::runtime_error&) { return false; }
     };
     const auto eligible = std::count_if(videos.begin(), videos.end(), fits_piece);
     for (std::size_t index = 0; index < videos.size(); ++index) {
         if (!fits_piece(videos[index])) {
-            output << "Video [" << index + 1 << "] unavailable: its 2.5% cache budget is "
-                   << formatVideoSize(videos[index].size_bytes / 40) << ", below the "
-                   << formatVideoSize(piece_length) << " torrent piece size.\n";
+            output << "Video [" << index + 1 << "] unavailable under the selected cache budget policy.\n";
         }
     }
-    if (eligible == 0) throw std::runtime_error("No video's 2.5% cache budget can fit one whole torrent piece.");
-    if (eligible == 1 && videos.size() > 1) {
+    if (eligible == 0) throw std::runtime_error("No video fits the selected cache budget policy.");
+    if (budget.mode == CacheBudgetMode::strict && eligible == 1 && videos.size() > 1) {
         const auto selected = std::find_if(videos.begin(), videos.end(), fits_piece);
         output << "Automatically selecting [" << std::distance(videos.begin(), selected) + 1 << "]: "
                << selected->path << " (the only candidate with enough piece budget).\n" << std::flush;
@@ -97,7 +97,7 @@ std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& vide
     for (;;) {
         auto selected = selectVideo(videos, input, output);
         if (!selected || fits_piece(*selected)) return selected;
-        output << "That video cannot fit a torrent piece in its cache budget. Choose another video.\n";
+        output << "That video does not fit the selected cache budget policy. Choose another video.\n";
     }
 }
 

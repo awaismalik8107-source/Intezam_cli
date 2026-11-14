@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cache_budget.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -11,7 +13,8 @@ namespace intezam {
 class CacheFile {
 public:
     static std::unique_ptr<CacheFile> create(std::int64_t video_size, int piece_length,
-                                            const std::filesystem::path& root);
+                                            const std::filesystem::path& root,
+                                            CacheBudgetOptions options = {CacheBudgetMode::strict, 25});
     static std::filesystem::path defaultRoot();
     static void recoverStale(const std::filesystem::path& root);
     ~CacheFile();
@@ -28,7 +31,7 @@ public:
 
 private:
     CacheFile() = default;
-    void initialize(std::int64_t video_size, int piece_length, const std::filesystem::path& root);
+    void initialize(std::int64_t video_size, int piece_length, const std::filesystem::path& root, CacheBudgetOptions options);
     std::filesystem::path directory_;
     std::filesystem::path root_;
     int fd_ = -1;

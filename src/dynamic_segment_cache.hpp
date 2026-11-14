@@ -21,7 +21,8 @@ struct SegmentWindow {
 // independent mutex; the libtorrent thread never accesses this policy object.
 class DynamicSegmentCache {
 public:
-    DynamicSegmentCache(PieceGeometry geometry, std::size_t slots, double bitrate);
+    DynamicSegmentCache(PieceGeometry geometry, std::size_t slots, double bitrate,
+        double forward_target_seconds = 0);
     void updatePlaybackPosition(std::int64_t byte_offset);
     void reposition(std::int64_t byte_offset);
     void updateCapacity(std::size_t slots);
@@ -42,6 +43,7 @@ private:
     std::int64_t segment_size_;
     std::int64_t position_ = 0;
     double bitrate_;
+    double forward_target_seconds_;
     double speed_ = 0;
     double jitter_ = 0;
     double buffer_seconds_ = 0;

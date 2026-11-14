@@ -81,15 +81,16 @@ std::string timestamp(std::int64_t milliseconds)
     return output.str();
 }
 
-void displayPlayback(const VideoSourceStatus& source, const PlaybackStatus& player, bool prepared)
+void displayPlayback(const VideoSourceStatus& source, const PlaybackStatus& player, bool prepared, std::int64_t video_size)
 {
     const auto& cache = source.cache;
-    std::cout << "\nStatus: " << (source.waiting_reads ? "BUFFERING" : VlcPlayer::stateName(player.state))
+    std::cout << "\nStatus: " << (player.waiting_for_buffer ? "BUFFERING" : VlcPlayer::stateName(player.state))
               << (prepared ? "" : " (container/startup)")
               << "\nPosition: " << timestamp(player.time_ms) << " / " << timestamp(player.duration_ms)
               << "\nVLC Buffering: " << std::clamp(player.buffering_percent, 0.0f, 100.0f) << "%"
-              << "\nNetwork Speed: " << formatVideoSize(static_cast<std::int64_t>(cache.network_bytes_per_second)) << "/s"
-              << "\nCache Usage: " << cache.allocated_bytes << " / " << cache.budget_bytes << " bytes"
+              << "\nNetwork Speed: " << formatVideoSize(static_cast<std::int64_t>(cache.download_bytes_per_second)) << "/s"
+              << "\nCache Usage: " << cache.allocated_bytes << " / " << cache.budget_bytes << " bytes ("
+              << std::fixed << std::setprecision(2) << cache.budget_bytes * 100.0 / video_size << "% of video)"
               << "\nFree / Reserved Slots: " << cache.performance.free_slots << " / " << cache.performance.reserved_slots
               << "\nTorrent Rebuilds: " << cache.torrent_rebuilds
               << "\nVerified Read Wait: " << source.performance.wait_microseconds / 1000 << " ms; stalls >=50ms: "
@@ -149,7 +150,7 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
                 throw std::runtime_error("VLC startup timed out before any video frame was decoded.");
             }
             if (now - displayed >= std::chrono::seconds{1}) {
-                displayPlayback(cache, media, started);
+                displayPlayback(cache, media, started, video.size_bytes);
                 displayed = now;
             }
             const int key = keys.next();

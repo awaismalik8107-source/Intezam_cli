@@ -36,11 +36,11 @@ void PieceStore::setReservedSlots(std::size_t slots)
 }
 
 std::shared_ptr<PieceStore> PieceStore::create(const PieceGeometry& geometry, const std::filesystem::path& root,
-                                             std::optional<std::size_t> reserved_slots)
+                                             std::optional<std::size_t> reserved_slots, CacheBudgetOptions budget)
 {
     geometry.validate();
     return std::shared_ptr<PieceStore>(new PieceStore(geometry,
-        CacheFile::create(geometry.video_size, geometry.piece_length, root), reserved_slots));
+        CacheFile::create(geometry.video_size, geometry.piece_length, root, budget), reserved_slots));
 }
 
 void PieceStore::validatePieces(const std::vector<int>& pieces) const

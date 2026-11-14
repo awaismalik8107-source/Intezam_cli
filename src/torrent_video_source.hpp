@@ -1,6 +1,7 @@
 #pragma once
 
 #include "container_probe.hpp"
+#include "stream_policy.hpp"
 #include "torrent_cache_session.hpp"
 
 #include <atomic>
@@ -18,6 +19,7 @@ struct VideoSourceStatus {
     bool stopped = false;
     std::string error;
     ReadPerformance performance;
+    BufferWatermarks buffer_targets{};
 };
 
 class TorrentVideoSource final : public VideoByteSource {
@@ -39,6 +41,7 @@ public:
     void markPlaybackActive();
     void setEstimatedRate(double bytes_per_second);
     void prebuffer();
+    BufferWatermarks bufferTargets() const;
     VideoSourceStatus status() const;
     std::filesystem::path directory() const { return directory_; }
     std::int64_t capacity() const { return capacity_; }
@@ -59,8 +62,10 @@ private:
         VideoRange range;
         std::uint64_t epoch;
     };
-    std::size_t readVerified(std::int64_t offset, void* buffer, std::size_t length, bool metadata);
+    enum class ReadPurpose { playback, metadata, prebuffer };
+    std::size_t readVerified(std::int64_t offset, void* buffer, std::size_t length, ReadPurpose purpose);
     void run();
+    BufferWatermarks bufferTargetsLocked() const;
     void checkReadState(std::uint64_t epoch) const;
     void accountProbeRange(std::int64_t offset, std::size_t length);
     void seekToByte(std::int64_t offset, PlaybackMovement movement);

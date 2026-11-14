@@ -7,11 +7,15 @@
 
 namespace intezam {
 
-DynamicSegmentCache::DynamicSegmentCache(PieceGeometry geometry, std::size_t slots, double bitrate)
-    : geometry_(geometry), slots_(slots), segment_size_(std::max(16384, geometry.piece_length / 2)), bitrate_(bitrate)
+DynamicSegmentCache::DynamicSegmentCache(PieceGeometry geometry, std::size_t slots, double bitrate, double forward_target_seconds)
+    : geometry_(geometry), slots_(slots), segment_size_(std::max(16384, geometry.piece_length / 2)), bitrate_(bitrate),
+      forward_target_seconds_(forward_target_seconds)
 {
     geometry_.validate();
     if (slots == 0) throw std::invalid_argument("No whole-piece cache slots available.");
+    if (!std::isfinite(forward_target_seconds) || forward_target_seconds < 0 || forward_target_seconds > 120) {
+        throw std::invalid_argument("Forward buffer target must be between 0 and 120 seconds.");
+    }
     updateVideoBitrate(bitrate);
 }
 
@@ -69,12 +73,25 @@ SegmentWindow DynamicSegmentCache::window(const std::vector<int>& urgent_pieces)
     // cushion. All estimates are ultimately clipped by whole-piece disk capacity.
     const double ratio = observed_ ? speed_ / bitrate_ : 1.0;
     const double instability = std::min(2.0, jitter_ / std::max(speed_, bitrate_ * 0.1));
-    const double seconds = 2.0 + std::min(4.0, ratio) * 2.0 + instability * 2.0
+    double seconds = 2.0 + std::min(4.0, ratio) * 2.0 + instability * 2.0
                          + (buffer_seconds_ < 1.0 ? 2.0 : 0.0);
+    if (forward_target_seconds_ > 0) {
+        // Leave room for backward retention and rolling drift even on a slow
+        // swarm. Faster peers fund a larger horizon, within the same slot file.
+        seconds = std::max(seconds, std::min(forward_target_seconds_ * 3.75,
+            forward_target_seconds_ * 2.0 + std::min(3.0, ratio) * forward_target_seconds_ * 7.0 / 12.0));
+    }
     const auto maximum = std::min<std::int64_t>(total,
         (static_cast<std::int64_t>(slots_) * geometry_.piece_length) / segment_size_);
-    const auto count = static_cast<std::int64_t>(std::min<double>(maximum,
+    auto count = static_cast<std::int64_t>(std::min<double>(maximum,
         std::max(1.0, std::ceil(seconds * bitrate_ / segment_size_))));
+    if (forward_target_seconds_ > 0) {
+        // At the beginning there is no behind region to retain; avoid turning
+        // that unused region into an unnecessarily long startup download.
+        const auto ahead = static_cast<std::int64_t>(std::max(1.0,
+            std::ceil(forward_target_seconds_ * 2.5 * bitrate_ / segment_size_)));
+        count = std::min(count, position_ / segment_size_ + ahead);
+    }
     return fitWindow(count, urgent_pieces);
 }
 
@@ -91,7 +108,7 @@ SegmentWindow DynamicSegmentCache::fitWindow(std::int64_t count, const std::vect
         required.insert(urgent_pieces.begin(), urgent_pieces.end());
         if (required.size() <= slots_) return {first, first + count - 1, current, begin, end, std::move(pieces)};
     }
-    throw std::runtime_error("2.5% cache cannot fit playback and required container/read pieces together.");
+    throw std::runtime_error("Effective cache cannot fit playback and required container/read pieces together.");
 }
 
 SegmentWindow DynamicSegmentCache::planWindow(const std::vector<int>& urgent_pieces)

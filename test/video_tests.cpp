@@ -99,9 +99,14 @@ void selectsTheOnlyVideoWithEnoughPieceBudget()
 {
     const intezam::VideoFile sample{lt::file_index_t{3}, "Sample/sample.mkv", ".mkv", 60879760, 0};
     const intezam::VideoFile movie{lt::file_index_t{6}, "main-film.mkv", ".mkv", 5869802096, 60879760};
+    std::istringstream sample_choice("1\n");
+    std::ostringstream adaptive_output;
+    const auto adaptive = intezam::selectStreamingVideo({sample, movie}, 2097152, sample_choice, adaptive_output);
+    require(adaptive && adaptive->torrent_index == sample.torrent_index, "adaptive budget restores manual sample choice");
+    require(adaptive_output.str().find("Automatically") == std::string::npos, "adaptive mode does not force main video");
     std::istringstream no_choice;
     std::ostringstream output;
-    const auto selected = intezam::selectStreamingVideo({sample, movie}, 2097152, no_choice, output);
+    const auto selected = intezam::selectStreamingVideo({sample, movie}, 2097152, no_choice, output, {intezam::CacheBudgetMode::strict, 25});
     require(selected && selected->torrent_index == movie.torrent_index && selected->torrent_offset == movie.torrent_offset,
             "auto-select second/main video without changing its torrent identity");
     require(output.str().find("Automatically selecting [2]") != std::string::npos, "explain second-option selection");
@@ -109,7 +114,7 @@ void selectsTheOnlyVideoWithEnoughPieceBudget()
 
     std::istringstream reversed_input;
     std::ostringstream reversed_output;
-    const auto first = intezam::selectStreamingVideo({movie, sample}, 2097152, reversed_input, reversed_output);
+    const auto first = intezam::selectStreamingVideo({movie, sample}, 2097152, reversed_input, reversed_output, {intezam::CacheBudgetMode::strict, 25});
     require(first && first->torrent_index == movie.torrent_index, "do not hard-code option two for other torrents");
     require(reversed_output.str().find("Automatically selecting [1]") != std::string::npos, "preserve display numbering");
 

@@ -84,17 +84,16 @@ void CacheFile::recoverStale(const fs::path& root)
 }
 
 std::unique_ptr<CacheFile> CacheFile::create(
-    std::int64_t video_size, int piece_length, const fs::path& root)
+    std::int64_t video_size, int piece_length, const fs::path& root, CacheBudgetOptions options)
 {
     auto file = std::unique_ptr<CacheFile>(new CacheFile);
-    file->initialize(video_size, piece_length, root);
+    file->initialize(video_size, piece_length, root, options);
     return file;
 }
 
-void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::path& root)
+void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::path& root, CacheBudgetOptions options)
 {
     if (video_size <= 0 || piece_length <= 0) throw std::invalid_argument("Invalid cache dimensions");
-    budget_ = video_size / 40;
     root_ = root;
     fs::create_directories(root);
     if (!ownedDirectory(root)) throw std::runtime_error("Cache root must be a directory owned by this user.");
@@ -110,9 +109,6 @@ void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::
     const std::int64_t block = filesystem.f_frsize ? filesystem.f_frsize : filesystem.f_bsize;
     if (block <= 0) throw std::runtime_error("Cannot determine cache filesystem allocation unit.");
     slot_size_ = ((std::int64_t{piece_length} + block - 1) / block) * block;
-    if (budget_ < slot_size_ + 2 * block) {
-        throw std::runtime_error("2.5% cache budget cannot fit one whole torrent piece plus filesystem overhead.");
-    }
     auto pattern = (root / "session-XXXXXX").string();
     const auto created = mkdtemp(pattern.data());
     if (!created) systemFailure("create temporary cache session");
@@ -122,10 +118,7 @@ void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::
     fd_ = open((directory_ / "stream.cache").c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd_ < 0) systemFailure("create bounded cache file");
     const auto overhead = allocatedBytes();
-    // Reserve one extra allocation unit for filesystem rounding/metadata changes.
-    if (budget_ <= overhead + block || budget_ - overhead - block < slot_size_) {
-        throw std::runtime_error("2.5% cache budget is too small after filesystem overhead.");
-    }
+    budget_ = planCacheBudget(video_size, piece_length, block, overhead, options).effective_bytes;
     slots_ = static_cast<std::size_t>((budget_ - overhead - block) / slot_size_);
     const auto capacity = static_cast<std::int64_t>(slots_) * slot_size_;
     const int result = posix_fallocate(fd_, 0, capacity);
@@ -133,7 +126,7 @@ void CacheFile::initialize(std::int64_t video_size, int piece_length, const fs::
         throw std::system_error(result, std::generic_category(), "preallocate bounded disk cache");
     }
     if (allocatedBytes() > budget_) {
-        throw std::runtime_error("Filesystem allocation exceeds the 2.5% budget; cache refused.");
+        throw std::runtime_error("Filesystem allocation exceeds the effective cache budget; cache refused.");
     }
 }
 

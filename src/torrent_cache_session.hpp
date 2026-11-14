@@ -11,6 +11,7 @@
 
 #include <chrono>
 #include <functional>
+#include <map>
 
 namespace intezam {
 
@@ -20,7 +21,9 @@ libtorrent::settings_pack streamingSessionSettings();
 
 struct CacheStreamOptions {
     std::filesystem::path root = CacheFile::defaultRoot();
+    CacheBudgetOptions budget;
     double playback_bytes_per_second = 1024 * 1024;
+    double forward_buffer_target_seconds = 12; // 0 retains the shorter legacy horizon
     std::chrono::milliseconds stall_timeout{120000};
     libtorrent::settings_pack settings = streamingSessionSettings();
     std::function<bool()> cancelled;
@@ -48,6 +51,7 @@ struct CacheDiagnostics {
     bool ready;
     std::size_t urgent_pieces;
     CachePerformance performance{};
+    double download_bytes_per_second = 0; // current half-second sample; zero when idle
 };
 
 // Control methods are serialized internally. Playback may hold/use ReadLease
@@ -85,6 +89,8 @@ private:
     AdmissionPlan planAdmissions();
     bool shouldRebuild(const AdmissionPlan& plan, const AdmissionResult& admission) const;
     void applyPriorities(const AdmissionPlan& plan);
+    void publishPriorities(std::map<int, libtorrent::download_priority_t> priorities);
+    void publishDeadlines(std::map<int, Clock::time_point> deadlines);
     void rebuild(const AdmissionPlan& plan);
     void observeThroughput();
     void updateReservation(double bytes_per_second);
@@ -105,6 +111,13 @@ private:
     libtorrent::torrent_handle torrent_;
     std::vector<libtorrent::tcp::endpoint> known_peers_;
     std::vector<int> scheduled_;
+    std::map<int, libtorrent::download_priority_t> scheduled_priorities_;
+    std::map<int, Clock::time_point> scheduled_deadlines_;
+    bool retime_deadlines_ = false;
+    std::vector<int> scheduled_urgent_;
+    double scheduled_rate_ = 0;
+    std::int64_t scheduled_position_ = -1;
+    double download_rate_ = 0;
     std::int64_t last_torrent_bytes_ = 0;
     std::int64_t received_bytes_ = 0;
     std::int64_t sampled_bytes_ = 0;

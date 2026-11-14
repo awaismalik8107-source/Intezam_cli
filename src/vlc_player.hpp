@@ -1,6 +1,7 @@
 #pragma once
 
 #include "video_byte_source.hpp"
+#include "stream_policy.hpp"
 
 #include <vlc/vlc.h>
 
@@ -18,6 +19,7 @@ namespace intezam {
 struct VlcOptions {
     bool headless = false;
     int caching_milliseconds = 100;
+    std::uint32_t x11_window = 0;
 };
 
 struct PlaybackStatus {
@@ -28,6 +30,10 @@ struct PlaybackStatus {
     int decoded_video_frames = 0;
     int decoded_audio_frames = 0;
     bool seekable = false;
+    bool user_paused = false;
+    bool waiting_for_buffer = false;
+    int volume = 100;
+    bool muted = false;
     std::uint64_t bytes_read = 0;
     std::uint64_t seeks = 0;
     std::string error;
@@ -44,6 +50,8 @@ public:
     void resume();
     void togglePause();
     void seekTo(std::int64_t milliseconds);
+    void setVolume(int percent);
+    void setMuted(bool muted);
     void stop();
     PlaybackStatus status();
     static const char* stateName(libvlc_state_t state);
@@ -65,6 +73,7 @@ private:
     void recordError(const char* message) noexcept;
     void startInput(std::int64_t milliseconds);
     void stopInput();
+    void updateBuffering(const PlaybackStatus& status);
 
     std::shared_ptr<VideoByteSource> source_;
     libvlc_instance_t* instance_ = nullptr;
@@ -79,6 +88,12 @@ private:
     std::atomic<std::uint64_t> read_bytes_{0};
     std::atomic<std::uint64_t> seek_count_{0};
     bool stopped_ = false;
+    bool user_paused_ = false;
+    bool buffer_paused_ = false;
+    int volume_ = 100;
+    bool muted_ = false;
+    bool audio_settings_pending_ = true;
+    RebufferGate rebuffer_gate_;
     bool pause_after_start_ = false;
     bool headless_ = false;
     int caching_ms_ = 100;

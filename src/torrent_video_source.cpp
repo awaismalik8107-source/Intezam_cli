@@ -43,12 +43,12 @@ void TorrentVideoSource::checkReadState(std::uint64_t epoch) const
 }
 
 std::size_t TorrentVideoSource::read(std::int64_t offset, void* buffer, std::size_t length)
-{ return readVerified(offset, buffer, length, false); }
+{ return readVerified(offset, buffer, length, ReadPurpose::playback); }
 
 std::size_t TorrentVideoSource::readMetadata(std::int64_t offset, void* buffer, std::size_t length)
-{ return readVerified(offset, buffer, length, true); }
+{ return readVerified(offset, buffer, length, ReadPurpose::metadata); }
 
-std::size_t TorrentVideoSource::readVerified(std::int64_t offset, void* buffer, std::size_t length, bool metadata)
+std::size_t TorrentVideoSource::readVerified(std::int64_t offset, void* buffer, std::size_t length, ReadPurpose purpose)
 {
     if (offset < 0 || offset > video_size_) throw std::out_of_range("Video byte offset");
     if (length == 0 || offset == video_size_) return 0;
@@ -59,7 +59,7 @@ std::size_t TorrentVideoSource::readVerified(std::int64_t offset, void* buffer, 
     std::unique_lock<std::mutex> lock(read_signal_->mutex);
     const auto epoch = epoch_;
     checkReadState(epoch);
-    if (probing_) {
+    if (probing_ && purpose != ReadPurpose::prebuffer) {
         // A tiny header read still requires a complete verified torrent piece.
         // Charge that selected-file footprint so sparse index scans cannot hide
         // full-file downloads behind small callback requests.
@@ -67,7 +67,7 @@ std::size_t TorrentVideoSource::readVerified(std::int64_t offset, void* buffer, 
         const auto end = std::min(video_size_, offset + until_boundary);
         accountProbeRange(begin, static_cast<std::size_t>(end - begin));
     }
-    if (!metadata && !container_.isMetadata(offset)) playback_offset_ = offset;
+    if (purpose == ReadPurpose::playback && !container_.isMetadata(offset)) playback_offset_ = offset;
     auto request = std::make_shared<PendingRead>(PendingRead{{offset, static_cast<std::int64_t>(length)}, epoch});
     pending_.push_back(request);
     read_signal_->changed.notify_all();
@@ -266,17 +266,29 @@ void TorrentVideoSource::setEstimatedRate(double bytes_per_second)
 
 void TorrentVideoSource::prebuffer()
 {
+    const auto targets = bufferTargets();
     double rate;
-    {
-        std::lock_guard<std::mutex> lock(read_signal_->mutex);
-        rate = requested_rate_;
-    }
+    { std::lock_guard<std::mutex> lock(read_signal_->mutex); rate = requested_rate_; }
     const auto target = std::min<std::int64_t>({video_size_, capacity_ / 3,
-        std::max<std::int64_t>(16384, static_cast<std::int64_t>(rate * 0.2))});
+        std::max<std::int64_t>(16384, static_cast<std::int64_t>(rate * targets.high_seconds))});
     std::array<unsigned char, 16384> bytes{};
     for (std::int64_t offset = 0; offset < target;) {
-        offset += readMetadata(offset, bytes.data(), std::min<std::int64_t>(bytes.size(), target - offset));
+        offset += readVerified(offset, bytes.data(), std::min<std::int64_t>(bytes.size(), target - offset), ReadPurpose::prebuffer);
     }
+}
+
+BufferWatermarks TorrentVideoSource::bufferTargets() const
+{
+    std::lock_guard<std::mutex> lock(read_signal_->mutex);
+    return bufferTargetsLocked();
+}
+
+BufferWatermarks TorrentVideoSource::bufferTargetsLocked() const
+{
+    const auto remaining = std::max<std::int64_t>(0, video_size_ - status_.cache.playback_position);
+    const auto forward_capacity = std::min({remaining, capacity_ / 3,
+        std::max<std::int64_t>(0, status_.cache.desired.end_byte - status_.cache.playback_position)});
+    return bufferWatermarks(requested_rate_, status_.cache.network_bytes_per_second, forward_capacity);
 }
 
 VideoSourceStatus TorrentVideoSource::status() const
@@ -285,6 +297,7 @@ VideoSourceStatus TorrentVideoSource::status() const
     auto status = status_;
     status.waiting_reads = pending_.size();
     status.stopped = stopping_.load();
+    status.buffer_targets = bufferTargetsLocked();
     return status;
 }
 

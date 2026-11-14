@@ -64,6 +64,24 @@ void respectsAdaptationAndUrgency()
     require(required.size() <= 40, "metadata urgency immediately overrides hysteresis capacity");
     require(urgent.segmentCount() < larger.segmentCount(), "urgent metadata reduces the active horizon");
 }
+void givesSmoothPlaybackAReachableForwardCushion()
+{
+    const intezam::PieceGeometry geometry{8LL * 1024 * 1024 * 1024, 7000, 8LL * 1024 * 1024 * 1024 + 7000, 2 * 1024 * 1024};
+    intezam::DynamicSegmentCache cache(geometry, 100, 1024 * 1024, 12);
+    cache.reposition(geometry.video_size / 2);
+    cache.updateNetworkSpeed(4 * 1024 * 1024);
+    const auto fast = cache.planWindow();
+    const auto ahead = (fast.end_byte - cache.playbackPosition()) / cache.videoBitrate();
+    require(ahead >= 28 && ahead <= 32, "smooth profile prefetches about thirty seconds ahead");
+    for (int sample = 0; sample < 50; ++sample) cache.updateNetworkSpeed(0);
+    const auto slow = cache.planWindow();
+    require(slow.segmentCount() < fast.segmentCount(), "smooth horizon still adapts to throughput");
+    require((slow.end_byte - cache.playbackPosition()) / cache.videoBitrate() >= 12,
+        "slow profile has enough forward window for its resume target");
+    cache.updateCapacity(4);
+    require(cache.planWindow().pieces.size() <= 4, "smooth profile clips to small cache capacity");
+}
+
 } // namespace
 
 int main()
@@ -71,6 +89,7 @@ int main()
     try {
         stabilizesSmallMovements();
         respectsAdaptationAndUrgency();
+        givesSmoothPlaybackAReachableForwardCushion();
         std::cout << "Rolling hysteresis, adaptation, urgent metadata and immediate seeks passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

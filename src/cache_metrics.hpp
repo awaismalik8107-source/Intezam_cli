@@ -11,6 +11,10 @@ struct CachePerformance {
     std::uint64_t pieces_evicted = 0;
     std::uint64_t pieces_admitted = 0;
     std::uint64_t window_movements = 0;
+    std::uint64_t priority_updates = 0;
+    std::uint64_t deadline_updates = 0;
+    std::uint64_t deadline_resets = 0;
+    std::uint64_t proactive_refills = 0;
     std::uint64_t disk_jobs = 0;
     std::uint64_t disk_microseconds = 0;
     std::size_t total_slots = 0;

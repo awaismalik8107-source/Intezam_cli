@@ -62,7 +62,7 @@ struct TorrentRequests final : lt::torrent_plugin {
 
 class LocalVideoTorrent {
 public:
-    explicit LocalVideoTorrent(const fs::path& media_file)
+    explicit LocalVideoTorrent(const fs::path& media_file, int piece_length = 16384)
     {
         auto pattern = (fs::current_path() / "intezam-vlc-test-XXXXXX").string();
         const char* directory = mkdtemp(pattern.data());
@@ -86,7 +86,7 @@ public:
             if (error) fs::copy_file(media_file, source_file_);
             lt::create_torrent creator(std::vector<lt::create_file_entry>{
                 {torrent_name + "/prefix.txt", 7000}, {torrent_name + "/" + name, static_cast<std::int64_t>(fs::file_size(media_file))}},
-                16384, lt::create_torrent::v1_only);
+                piece_length, lt::create_torrent::v1_only);
             lt::set_piece_hashes(creator, source.string());
             auto encoded = creator.generate_buf();
             metadata_ = std::make_shared<lt::torrent_info>(lt::span<const char>{encoded}, lt::from_span);

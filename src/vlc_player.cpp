@@ -44,6 +44,11 @@ VlcPlayer::VlcPlayer(std::shared_ptr<VideoByteSource> source, const VlcOptions& 
         libvlc_release(instance_);
         throw std::runtime_error("Cannot attach VLC buffering event.");
     }
+    if (options.x11_window) {
+        libvlc_media_player_set_xwindow(player_, options.x11_window);
+        libvlc_video_set_key_input(player_, 0);
+        libvlc_video_set_mouse_input(player_, 0);
+    }
     if (headless_) {
         libvlc_video_set_callbacks(player_, lockFrame, nullptr, displayFrame, this);
         libvlc_video_set_format(player_, "RV32", 320, 240, 320 * 4);
@@ -185,6 +190,7 @@ void VlcPlayer::startInput(std::int64_t milliseconds)
     libvlc_media_player_set_media(player_, media);
     if (media_) libvlc_media_release(media_);
     media_ = media;
+    audio_settings_pending_ = true;
     buffering_.store(0);
     displayed_frames_.store(0);
     suspended_.store(false);
@@ -194,26 +200,32 @@ void VlcPlayer::startInput(std::int64_t milliseconds)
 void VlcPlayer::play()
 {
     std::lock_guard<std::mutex> lock(controls_);
-    if (libvlc_media_player_get_state(player_) == libvlc_Paused) libvlc_media_player_set_pause(player_, 0);
+    if (libvlc_media_player_get_state(player_) == libvlc_Paused) {
+        user_paused_ = false;
+        if (!buffer_paused_) libvlc_media_player_set_pause(player_, 0);
+    }
     else if (!media_) startInput(0);
 }
 
 void VlcPlayer::pause()
 {
     std::lock_guard<std::mutex> lock(controls_);
+    user_paused_ = true;
     libvlc_media_player_set_pause(player_, 1);
 }
 
 void VlcPlayer::resume()
 {
     std::lock_guard<std::mutex> lock(controls_);
-    libvlc_media_player_set_pause(player_, 0);
+    user_paused_ = false;
+    if (!buffer_paused_) libvlc_media_player_set_pause(player_, 0);
 }
 
 void VlcPlayer::togglePause()
 {
     std::lock_guard<std::mutex> lock(controls_);
-    libvlc_media_player_set_pause(player_, libvlc_media_player_get_state(player_) == libvlc_Paused ? 0 : 1);
+    user_paused_ = !user_paused_;
+    libvlc_media_player_set_pause(player_, user_paused_ || buffer_paused_);
 }
 
 void VlcPlayer::seekTo(std::int64_t milliseconds)
@@ -223,10 +235,29 @@ void VlcPlayer::seekTo(std::int64_t milliseconds)
     if (milliseconds < 0 || duration <= 0 || milliseconds >= duration) throw std::out_of_range("Seek time exceeds known media duration.");
     if (!libvlc_media_player_is_seekable(player_)) throw std::invalid_argument("VLC does not support time seeking for this stream.");
     if (auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_)) torrent->beginPlaybackEpoch();
+    buffer_paused_ = false;
+    rebuffer_gate_.reset();
+    if (!user_paused_) libvlc_media_player_set_pause(player_, 0);
     requested_seek_ = milliseconds;
     seek_count_at_request_ = seek_count_.load();
     seek_started_ = std::chrono::steady_clock::now();
     libvlc_media_player_set_time(player_, milliseconds);
+}
+
+void VlcPlayer::setVolume(int percent)
+{
+    if (percent < 0 || percent > 100) throw std::out_of_range("Volume must be between 0 and 100.");
+    std::lock_guard<std::mutex> lock(controls_);
+    volume_ = percent;
+    audio_settings_pending_ = libvlc_audio_set_volume(player_, volume_) != 0;
+}
+
+void VlcPlayer::setMuted(bool muted)
+{
+    std::lock_guard<std::mutex> lock(controls_);
+    muted_ = muted;
+    libvlc_audio_set_mute(player_, muted_);
+    audio_settings_pending_ = true;
 }
 
 void VlcPlayer::stop()
@@ -252,7 +283,7 @@ PlaybackStatus VlcPlayer::status()
             // stopping and reopening; ordinary cached seeks retain the demuxer.
             const auto target = *requested_seek_;
             requested_seek_.reset();
-            pause_after_start_ = libvlc_media_player_get_state(player_) == libvlc_Paused;
+            pause_after_start_ = user_paused_;
             stopInput();
             startInput(target);
         }
@@ -269,14 +300,20 @@ PlaybackStatus VlcPlayer::status()
         status.decoded_audio_frames = statistics.i_decoded_audio;
     }
     status.decoded_video_frames = std::max(status.decoded_video_frames, displayed_frames_.load());
-    if (auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_)) {
-        if (!requested_seek_ && (status.decoded_video_frames > 0 || status.time_ms > 0)) torrent->markPlaybackActive();
-        if (status.duration_ms > 0) torrent->setEstimatedRate(source_->size() * 1000.0 / status.duration_ms);
-    }
+    updateBuffering(status);
     if (pause_after_start_ && status.state == libvlc_Playing) {
         libvlc_media_player_set_pause(player_, 1);
         pause_after_start_ = false;
     }
+    status.user_paused = user_paused_;
+    status.waiting_for_buffer = buffer_paused_;
+    if (audio_settings_pending_ && !stopped_) {
+        // Output creation is asynchronous, and reopening can replace the output.
+        audio_settings_pending_ = libvlc_audio_set_volume(player_, volume_) != 0;
+        libvlc_audio_set_mute(player_, muted_);
+    }
+    status.volume = volume_;
+    status.muted = muted_;
     status.bytes_read = read_bytes_.load();
     status.seeks = seek_count_.load();
     {
@@ -286,6 +323,30 @@ PlaybackStatus VlcPlayer::status()
     }
     if (!status.error.empty()) status.state = libvlc_Error;
     return status;
+}
+
+void VlcPlayer::updateBuffering(const PlaybackStatus& status)
+{
+    if (stopped_ || status.state == libvlc_Ended || status.state == libvlc_Error) {
+        rebuffer_gate_.reset();
+        buffer_paused_ = false;
+        return;
+    }
+    if (auto torrent = std::dynamic_pointer_cast<TorrentVideoSource>(source_)) {
+        if (!requested_seek_ && (status.decoded_video_frames > 0 || status.time_ms > 0)) torrent->markPlaybackActive();
+        if (status.duration_ms > 0) torrent->setEstimatedRate(source_->size() * 1000.0 / status.duration_ms);
+        const auto cache = torrent->status();
+        const auto targets = cache.buffer_targets;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        const bool paused = rebuffer_gate_.update(!requested_seek_ && status.state == libvlc_Playing
+            && status.time_ms > 0, user_paused_, cache.waiting_reads > 0,
+            cache.cache.forward_buffer_seconds, targets, elapsed);
+        if (paused != buffer_paused_) {
+            buffer_paused_ = paused;
+            libvlc_media_player_set_pause(player_, user_paused_ || buffer_paused_);
+        }
+    }
 }
 
 const char* VlcPlayer::stateName(libvlc_state_t state)

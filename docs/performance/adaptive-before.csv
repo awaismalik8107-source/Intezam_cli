@@ -1,0 +1,3 @@
+workload,seconds,rebuilds,average_rebuild_ms,maximum_rebuild_ms,evicted,admitted,window_changes,hits,misses,hit_percent,wait_ms,max_wait_ms,stalls,stall_ms,backend_ms,lease_read_ms,min_free,max_free,allocated,budget,vlc_buffer_stalls,vlc_buffer_ms
+sequential-1,4.050,14,0.950,1.306,112,112,29,271,1,99.632,0.983,0.983,0,0.000,8.523,1.831,7,7,819200,838860,0,0.000
+seeking-1,0.733,7,1.399,1.592,301,287,26,168,8,95.455,30.824,4.995,0,0.000,16.575,1.604,7,7,819200,838860,0,0.000

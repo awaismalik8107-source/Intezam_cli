@@ -66,7 +66,8 @@ public:
             << ',' << reads.stalls << ',' << reads.stall_microseconds / 1000.0
             << ',' << metrics.disk_microseconds / 1000.0 << ',' << reads.disk_read_microseconds / 1000.0
             << ',' << minimum_free_ << ',' << maximum_free_ << ',' << cache.allocated_bytes << ',' << cache.budget_bytes
-            << ',' << vlc_stalls_ << ',' << vlc_buffering_ms_ << std::endl;
+            << ',' << vlc_stalls_ << ',' << vlc_buffering_ms_ << ',' << metrics.priority_updates
+            << ',' << metrics.deadline_updates << ',' << metrics.deadline_resets << ',' << metrics.proactive_refills << std::endl;
     }
 private:
     double elapsed() const { return std::chrono::duration<double>(Clock::now() - started_).count(); }
@@ -171,7 +172,7 @@ int main(int argc, char** argv)
         test_support::SyntheticMedia synthetic;
         std::cout << "workload,seconds,rebuilds,average_rebuild_ms,maximum_rebuild_ms,evicted,admitted,window_changes,"
             "hits,misses,hit_percent,wait_ms,max_wait_ms,stalls,stall_ms,backend_ms,lease_read_ms,min_free,max_free,"
-            "allocated,budget,vlc_buffer_stalls,vlc_buffer_ms\n";
+            "allocated,budget,vlc_buffer_stalls,vlc_buffer_ms,priority_updates,deadline_updates,deadline_resets,proactive_refills\n";
         for (int repetition = 1; repetition <= repetitions; ++repetition) {
             runByteWorkload(synthetic.path(), trace, repetition, false);
             runByteWorkload(synthetic.path(), trace, repetition, true);

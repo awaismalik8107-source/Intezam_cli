@@ -1,6 +1,7 @@
 #pragma once
 
 #include "video_files.hpp"
+#include "cache_budget.hpp"
 
 #include <iosfwd>
 #include <optional>
@@ -13,10 +14,8 @@ void displayVideos(const std::vector<VideoFile>& videos, std::ostream& output);
 // EOF or q cancels without changing torrent state.
 std::optional<VideoFile> selectVideo(
     const std::vector<VideoFile>& videos, std::istream& input, std::ostream& output);
-// Reject budgets below one piece. If this leaves one of several candidates,
-// select it automatically; retain original display numbers for manual choices.
-// Passing this check does not guarantee sufficient filesystem/container capacity.
+// Adaptive mode retains manual choice; allocation is checked again on the real filesystem.
 std::optional<VideoFile> selectStreamingVideo(const std::vector<VideoFile>& videos,
-    int piece_length, std::istream& input, std::ostream& output);
+    int piece_length, std::istream& input, std::ostream& output, CacheBudgetOptions budget = {});
 
 } // namespace intezam

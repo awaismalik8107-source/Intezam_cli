@@ -53,7 +53,8 @@ public:
 
     static std::shared_ptr<PieceStore> create(const PieceGeometry& geometry,
         const std::filesystem::path& root = CacheFile::defaultRoot(),
-        std::optional<std::size_t> reserved_slots = {});
+        std::optional<std::size_t> reserved_slots = {},
+        CacheBudgetOptions budget = {CacheBudgetMode::strict, 25});
     std::size_t slotCount() const { return file_->slotCount(); }
     static std::size_t automaticReservation(std::size_t slots);
     std::size_t reservedSlots() const;

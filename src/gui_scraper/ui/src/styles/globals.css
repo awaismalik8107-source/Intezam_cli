@@ -1,0 +1,162 @@
+@import "tailwindcss";
+@import "@fontsource/inter/400.css";
+@import "@fontsource/inter/500.css";
+@import "@fontsource/inter/600.css";
+@import "@fontsource/inter/700.css";
+@import "@fontsource/jetbrains-mono/400.css";
+@import "@fontsource/jetbrains-mono/500.css";
+@import "@fontsource/jetbrains-mono/600.css";
+
+/* ==========================================================================
+   INTEZAM CINEMA — Design Tokens
+   ========================================================================== */
+:root {
+  color-scheme: dark;
+
+  --cinema-bg: #090b12;
+  --cinema-surface: #111522;
+  --cinema-elevated: #191e2e;
+  --cinema-accent: #786bff;
+  --cinema-secondary: #38bdf8;
+  --cinema-text: #f8fafc;
+  --cinema-muted: #949caf;
+  --cinema-success: #34d399;
+  --cinema-warning: #fbbf24;
+  --cinema-error: #fb7185;
+
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.1);
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@theme {
+  --font-sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: var(--cinema-bg);
+    color: var(--cinema-text);
+    font-family: var(--font-sans);
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="tab"],
+  a[href] {
+    cursor: pointer;
+  }
+}
+
+.cinema-canvas {
+  background-color: var(--cinema-bg);
+  background-image:
+    radial-gradient(ellipse 80% 45% at 58% -10%, rgba(120, 107, 255, 0.08), transparent 70%),
+    radial-gradient(ellipse 50% 35% at 85% 0%, rgba(56, 189, 248, 0.05), transparent 65%);
+}
+
+/* Custom ultra-thin scrollbars (hide legacy native look) */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 156, 175, 0.22);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 156, 175, 0.42);
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Flowing data-stream indicator for Intezam loading */
+@keyframes streamFlow {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(220%);
+  }
+}
+
+.intezam-flow-bar {
+  position: relative;
+  overflow: hidden;
+}
+
+.intezam-flow-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 45%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(120, 107, 255, 0.9) 45%,
+    rgba(56, 189, 248, 0.95) 75%,
+    transparent 100%
+  );
+  animation: streamFlow 1.25s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+/* GPU-composited skeleton shimmer */
+@keyframes shimmerSweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton-shimmer {
+  position: relative;
+  overflow: hidden;
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+.skeleton-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.07) 50%,
+    transparent 100%
+  );
+  animation: shimmerSweep 1.35s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .intezam-flow-bar::after,
+  .skeleton-shimmer::after {
+    animation: none;
+    transform: none;
+  }
+}

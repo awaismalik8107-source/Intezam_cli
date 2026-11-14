@@ -3,6 +3,9 @@
 #include "src/video_selection.hpp"
 #include "src/cache_simulation.hpp"
 #include "src/vlc_playback.hpp"
+#ifdef INTEZAM_QT_UI
+#include "src/player_window.hpp"
+#endif
 
 #include <libtorrent/version.hpp>
 
@@ -16,6 +19,11 @@
 #include <string_view>
 
 namespace {
+#ifdef INTEZAM_QT_UI
+constexpr const char* default_playback = "Default Qt playback window";
+#else
+constexpr const char* default_playback = "Default terminal playback controls (built without Qt)";
+#endif
 
 struct CliOptions {
     std::chrono::milliseconds timeout{120000};
@@ -25,15 +33,17 @@ struct CliOptions {
     bool help = false;
     bool simulate = false;
     bool headless = false;
+    bool no_ui = false;
+    intezam::CacheBudgetOptions budget;
 };
 
-int parseSeconds(std::string_view argument, int maximum)
+int parsePositiveInteger(std::string_view argument, int maximum)
 {
     int seconds = 0;
     const auto result = std::from_chars(argument.data(), argument.data() + argument.size(), seconds);
     if (result.ec != std::errc{} || result.ptr != argument.data() + argument.size()
         || seconds < 1 || seconds > maximum) {
-        throw std::invalid_argument("Seconds must be a whole number from 1 to " + std::to_string(maximum) + ".");
+        throw std::invalid_argument("Value must be a whole number from 1 to " + std::to_string(maximum) + ".");
     }
     return seconds;
 }
@@ -47,12 +57,19 @@ CliOptions parseOptions(int argc, char* argv[])
         else if (argument == "--metadata-only") options.metadata_only = true;
         else if (argument == "--simulate") options.simulate = true;
         else if (argument == "--headless") options.headless = true;
+        else if (argument == "--no-ui") options.no_ui = true;
+        else if (argument == "--strict-cache") options.budget.mode = intezam::CacheBudgetMode::strict;
+        else if (argument == "--cache-max-percent") {
+            if (++index >= argc) throw std::invalid_argument("Missing value for --cache-max-percent");
+            options.budget.maximum_percent = parsePositiveInteger(argv[index], 99);
+            if (options.budget.maximum_percent < 3) throw std::invalid_argument("Cache ceiling must be from 3 to 99 percent.");
+        }
         else if (argument == "--timeout" || argument == "--simulate-seconds" || argument == "--bitrate") {
             if (++index >= argc) throw std::invalid_argument("Missing value for " + std::string(argument));
             const std::string_view value{argv[index]};
-            if (argument == "--timeout") options.timeout = std::chrono::seconds{parseSeconds(value, 3600)};
+            if (argument == "--timeout") options.timeout = std::chrono::seconds{parsePositiveInteger(value, 3600)};
             else if (argument == "--simulate-seconds") {
-                options.duration = std::chrono::seconds{parseSeconds(value, 86400)};
+                options.duration = std::chrono::seconds{parsePositiveInteger(value, 86400)};
                 options.simulate = true;
             }
             else {
@@ -77,10 +94,12 @@ int main(int argc, char* argv[])
         const auto cli = parseOptions(argc, argv);
         if (cli.help) {
             std::cout << "Usage: intezam [--timeout SECONDS] [--metadata-only]\n"
-                      << "               [--bitrate BYTES_PER_SECOND] [--headless]\n"
+                      << "               [--bitrate BYTES_PER_SECOND] [--headless | --no-ui]\n"
+                      << "               [--strict-cache | --cache-max-percent 3..99]\n"
                       << "               [--simulate | --simulate-seconds SECONDS]\n"
                       << "Retrieve metadata, select a video, then play verified cache bytes with LibVLC.\n"
                       << "--metadata-only preserves detection/selection without payload downloads.\n"
+                      << default_playback << "; adaptive cache target 2.5%, automatic ceiling 25%.\n"
                       << "Defaults: metadata timeout 120 seconds, initial bitrate estimate 1048576 bytes/s.\n"
                       << "--simulate retains the cache test harness; --headless uses memory video/dummy audio.\n";
             return EXIT_SUCCESS;
@@ -117,7 +136,7 @@ int main(int argc, char* argv[])
         intezam::displayVideos(videos, std::cout);
         const auto selected_video = cli.metadata_only
             ? intezam::selectVideo(videos, std::cin, std::cout)
-            : intezam::selectStreamingVideo(videos, metadata->piece_length(), std::cin, std::cout);
+            : intezam::selectStreamingVideo(videos, metadata->piece_length(), std::cin, std::cout, cli.budget);
         if (!selected_video) {
             std::cout << "\nSelection cancelled.\n";
             return EXIT_SUCCESS;
@@ -133,13 +152,19 @@ int main(int argc, char* argv[])
         if (cli.simulate) {
             intezam::CacheSimulationOptions simulation;
             simulation.cache.playback_bytes_per_second = cli.bitrate;
+            simulation.cache.budget = cli.budget;
             simulation.duration = cli.duration;
             intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
         } else {
             intezam::PlaybackOptions playback;
             playback.cache.playback_bytes_per_second = cli.bitrate;
+            playback.cache.budget = cli.budget;
             playback.vlc.headless = cli.headless;
-            intezam::runVlcPlayback(magnet, metadata, *selected_video, playback);
+#ifdef INTEZAM_QT_UI
+            if (!cli.headless && !cli.no_ui) intezam::runQtPlayback(magnet, metadata, *selected_video, playback);
+            else
+#endif
+                intezam::runVlcPlayback(magnet, metadata, *selected_video, playback);
         }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

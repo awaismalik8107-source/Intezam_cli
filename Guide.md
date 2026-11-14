@@ -24,6 +24,7 @@ for playback, after selection. The older simulation remains opt-in.
 | Module | Responsibility |
 |---|---|
 | `cache_geometry.*` | Validated selected-file geometry and torrent-global piece mapping |
+| `cache_budget.*`, `stream_policy.*` | Bounded adaptive allocation, buffering hysteresis and consumption-based deadlines |
 | `cache_file.*` | Filesystem-aligned preallocation, budget, pwrite/pread bounds, lock and cleanup |
 | `piece_store.*` | Piece mapping, reserved/free inventory, protected reclamation, verification and pinned leases |
 | `dynamic_segment_cache.*` | Adaptive horizon, rolling/resize hysteresis and approximate 1/3-behind, 2/3-ahead positioning |
@@ -33,14 +34,18 @@ for playback, after selection. The older simulation remains opt-in.
 | `container_probe.*` | Bounded ISO BMFF atom walking and EBML/AVI/MPEG signature probing |
 | `torrent_video_source.*` | Worker, urgent range scheduling, verified callback reads, prebuffer and scan guard |
 | `vlc_player.*` | LibVLC lifecycle, custom callbacks, decode statistics, pause and time seeks |
+| `playback_controller.*` | Background preparation, queued controls and synchronized snapshots |
+| `player_window.*`, `qt_playback.cpp` | Qt controls, X11 embedding, seek-on-release and asynchronous close |
 | `vlc_playback.*` | Startup, terminal controls, signals, status and orderly shutdown |
 | `cache_simulation.*` | Timed simulated playback, interactive seeks/rate changes and signal cleanup |
 | `main.cpp` | Magnet/detection/selection flow, playback options and handoff |
 
 ## Budget and piece mapping
 
-For video size `V`, maximum budget `B = floor(V / 40)`. With filesystem unit `A`
-and piece size `P`, each slot has stride `ceil(P / A) * A`. Available slot count
+For video size `V`, target `T = floor(V / 40)`. With filesystem unit `A`
+and piece size `P`, each slot has stride `ceil(P / A) * A`. Automatic budget
+`B = max(T, 4 * stride + measured_overhead + A)` must fit the configured ceiling
+(default 25% of `V`). Strict mode retains `B = T`. Available slot count
 is `floor((B - measured_directory_and_lock_blocks - A) / stride)`. All slots,
 including incomplete pieces and pinned data outside the target window, fit in
 this one preallocated file. There is no separate payload staging file.
@@ -75,6 +80,16 @@ For configured consumption `r`, a candidate horizon in seconds is:
   + 2 * min(2, j / max(s, 0.1*r))
   + (contiguous_verified_buffer < 1 second ? 2 : 0)
 ```
+
+The application now passes a 12-second forward safety goal to the policy. Its
+horizon is the larger of the expression above and `min(45, 24 + 7 * min(3, s/r))`
+seconds, still clipped by working slots and urgent metadata. At the beginning,
+where there is no behind region, it caps the target at about 30 seconds ahead.
+At normal interior positions, the 45-second total horizon gives approximately
+15 seconds behind and 30 ahead. `DynamicSegmentCache`'s optional constructor goal
+defaults to zero for existing policy callers; `CacheStreamOptions` enables the
+smooth profile by default. Its `forward_buffer_target_seconds` can be set to zero
+by C++ embedders to retain the shorter horizon.
 
 Before the first sample, `s/r` uses 1 as an initialization estimate, not a claim
 about actual throughput. The horizon becomes a segment count via
@@ -234,8 +249,14 @@ memory. Matroska cluster/directory preloading and AVI automatic index repair are
 disabled; missing indexes do not authorize an unlimited scan.
 
 Before playback, a bounded verified prefix is buffered: up to the smaller of
-one third of data capacity and the initial 0.2-second rate estimate, with a 16 KiB
-minimum where capacity allows. VLC then performs its normal demux buffering.
+one third of data capacity, the planned forward window and an adaptive 6–12 second
+rate estimate, with a 16 KiB minimum where capacity allows. Planned prefix
+buffering is distinct from decoder probing and does not spend the index-scan allowance; it still uses the same bounded,
+verified disk cache and small read chunks. Slow/unknown throughput
+uses 12 seconds, throughput at least consumption uses 8, and at least 1.5 times
+consumption uses 6. The low watermark is min(2 seconds, high / 3). A verified-data
+miss below low for 250 ms pauses playback until high is available. Manual pause
+prevents automatic resume. VLC then performs its normal demux buffering.
 VLC's prefetch filter is limited to 64 KiB RAM, 16 KiB reads and a one-byte seek
 threshold. Setting this threshold to zero makes VLC 3 loop on an empty prefetch
 buffer; the one-byte value permits discontinuous metadata requests to seek.
@@ -296,3 +317,31 @@ recognized stale cache directories on the next initialization.
 - [LibVLC 3 custom media callbacks](https://videolan.videolan.me/vlc-3.0/group__libvlc__media.html)
 - [LibVLC 3 player controls and video callbacks](https://videolan.videolan.me/vlc-3.0/group__libvlc__media__player.html)
 - [VLC 3 prefetch implementation and option units](https://code.videolan.org/videolan/vlc/-/blob/3.0.x/modules/stream_filter/prefetch.c)
+
+
+## Native Qt controller
+
+Qt Widgets renders standard controls; LibVLC renders directly into the native
+X11 child window. `XInitThreads()` precedes Qt and LibVLC initialization. The
+native window remains alive until player stop, callbacks and cache shutdown have
+finished. Qt's process-local `xcb` backend also supports XWayland desktops.
+The [LibVLC native output API](https://videolan.videolan.me/vlc-3.0/group__libvlc__media__player.html)
+describes the drawable lifetime and Xlib threading requirement.
+
+`PlaybackController` owns a worker for probing, prebuffering and player commands.
+The UI polls synchronized snapshots every 200 ms and never waits for the worker.
+Stop cancels pending reads immediately; final close follows the finished snapshot.
+Queued absolute seek/volume values coalesce. Slider tracking is disabled and
+snapshot updates block signals, so dragging sends one seek on release; see
+[Qt slider tracking](https://doc.qt.io/qt-6/qabstractslider.html#tracking-prop).
+No video-frame copies are routed through Qt, and normal native output keeps
+hardware decoding available. `--headless` retains fixed memory frames for tests.
+
+Current configuration, affected files and validation are recorded in
+[adaptive playback](docs/adaptive-playback.md). Earlier reserved-slot benchmarks
+remain a historical comparison of that optimization.
+
+
+The [smooth playback follow-up](docs/smooth-playback.md) records proactive refill,
+incremental deadline updates, current transfer-rate reporting and the larger
+approved buffering profile, with regression and performance measurements.

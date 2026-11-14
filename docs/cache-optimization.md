@@ -1,5 +1,10 @@
 # Sliding cache optimization
 
+This document records the earlier reserved-slot milestone. Its original 2.5%
+ceiling remains available with `--strict-cache`; the newer default allocation
+policy and Qt controller are documented in [adaptive playback](adaptive-playback.md).
+The reclamation, verification and synchronization rules below still apply.
+
 ## Investigation
 
 Baseline revision: `6a3505e` (before this optimization). The supported local

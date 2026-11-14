@@ -11,6 +11,8 @@ find_package(Threads REQUIRED)
 
 add_library(intezam_core
     src/cache_geometry.cpp
+    src/cache_budget.cpp
+    src/stream_policy.cpp
     src/cache_file.cpp
     src/piece_store.cpp
     src/dynamic_segment_cache.cpp
@@ -21,6 +23,7 @@ add_library(intezam_core
     src/torrent_video_source.cpp
     src/vlc_player.cpp
     src/vlc_playback.cpp
+    src/playback_controller.cpp
     src/torrent_metadata.cpp
     src/video_files.cpp
     src/video_selection.cpp
@@ -35,8 +38,33 @@ add_executable(intezam main.cpp)
 target_link_libraries(intezam PRIVATE intezam_core)
 target_compile_options(intezam PRIVATE -Wall -Wextra -Wpedantic)
 
+option(INTEZAM_QT_UI "Build native Qt 6 playback controls (Linux X11/XWayland)" ON)
+if(INTEZAM_QT_UI)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    pkg_check_modules(X11 REQUIRED IMPORTED_TARGET x11)
+    add_library(intezam_ui src/player_window.cpp src/qt_playback.cpp)
+    target_link_libraries(intezam_ui PUBLIC intezam_core Qt6::Widgets PRIVATE PkgConfig::X11)
+    target_compile_options(intezam_ui PRIVATE -Wall -Wextra -Wpedantic)
+    target_link_libraries(intezam PRIVATE intezam_ui)
+    target_compile_definitions(intezam PRIVATE INTEZAM_QT_UI)
+endif()
+
 include(CTest)
 if(BUILD_TESTING)
+    if(INTEZAM_QT_UI)
+        find_package(Qt6 REQUIRED COMPONENTS Test)
+        add_executable(qt_player_tests test/qt_player_tests.cpp)
+        target_link_libraries(qt_player_tests PRIVATE intezam_ui Qt6::Test)
+        add_test(NAME qt_playback_controls COMMAND qt_player_tests)
+        set_tests_properties(qt_playback_controls PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+    endif()
+    add_executable(forward_refill_tests test/forward_refill_tests.cpp)
+    target_link_libraries(forward_refill_tests PRIVATE intezam_core)
+    add_test(NAME proactive_forward_refill COMMAND forward_refill_tests)
+    set_tests_properties(proactive_forward_refill PROPERTIES TIMEOUT 30)
+    add_executable(cache_policy_tests test/cache_policy_tests.cpp)
+    target_link_libraries(cache_policy_tests PRIVATE intezam_core)
+    add_test(NAME adaptive_cache_policy COMMAND cache_policy_tests)
     add_executable(cache_benchmark test/cache_benchmark.cpp)
     target_link_libraries(cache_benchmark PRIVATE intezam_core)
     add_executable(reserved_slot_tests test/reserved_slot_tests.cpp)
@@ -65,6 +93,13 @@ if(BUILD_TESTING)
             ${media_directory}/video.mov ${media_directory}/video.m4v
             ${media_directory}/video.avi ${media_directory}/video.ts)
         set_tests_properties(vlc_cache_playback PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 240)
+        if(INTEZAM_QT_UI)
+            add_executable(qt_streaming_tests test/qt_streaming_tests.cpp)
+            target_link_libraries(qt_streaming_tests PRIVATE intezam_ui Qt6::Test PkgConfig::X11)
+            add_test(NAME qt_torrent_playback COMMAND qt_streaming_tests ${media_directory}/tail.mp4)
+            set_tests_properties(qt_torrent_playback PROPERTIES FIXTURES_REQUIRED vlc_media
+                ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 45)
+        endif()
         add_test(NAME cli_magnet_to_playback COMMAND playback_tests --cli
             $<TARGET_FILE:intezam> ${media_directory}/tail.mp4)
         set_tests_properties(cli_magnet_to_playback PROPERTIES FIXTURES_REQUIRED vlc_media TIMEOUT 45)
