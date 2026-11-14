@@ -110,7 +110,7 @@ export function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const activeSearchIdRef = useRef(0);
   const activeDetailIdRef = useRef(0);
-  const detailsCacheRef = useRef(new Map<string, { entry: MediaEntry; expires: number; hasMore: boolean }>());
+  const detailsCacheRef = useRef(new Map<string, { entry: MediaEntry; expires: number; hasMore: boolean; nextPage: number }>());
 
   const [preferences, setPreferences] = useState<UiPreferences>(loadInitialPreferences);
   const [activeSection, setActiveSection] = useState<NavSection>("home");
@@ -119,6 +119,7 @@ export function App() {
   const [detailsLoading, setDetailsLoading] = useState(false);
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [detailsHasMore, setDetailsHasMore] = useState(false);
+  const [detailsNextPage, setDetailsNextPage] = useState(1);
   const [inspectedRow, setInspectedRow] = useState<ScrapedItem | null>(null);
 
   const [mode, setMode] = useState<ScrapeMode>(() => preferences.defaultMode);
@@ -344,14 +345,15 @@ export function App() {
     [config.provider_name, mode, pushToast, query],
   );
 
-  // Title-specific release discovery is deferred until the title is opened.
-  // Cache for 90 seconds so returning to the same title does not repeat requests.
-  const loadTitleEpisodes = useCallback(async (media: MediaEntry, force = false) => {
+  // Titles are discovered cheaply; episodes are fetched only when opened.
+  // Cache the results so reopening a title avoids repeated HTTP requests.
+  const loadTitleEpisodes = useCallback(async (media: MediaEntry, force = false, startPage = 1) => {
     const cacheKey = `${mode}:${config.provider_name}:${media.key}`;
     const cached = detailsCacheRef.current.get(cacheKey);
-    if (!force && cached && cached.expires > Date.now()) {
+    if (startPage === 1 && !force && cached && cached.expires > Date.now()) {
       setDetailedMedia(cached.entry);
       setDetailsHasMore(cached.hasMore);
+      setDetailsNextPage(cached.nextPage);
       setDetailsError(null);
       setDetailsLoading(false);
       return;
@@ -362,14 +364,16 @@ export function App() {
     setDetailsError(null);
     const collected: ScrapedItem[] = media.sources.map((source) => source.item);
     let hasMore = false;
+    let nextPage = startPage;
     try {
-      // Bounded on-demand pagination. Do not issue title-expansion requests
-      // for every poster in the search results.
-      for (let page = 1; page <= 3; page += 1) {
+      // Fetch at most three pages per user action; never search every card.
+      // A subsequent "Load more" resumes exactly where this request stopped.
+      for (let page = startPage; page < startPage + 3; page += 1) {
         const response = await searchPaginated(media.title, mode, page);
         if (requestId !== activeDetailIdRef.current) return;
         collected.push(...response.items);
         hasMore = response.has_next_page;
+        nextPage = page + 1;
         if (!hasMore) break;
       }
       const resolved = groupItemsToMedia(collected, config.provider_name)
@@ -377,14 +381,15 @@ export function App() {
       const entry = resolved ?? media;
       if (requestId !== activeDetailIdRef.current) return;
       detailsCacheRef.current.set(cacheKey, {
-        entry, hasMore, expires: Date.now() + 90_000,
+        entry, hasMore, nextPage, expires: Date.now() + 90_000,
       });
       setDetailedMedia(entry);
       setDetailsHasMore(hasMore);
+      setDetailsNextPage(nextPage);
     } catch (err) {
       if (requestId !== activeDetailIdRef.current) return;
       setDetailsError(err instanceof Error ? err.message : String(err));
-      // Preserve already-visible releases when an on-demand refresh fails.
+      // Keep data that was already collected if later pages fail.
       setDetailedMedia((previous) => previous?.key === media.key ? previous : media);
     } finally {
       if (requestId === activeDetailIdRef.current) setDetailsLoading(false);
@@ -396,6 +401,7 @@ export function App() {
     setSelectedMediaKey(media.key);
     setDetailedMedia(media);
     setDetailsHasMore(false);
+    setDetailsNextPage(1);
     setDetailsError(null);
     void loadTitleEpisodes(media);
   }, [loadTitleEpisodes]);
@@ -770,6 +776,7 @@ export function App() {
                   episodeError={detailsError}
                   moreEpisodesAvailable={detailsHasMore}
                   onLoadEpisodes={() => void loadTitleEpisodes(selectedMedia, true)}
+                  onLoadMoreEpisodes={() => void loadTitleEpisodes(selectedMedia, true, detailsNextPage)}
                 />
               ) : activeSection === "home" ? (
                 <HomeView
