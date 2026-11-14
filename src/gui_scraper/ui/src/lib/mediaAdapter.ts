@@ -1,3 +1,4 @@
+import { parseReleaseTitle, showKey } from "./episodeCatalog";
 import type { MediaEntry, MediaSource, QualityTier, ScrapedItem, ScraperConfig } from "./types";
 
 const SIZE_UNIT_MULTIPLIERS: Record<string, number> = {
@@ -142,28 +143,28 @@ export function adaptScrapedItem(item: ScrapedItem, providerName: string): Media
   };
 }
 
-export function groupItemsToMedia(
-  items: ScrapedItem[],
-  providerName: string,
-): MediaEntry[] {
-  const grouped = new Map<string, MediaSource[]>();
-
-  for (const rawItem of items) {
-    const source = adaptScrapedItem(rawItem, providerName);
-    const titleGroup = cleanDisplayTitle(rawItem.title);
-    const key = titleGroup.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || `item-${rawItem.id}`;
-    const existing = grouped.get(key) ?? [];
-    existing.push(source);
-    grouped.set(key, existing);
+export function groupItemsToMedia(items: ScrapedItem[], providerName: string): MediaEntry[] {
+  // A title is an identity, not an individual torrent or an episode.
+  const grouped = new Map<string, { title: string; sources: MediaSource[]; seen: Set<string> }>();
+  for (const item of items) {
+    const parsed = parseReleaseTitle(item.title);
+    const title = parsed.showTitle || item.title.trim();
+    const key = showKey(title) || `item-${item.id}`;
+    const group = grouped.get(key) ?? { title, sources: [], seen: new Set<string>() };
+    const source = adaptScrapedItem(item, providerName);
+    const uniqueKey = source.infoHash || item.magnet_link || item.resolved_link || item.view_url || item.title;
+    if (!group.seen.has(uniqueKey)) {
+      group.sources.push(source);
+      group.seen.add(uniqueKey);
+    }
+    grouped.set(key, group);
   }
 
   const entries: MediaEntry[] = [];
-  for (const [key, sources] of grouped.entries()) {
+  for (const [key, { title, sources }] of grouped) {
     const primary = sources[0];
-    const displayTitle = cleanDisplayTitle(primary.sourceTitle);
     const year = extractYear(primary.sourceTitle);
     const seasonEpisode = extractSeasonEpisode(primary.sourceTitle);
-
     let bestQuality: QualityTier = "Other";
     let verifiedCount = 0;
     let magnetCount = 0;
@@ -173,41 +174,25 @@ export function groupItemsToMedia(
     let latestDate = primary.item.date || "N/A";
 
     for (const src of sources) {
-      if (QUALITY_RANK[src.qualityTier] > QUALITY_RANK[bestQuality]) {
-        bestQuality = src.qualityTier;
-      }
-      if (src.item.is_valid) verifiedCount += 1;
-      if (src.isMagnet) magnetCount += 1;
+      if (QUALITY_RANK[src.qualityTier] > QUALITY_RANK[bestQuality]) bestQuality = src.qualityTier;
+      if (src.item.is_valid) verifiedCount++;
+      if (src.isMagnet) magnetCount++;
       if (src.sizeBytes > largestSizeBytes) {
         largestSizeBytes = src.sizeBytes;
         largestSizeLabel = src.item.size;
       }
-      if (src.seeders !== null && (maxSeeders === null || src.seeders > maxSeeders)) {
-        maxSeeders = src.seeders;
-      }
-      if (src.item.date && src.item.date > latestDate) {
-        latestDate = src.item.date;
-      }
+      if (src.seeders !== null && (maxSeeders === null || src.seeders > maxSeeders)) maxSeeders = src.seeders;
+      if (src.item.date && src.item.date > latestDate) latestDate = src.item.date;
     }
 
     entries.push({
-      key,
-      title: displayTitle,
-      year,
-      seasonEpisode,
-      mediaType: seasonEpisode ? "series" : "release",
-      sources,
-      bestQuality,
-      verifiedCount,
-      magnetCount,
-      latestDate,
-      largestSizeLabel,
-      largestSizeBytes,
-      maxSeeders,
-      providerName,
+      key, title, year, seasonEpisode,
+      mediaType: sources.some((src) => parseReleaseTitle(src.sourceTitle).classification !== "unclassified")
+        ? "series" : "release",
+      sources, bestQuality, verifiedCount, magnetCount, latestDate,
+      largestSizeLabel, largestSizeBytes, maxSeeders, providerName,
     });
   }
-
   return entries;
 }
 
