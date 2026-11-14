@@ -1,0 +1,84 @@
+name: Intezam GUI visual smoke
+on:
+  push:
+    branches:
+      - review/gui-episode-flow-20261114
+jobs:
+  desktop-gui-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install, compile UI and browser
+        working-directory: src/gui_scraper/ui
+        run: |
+          npm ci
+          npm install --no-save playwright@1.56.1
+          npx playwright install --with-deps chromium
+          npm run build
+      - name: Launch GUI frontend and inspect search flow
+        working-directory: src/gui_scraper/ui
+        run: |
+          python3 -m http.server 4173 --directory dist >/tmp/intezam-server.log 2>&1 &
+          node --input-type=module <<'JS'
+          import { chromium } from 'playwright';
+          const browser = await chromium.launch({headless: true});
+          const page = await browser.newPage({viewport: {width:1440,height:900}});
+          page.on('pageerror', e => console.log('PAGE ERROR:',e.message));
+          await page.addInitScript(() => {
+            const titles = [
+              '[Group A] Frieren - 01 [1080p][HEVC]',
+              '[Group B] Frieren - 01 [720p][AVC]',
+              '[Group A] Frieren - 02 [1080p]',
+              '[Group A] Frieren - 01-04 Batch [1080p]',
+              '[Group A] Frieren S02E01 [1080p]'
+            ];
+            const rows = titles.map((title,i) => ({
+              id:i+1,title,size:'1.2 GiB',date:'2026-11-14',stats:'S: 20 L: 4',
+              raw_link:'https://example.org/torrent/'+i,
+              resolved_link:'magnet:?xt=urn:btih:'+String(i+1).padStart(40,'a'),
+              magnet_link:'magnet:?xt=urn:btih:'+String(i+1).padStart(40,'a'),
+              torrent_link:'https://example.org/torrent/'+i,
+              is_valid:true, verification_msg:'Valid magnet',seeders:20,leechers:4
+            }));
+            window.pywebview={api:{
+              get_config:async()=>({provider_name:'Nyaa',base_url:'https://nyaa.si',search_path:'/',query_param:'q',row_selector:'table.torrent-list tbody tr',title_selector:'td:nth-of-type(2) a',link_selector:'td:nth-of-type(3) a',size_selector:'td:nth-of-type(4)',date_selector:'td:nth-of-type(5)',stats_selector:'td:nth-of-type(6)',timeout:10,user_agent:'test'}),
+              search_paginated:async()=>({items:rows,page:1,total_pages:1,has_next_page:false}),
+              search:async()=>rows,
+              get_library:async()=>[],get_search_history:async()=>[],get_watch_history:async()=>[],
+              get_engine_status:async()=>({intezam_binary_available:false,vlc_available:false,mpv_available:false,rolling_cache_policy:'',stream_active:false}),
+              get_app_logs:async()=>[],get_stream_status:async()=>null,
+              copy_to_clipboard:async()=>({ok:true}),verify_url:async()=>({is_valid:true,message:'ok'}),
+              open_external:async()=>false
+            }};
+          });
+          try {
+            await page.goto('http://127.0.0.1:4173', {waitUntil:'domcontentloaded'});
+            await page.locator('#cinema-search-input').fill('Frieren');
+            await page.locator('#cinema-search-input').press('Enter');
+            await page.getByRole('button',{name:'Poster Cards'}).click();
+            await page.locator('button[aria-label^="Open details for"]').first().waitFor({timeout:15000});
+            console.log('TITLE CARDS:',await page.locator('button[aria-label^="Open details for"]').count());
+            await page.screenshot({path:'gui-search-before.png',fullPage:true});
+            await page.locator('button[aria-label^="Open details for"]').first().click();
+            await page.getByText('Stream Sources',{exact:true}).waitFor({timeout:15000});
+            console.log('EXISTING DETAILS SCREEN TEXT:',(await page.locator('main').innerText()).slice(0,2400));
+            console.log('EPISODE PICKER PRESENT:',await page.getByText('Episodes',{exact:true}).count()>0);
+            await page.screenshot({path:'gui-details-before.png',fullPage:true});
+            console.log('GUI SMOKE PASSED: React rendered, search was exercised, title opened');
+          } finally {
+            await browser.close();
+          }
+          JS
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intezam-gui-smoke
+          path: |
+            src/gui_scraper/ui/gui-search-before.png
+            src/gui_scraper/ui/gui-details-before.png
+          if-no-files-found: ignore
