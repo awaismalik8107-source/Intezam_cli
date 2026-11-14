@@ -1,4 +1,4 @@
-# Cache architecture and implementation notes
+# Playback and cache architecture
 
 ## Inspected repository and reused code
 
@@ -6,15 +6,18 @@ The [upstream repository](https://github.com/awaismalik8107-source/Intezam_cli)
 began with a single `main.cpp`, documentation and historical compiled binaries.
 Its original code created `./test`, dereferenced metadata before retrieval had
 completed and entered an unlimited download/status loop. The preceding local
-milestone already replaced that flow with tested metadata-only retrieval, video
-detection, validated selection and CMake/CTest targets.
+milestones replaced that flow with tested metadata-only retrieval, video
+detection, validated selection, the bounded sliding disk cache and CMake/CTest
+targets. The current milestone adds LibVLC playback on those local modules.
 
-This implementation reuses `torrent_metadata.*`, `video_files.*` and
-`video_selection.*`. Metadata retrieval still uses upload-only mode,
+This implementation reuses `torrent_metadata.*`, `video_files.*`,
+`video_selection.*` and the cache geometry, allocation, storage and disk backend.
+Metadata retrieval still uses upload-only mode,
 `default_dont_download` and disabled disk I/O. A separate session starts only
 after a video is selected and cache allocation succeeds. `--metadata-only`
-retains the previous no-payload behavior. Existing uncommitted work is retained;
-the historical binary artifacts are not overwritten.
+retains the previous no-payload behavior. Historical binary artifacts are not
+overwritten. LibVLC 3.x is a required linked dependency; it is initialized only
+for playback, after selection. The older simulation remains opt-in.
 
 ## Modules
 
@@ -26,8 +29,13 @@ the historical binary artifacts are not overwritten.
 | `dynamic_segment_cache.*` | Adaptive horizon and 1/3-behind, 2/3-ahead segment positioning |
 | `cache_disk_io.*` | libtorrent 2.1 `disk_interface`, disk reads/writes and SHA-1/SHA-256 hash callbacks |
 | `torrent_cache_session.*` | Safe torrent lifecycle, piece priorities/deadlines, eviction barrier and diagnostics |
+| `video_byte_source.hpp` | Seekable byte source contract, metadata reads and explicit cancellation |
+| `container_probe.*` | Bounded ISO BMFF atom walking and EBML/AVI/MPEG signature probing |
+| `torrent_video_source.*` | Worker, urgent range scheduling, verified callback reads, prebuffer and scan guard |
+| `vlc_player.*` | LibVLC lifecycle, custom callbacks, decode statistics, pause and time seeks |
+| `vlc_playback.*` | Startup, terminal controls, signals, status and orderly shutdown |
 | `cache_simulation.*` | Timed simulated playback, interactive seeks/rate changes and signal cleanup |
-| `main.cpp` | Existing magnet/detection/selection flow plus cache options and handoff |
+| `main.cpp` | Magnet/detection/selection flow, playback options and handoff |
 
 ## Budget and piece mapping
 
@@ -71,8 +79,11 @@ For configured consumption `r`, a candidate horizon in seconds is:
 Before the first sample, `s/r` uses 1 as an initialization estimate, not a claim
 about actual throughput. The horizon becomes a segment count via
 `ceil(seconds * r / segment_size)`. The count is clipped by available slots and
-then reduced until its exact intersecting piece set fits. If even the current
-segment cannot fit, the limitation is reported instead of exceeding the budget.
+then reduced until its exact intersecting piece set, unioned with the current
+urgent read's pieces, fits. A distant container metadata read therefore consumes
+existing slots and temporarily reduces the playback horizon. If even the current
+segment plus required metadata cannot fit, the limitation is reported instead
+of exceeding the budget.
 This policy is deliberately explicit and tunable; no constant four-segment
 window or claim of universal optimal buffering is involved.
 
@@ -99,8 +110,8 @@ Hash failures invalidate the piece and let libtorrent retry. V1 uses SHA-1;
 v2/hybrid validation also supplies per-block SHA-256 hashes through
 `async_hash()` / `async_hash2()` with v2 file-tail lengths.
 
-The controller gives nonzero priorities only to admitted target pieces.
-Deadlines start at playback, continue through forward prefetch, then backward
+The controller gives nonzero priorities only to admitted target/urgent pieces.
+Deadlines start with the blocked read, then playback, forward prefetch and backward
 retention. Starting torrents are paused and in upload-only mode until these
 priorities are installed. This prevents both payload races and an early
 upload-only handshake from disconnecting the seed before scheduling is ready.
@@ -139,16 +150,108 @@ Re-adding costs connection churn and can cause rebuffering. This avoids internal
 libtorrent headers or unsupported modifications to its piece picker, but a future
 upstream availability-reset API could make eviction smoother.
 
-## Remaining playback work
+Default streaming settings use outgoing TCP, incoming TCP/uTP and a one-second
+minimum reconnect backoff. Libtorrent optimistically retries uTP for newly added
+peers, including after each eviction generation; repeated UDP-to-TCP fallback
+otherwise stalls playback on a TCP-only seeder. Metadata retrieval retains its
+existing transport settings. Embedders can explicitly enable outgoing uTP via
+`CacheStreamOptions::settings`, accepting that cost.
 
-The simulation consumes byte ranges at a configured rate. It does not decode
-media or derive timestamps/bitrate from a container. A future player should
-translate its requests into selected-file ranges, hold leases during reads, and
-provide observed playback consumption. Container headers/indexes near EOF may
-need separate pinned requests; these would also consume slots. Decoder startup,
-seeking and minimum buffer requirements can exceed the budget and must be
-reported or stalled explicitly. No guarantee of codec compatibility or
-uninterrupted VLC playback is made here.
+## Cache-to-VLC interface and threads
+
+`TorrentVideoSource` owns one `TorrentCacheSession` and a control worker. VLC's
+open callback creates a cursor containing its selected-file offset and source
+ownership. Seek validates `0 <= offset <= video_size`, changes that cursor and
+supersedes old queued reads. Read clamps each request to 16 KiB, the selected-file
+end and one torrent-piece boundary, including unaligned selected files.
+
+A callback queues its exact range under the source mutex. It first attempts a
+verified `ReadLease`; otherwise it sleeps on a condition variable. The worker
+updates the playback anchor and urgent range, pumps libtorrent and publishes
+diagnostics every 20 ms. The callback never pumps the session or requests a
+rebuild itself. A lease remains pinned through the disk read and copy to VLC.
+Only EOF (or a zero-length request) returns zero. Timeout, cancellation and storage
+errors have separate exception paths; all C callbacks catch exceptions and return
+VLC's error sentinel rather than unwinding through C.
+
+Source mutex order is source -> cache controller -> piece store. The worker takes
+source snapshots before cache calls and releases cache locks before publishing
+status. LibVLC control calls run on the CLI thread, with separate control and error
+mutexes; event/log/video callbacks never call player control APIs. The headless
+video callback uses a 32-byte-aligned fixed frame buffer and counts displayed
+frames; audio uses VLC's dummy output while still decoding audio packets.
+
+Stop first suspends new input reads, advances a cancellation epoch and wakes
+pending callbacks, then calls LibVLC 3's synchronous stop. After callbacks finish,
+the cache worker is cancelled/joined and its session is destroyed. This ordering
+also handles stopping during probing or an active network wait. SIGINT/SIGTERM
+only set a signal flag; normal control flow performs teardown. Terminal mode is
+restored by RAII. A closed stdin disables controls while media continues to EOF.
+
+## Containers, startup and seeking
+
+Container detection reads real bytes. MP4/MOV/M4V use bounded top-level atom-header
+walking: `mdat` payload is skipped by offset and the `moov` range is recorded even
+after media data. Scanning stops when `moov` is found, avoiding a walk through
+every media fragment. Extended atom sizes and malformed/truncated bounds are checked.
+EBML header/DocType distinguishes Matroska and WebM; RIFF AVI, TS/M2TS and MPEG
+program streams have signature checks. Unknown signatures receive VLC probing.
+There are no custom codecs or timestamp indexes.
+
+Known ISO BMFF metadata reads preserve the playback byte anchor. VLC can request
+any other header/cue/index range through its seek/read callbacks, prioritizing
+the missing piece without allocating a separate metadata file. All such data
+shares the same slots and verification path. Parsed demux metadata lives in VLC's
+memory. Matroska cluster/directory preloading and AVI automatic index repair are
+disabled; missing indexes do not authorize an unlimited scan.
+
+Before playback, a bounded verified prefix is buffered: up to the smaller of
+one third of data capacity and the initial 0.2-second rate estimate, with a 16 KiB
+minimum where capacity allows. VLC then performs its normal demux buffering.
+VLC's prefetch filter is limited to 64 KiB RAM, 16 KiB reads and a one-byte seek
+threshold. Setting this threshold to zero makes VLC 3 loop on an empty prefetch
+buffer; the one-byte value permits discontinuous metadata requests to seek.
+
+During startup and user seeks, a merged range map counts the unique selected-file
+footprint of requested whole torrent pieces, including for tiny header requests.
+Its allowance is `min(90% of video_size, max(8 MiB, min(16 MiB, capacity * 8)))`.
+Repeated reads do not consume the allowance again. Exceeding it fails explicitly
+instead of fetching the complete file to reconstruct an index. Normal decoded
+playback disables the startup guard. The disk bound does not cover VLC decoder
+buffers or parsed in-memory metadata.
+
+Time, duration and seekability come from LibVLC. Ordinary time seeks retain the
+demuxer via `libvlc_media_player_set_time()`. If a seek remains blocked after
+750 ms, the controller cancels the old callback before stopping and reopening
+with `start-time`; pause state is preserved. VLC determines the byte offsets and
+keyframe dependencies. A cache hit serves existing verified bytes immediately;
+an uncached request updates priorities and waits for verification. Parsed indexes
+and keyframes can still require additional bytes before a frame is displayed.
+
+The dynamic window follows demux byte consumption, which can lead displayed time
+because VLC buffers packets. Duration supplies an approximate average bitrate;
+it does not model arbitrary variable bitrate streams precisely. Network EWMA,
+verified forward availability and capacity continue to determine the horizon.
+Seeking and codec support depend on valid media and installed plugins. Expensive
+startup metadata or too few slots can fail under the strict budget.
+
+## Validation and limitations
+
+The real-media tests generate eight fixtures and play them over a loopback torrent
+through the custom cache backend and LibVLC memory-video/dummy-audio outputs.
+Executed checks include front/tail MP4, MKV, WebM, MOV, M4V, AVI, MPEG-TS, actual
+decoded video/audio, pause/resume, time seeks, cached byte reuse, uncached reads,
+peer outage/recovery, throttling, blocked-read cancellation, EOF and cleanup.
+A subprocess test exercises the complete CLI with its default network settings,
+from magnet input and selection through tail-metadata playback to EOF.
+Each client cache's actual allocated file/directory blocks are measured against
+`floor(video_size / 40)`, separately from the seeder's fixture files. The existing
+v1/v2/hybrid cache and metadata-only tests remain active. See README for commands.
+
+Desktop image presentation, audible output, hardware decoding, arbitrary damaged
+or encrypted media, public swarms and sustained WAN playback still require manual
+or broader compatibility testing. Local decode success is not a guarantee of
+uninterrupted playback on every torrent.
 
 The initial disk backend performs bounded synchronous operations on libtorrent's
 network thread and posts callbacks to its `io_context`, which the API permits.
@@ -162,3 +265,6 @@ recognized stale cache directories on the next initialization.
 - [Piece priorities, deadlines and resume data](https://libtorrent.org/reference-Torrent_Handle.html)
 - [Torrent flags](https://github.com/arvidn/libtorrent/blob/v2.1.0/include/libtorrent/torrent_flags.hpp)
 - [Resume parameter fields](https://github.com/arvidn/libtorrent/blob/v2.1.0/include/libtorrent/add_torrent_params.hpp)
+- [LibVLC 3 custom media callbacks](https://videolan.videolan.me/vlc-3.0/group__libvlc__media.html)
+- [LibVLC 3 player controls and video callbacks](https://videolan.videolan.me/vlc-3.0/group__libvlc__media__player.html)
+- [VLC 3 prefetch implementation and option units](https://code.videolan.org/videolan/vlc/-/blob/3.0.x/modules/stream_filter/prefetch.c)

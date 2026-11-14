@@ -41,6 +41,13 @@ private:
 
 } // namespace
 
+lt::settings_pack streamingSessionSettings()
+{
+    auto settings = metadataSessionSettings();
+    settings.set_bool(lt::settings_pack::enable_outgoing_utp, false);
+    return settings;
+}
+
 TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
     std::shared_ptr<const lt::torrent_info> metadata, const VideoFile& video, const CacheStreamOptions& options)
     : metadata_(std::move(metadata)), geometry_(geometryFor(metadata_, video)), options_(options),
@@ -67,6 +74,9 @@ TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
         static_cast<int>(static_cast<std::uint32_t>(lt::alert_category::status
             | lt::alert_category::error | lt::alert_category::storage | lt::alert_category::connect)));
     session_params.settings.set_int(lt::settings_pack::stop_tracker_timeout, 1);
+    // A streaming read must recover promptly when a temporarily unavailable peer
+    // returns, rather than inheriting the default minute-long reconnect backoff.
+    session_params.settings.set_int(lt::settings_pack::min_reconnect_time, 1);
     session_params.disk_io_constructor = cacheDiskConstructor(store_, geometry_, disk_state_);
     session_ = std::make_unique<lt::session>(std::move(session_params));
     store_->reconcile(controller_.window().pieces);
@@ -136,6 +146,7 @@ void TorrentCacheSession::addTorrent(lt::add_torrent_params params)
 void TorrentCacheSession::drain(std::chrono::milliseconds wait,
                                const std::function<void(lt::alert*)>& inspect)
 {
+    checkCancelled();
     if (wait > 0ms) session_->wait_for_alert(wait);
     std::vector<lt::alert*> alerts;
     session_->pop_alerts(&alerts);
@@ -205,11 +216,18 @@ void TorrentCacheSession::rebuild(const std::vector<int>& desired)
 
 void TorrentCacheSession::schedule()
 {
-    auto desired = controller_.window().pieces;
+    const auto urgent = urgentPieces();
+    auto desired = controller_.window(urgent).pieces;
+    for (int piece : urgent) {
+        if (std::find(desired.begin(), desired.end(), piece) == desired.end()) desired.push_back(piece);
+    }
     const int current = static_cast<int>((geometry_.video_offset + controller_.playbackPosition()) / geometry_.piece_length);
     // Admit playback first, then forward prefetch, then backward retention.
-    std::stable_sort(desired.begin(), desired.end(), [current](int left, int right) {
-        const auto rank = [current](int piece) { return piece >= current ? piece - current : current - piece + 1000000000LL; };
+    std::stable_sort(desired.begin(), desired.end(), [current, &urgent](int left, int right) {
+        const auto rank = [current, &urgent](int piece) {
+            if (std::find(urgent.begin(), urgent.end(), piece) != urgent.end()) return std::int64_t{-1};
+            return piece >= current ? std::int64_t{piece - current} : std::int64_t{current - piece} + 1000000000;
+        };
         return rank(left) < rank(right);
     });
     if (store_->needsEviction(desired)) rebuild(desired);
@@ -217,9 +235,7 @@ void TorrentCacheSession::schedule()
 
     std::vector<int> admitted;
     for (int piece : desired) if (store_->contains(piece)) admitted.push_back(piece);
-    auto sorted = admitted;
-    std::sort(sorted.begin(), sorted.end());
-    if (sorted == scheduled_) return;
+    if (admitted == scheduled_) return;
     torrent_.clear_piece_deadlines();
     std::vector<lt::download_priority_t> priorities(metadata_->num_pieces(), lt::dont_download);
     for (int piece : admitted) priorities[piece] = lt::top_priority;
@@ -229,7 +245,17 @@ void TorrentCacheSession::schedule()
         if (!store_->isVerified(piece)) torrent_.set_piece_deadline(lt::piece_index_t{piece}, deadline_ms);
         deadline_ms = std::min(60000, deadline_ms + 100);
     }
-    scheduled_ = std::move(sorted);
+    scheduled_ = std::move(admitted);
+}
+
+std::vector<int> TorrentCacheSession::urgentPieces() const
+{
+    return read_demand_ ? geometry_.piecesForRange(read_demand_->offset, read_demand_->length) : std::vector<int>{};
+}
+
+void TorrentCacheSession::checkCancelled() const
+{
+    if (options_.cancelled && options_.cancelled()) throw std::runtime_error("Cache operation cancelled.");
 }
 
 void TorrentCacheSession::observeThroughput()
@@ -310,6 +336,18 @@ void TorrentCacheSession::setPlaybackRate(double bytes_per_second)
     schedule();
 }
 
+void TorrentCacheSession::updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand)
+{
+    std::lock_guard<std::mutex> control(control_mutex_);
+    if (demand) geometry_.piecesForRange(demand->offset, demand->length);
+    if (playback_offset != controller_.playbackPosition()) {
+        controller_.updatePlaybackPosition(playback_offset);
+        last_progress_ = Clock::now();
+    }
+    read_demand_ = demand;
+    schedule();
+}
+
 bool TorrentCacheSession::isRangeCached(std::int64_t offset, std::int64_t length) const
 { return store_->isRangeCached(offset, length); }
 
@@ -319,18 +357,21 @@ std::optional<PieceStore::ReadLease> TorrentCacheSession::read(std::int64_t offs
 CacheDiagnostics TorrentCacheSession::diagnostics() const
 {
     std::lock_guard<std::mutex> control(control_mutex_);
-    const auto window = controller_.window();
+    const auto urgent = urgentPieces();
+    const auto window = controller_.window(urgent);
+    auto required = window.pieces;
+    for (int piece : urgent) if (std::find(required.begin(), required.end(), piece) == required.end()) required.push_back(piece);
     std::set<int> in_flight;
     for (const auto& partial : torrent_.get_download_queue()) {
         const int piece = static_cast<int>(partial.piece_index);
         if (!store_->isVerified(piece)
-            && std::find(window.pieces.begin(), window.pieces.end(), piece) != window.pieces.end()) {
+            && std::find(required.begin(), required.end(), piece) != required.end()) {
             in_flight.insert(piece);
         }
     }
     std::size_t pending = 0;
     std::size_t deferred = 0;
-    for (int piece : window.pieces) {
+    for (int piece : required) {
         if (!store_->contains(piece)) ++deferred;
         else if (!store_->isVerified(piece)) ++pending;
     }
@@ -352,7 +393,7 @@ CacheDiagnostics TorrentCacheSession::diagnostics() const
             received_bytes_, store_->residentPieces().size(), store_->verifiedPieces().size(), in_flight.size(),
             pending - std::min(pending, in_flight.size()),
             verified_segments, downloading_segments, deferred, rebuilds_, controller_.networkSpeed(),
-            controller_.videoBitrate(), buffered, buffered > 0};
+            controller_.videoBitrate(), buffered, buffered > 0, urgent.size()};
 }
 
 } // namespace intezam

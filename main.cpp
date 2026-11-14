@@ -2,6 +2,7 @@
 #include "src/video_files.hpp"
 #include "src/video_selection.hpp"
 #include "src/cache_simulation.hpp"
+#include "src/vlc_playback.hpp"
 
 #include <libtorrent/version.hpp>
 
@@ -22,6 +23,8 @@ struct CliOptions {
     double bitrate = 1024 * 1024;
     bool metadata_only = false;
     bool help = false;
+    bool simulate = false;
+    bool headless = false;
 };
 
 int parseSeconds(std::string_view argument, int maximum)
@@ -42,11 +45,16 @@ CliOptions parseOptions(int argc, char* argv[])
         const std::string_view argument{argv[index]};
         if (argument == "--help") options.help = true;
         else if (argument == "--metadata-only") options.metadata_only = true;
+        else if (argument == "--simulate") options.simulate = true;
+        else if (argument == "--headless") options.headless = true;
         else if (argument == "--timeout" || argument == "--simulate-seconds" || argument == "--bitrate") {
             if (++index >= argc) throw std::invalid_argument("Missing value for " + std::string(argument));
             const std::string_view value{argv[index]};
             if (argument == "--timeout") options.timeout = std::chrono::seconds{parseSeconds(value, 3600)};
-            else if (argument == "--simulate-seconds") options.duration = std::chrono::seconds{parseSeconds(value, 86400)};
+            else if (argument == "--simulate-seconds") {
+                options.duration = std::chrono::seconds{parseSeconds(value, 86400)};
+                options.simulate = true;
+            }
             else {
                 const auto parsed = std::from_chars(value.data(), value.data() + value.size(), options.bitrate);
                 if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size()
@@ -69,11 +77,12 @@ int main(int argc, char* argv[])
         const auto cli = parseOptions(argc, argv);
         if (cli.help) {
             std::cout << "Usage: intezam [--timeout SECONDS] [--metadata-only]\n"
-                      << "               [--bitrate BYTES_PER_SECOND] [--simulate-seconds SECONDS]\n"
-                      << "Retrieve metadata, select a video, then simulate playback through a bounded disk cache.\n"
+                      << "               [--bitrate BYTES_PER_SECOND] [--headless]\n"
+                      << "               [--simulate | --simulate-seconds SECONDS]\n"
+                      << "Retrieve metadata, select a video, then play verified cache bytes with LibVLC.\n"
                       << "--metadata-only preserves detection/selection without payload downloads.\n"
-                      << "Defaults: metadata timeout 120 seconds, simulated consumption 1048576 bytes/s.\n"
-                      << "VLC and container/codec parsing are not implemented.\n";
+                      << "Defaults: metadata timeout 120 seconds, initial bitrate estimate 1048576 bytes/s.\n"
+                      << "--simulate retains the cache test harness; --headless uses memory video/dummy audio.\n";
             return EXIT_SUCCESS;
         }
         intezam::MetadataOptions options;
@@ -119,10 +128,17 @@ int main(int argc, char* argv[])
             std::cout << "Metadata-only selection complete. No video data downloaded.\n";
             return EXIT_SUCCESS;
         }
-        intezam::CacheSimulationOptions simulation;
-        simulation.cache.playback_bytes_per_second = cli.bitrate;
-        simulation.duration = cli.duration;
-        intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
+        if (cli.simulate) {
+            intezam::CacheSimulationOptions simulation;
+            simulation.cache.playback_bytes_per_second = cli.bitrate;
+            simulation.duration = cli.duration;
+            intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
+        } else {
+            intezam::PlaybackOptions playback;
+            playback.cache.playback_bytes_per_second = cli.bitrate;
+            playback.vlc.headless = cli.headless;
+            intezam::runVlcPlayback(magnet, metadata, *selected_video, playback);
+        }
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';

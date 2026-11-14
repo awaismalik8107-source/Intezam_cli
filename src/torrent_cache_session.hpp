@@ -13,11 +13,16 @@
 
 namespace intezam {
 
+// Rebuilt cache torrents otherwise repeat optimistic uTP handshakes, including
+// for TCP-only peers. Keep incoming uTP, but prefer reliable TCP reconnection.
+libtorrent::settings_pack streamingSessionSettings();
+
 struct CacheStreamOptions {
     std::filesystem::path root = CacheFile::defaultRoot();
     double playback_bytes_per_second = 1024 * 1024;
     std::chrono::milliseconds stall_timeout{120000};
-    libtorrent::settings_pack settings = metadataSessionSettings();
+    libtorrent::settings_pack settings = streamingSessionSettings();
+    std::function<bool()> cancelled;
 };
 
 struct CacheDiagnostics {
@@ -38,6 +43,7 @@ struct CacheDiagnostics {
     double playback_bytes_per_second;
     double forward_buffer_seconds;
     bool ready;
+    std::size_t urgent_pieces;
 };
 
 // Control methods are serialized internally. Playback may hold/use ReadLease
@@ -51,10 +57,12 @@ public:
     bool seek(std::int64_t byte_offset);
     void setPlaybackPosition(std::int64_t byte_offset);
     void setPlaybackRate(double bytes_per_second);
+    void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand);
     std::optional<PieceStore::ReadLease> read(std::int64_t offset, std::int64_t length);
     bool isRangeCached(std::int64_t offset, std::int64_t length) const;
     CacheDiagnostics diagnostics() const;
     std::filesystem::path directory() const { return store_->directory(); }
+    std::int64_t dataCapacity() const { return static_cast<std::int64_t>(store_->slotCount()) * geometry_.piece_length; }
 
 private:
     using Clock = std::chrono::steady_clock;
@@ -66,6 +74,8 @@ private:
     void rebuild(const std::vector<int>& desired);
     void observeThroughput();
     void updatePosition(std::int64_t byte_offset);
+    std::vector<int> urgentPieces() const;
+    void checkCancelled() const;
     double forwardBufferSeconds() const;
     libtorrent::add_torrent_params safeParams(libtorrent::add_torrent_params params);
 
@@ -87,6 +97,7 @@ private:
     Clock::time_point last_progress_ = Clock::now();
     std::vector<int> last_verified_;
     std::string last_peer_error_;
+    std::optional<VideoRange> read_demand_;
     std::size_t rebuilds_ = 0;
 };
 

@@ -1,184 +1,216 @@
 # Intezam CLI
 
-A C++17 Linux CLI for torrent video detection and a network-adaptive, temporary
-disk cache. After metadata retrieval and video selection, a simulated player
-reads verified bytes while a sliding window follows its position. VLC and
-container/codec parsing are not implemented.
+A C++17 Linux torrent video player powered by libtorrent and LibVLC. It retrieves
+metadata, lists videos, and plays the selected video through custom media callbacks
+reading **verified bytes from a bounded temporary disk cache**. It never creates
+an ordinary full-size or sparse video file for VLC.
 
 ## Build on Arch Linux / CachyOS
 
-The custom disk interface targets **libtorrent-rasterbar 2.1.0+**, tested with
-**2.1.2**. No third-party test framework is required.
+Targets libtorrent-rasterbar **2.1.0+** and the **LibVLC 3.x** callback/lifecycle
+API. Tested locally with libtorrent **2.1.2**, LibVLC **3.0.24**, and GCC 16.2.1.
+LibVLC 4 has different lifecycle APIs and is rejected by this CMake configuration.
 
 ```bash
-sudo pacman -S --needed base-devel pkgconf cmake libtorrent-rasterbar
-pkg-config --modversion libtorrent-rasterbar
+sudo pacman -S --needed base-devel pkgconf cmake libtorrent-rasterbar libvlc vlc vlc-plugins-all
+pkg-config --modversion libtorrent-rasterbar libvlc
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j2
-ctest --test-dir build --output-on-failure
 ./build/intezam
 ```
 
-Use `build/intezam`. Historical executables checked into the repository root
-are not updated by this build. CMake commands work in both Bash and Fish.
+`vlc-plugins-all` supplies the runtime demuxers, codecs and output modules. A
+minimal installation can use the corresponding individual VLC plugin packages;
+headers/libvlc alone do not guarantee codec availability. No FFmpeg development
+library, HTTP framework, Qt application or external player process is required.
+The [Arch plugin package](https://archlinux.org/packages/extra/x86_64/vlc-plugins-all/)
+documents its runtime dependencies.
 
-Direct Bash build without CMake:
+Use `build/intezam`; historical binaries in the repository root are unchanged.
+CMake commands work in Bash and Fish. A direct Bash build is also supported:
 
 ```bash
 mkdir -p build
 g++ -std=c++17 -Wall -Wextra -Wpedantic main.cpp src/*.cpp \
-    $(pkg-config --cflags --libs libtorrent-rasterbar) -pthread -o build/intezam
+    $(pkg-config --cflags --libs libtorrent-rasterbar libvlc) -pthread -o build/intezam
 ```
 
-For Fish, replace `$(pkg-config ...)` with
-`(pkg-config --cflags --libs libtorrent-rasterbar | string split ' ')`.
+In Fish, replace the command substitution with
+`(pkg-config --cflags --libs libtorrent-rasterbar libvlc | string split ' ')`.
 
-## Usage
+## Playback
 
 ```bash
-./build/intezam --help
+./build/intezam
 ./build/intezam --timeout 60 --bitrate 1048576
-./build/intezam --simulate-seconds 30 --bitrate 262144
+./build/intezam --headless
 ./build/intezam --metadata-only
+./build/intezam --simulate
+./build/intezam --simulate-seconds 30
 ```
 
-Paste a magnet and select a video by its displayed number. Input is validated;
-`q` or EOF cancels selection. Metadata retrieval defaults to a 120-second timeout
-(`--timeout`: 1–3600 seconds). The metadata stage still makes no payload requests
-and creates no files. `--metadata-only` exits after selection, preserving that
-workflow without initializing storage or downloading payload.
+Paste a magnet and choose a video by its displayed number. Original zero-based
+torrent indexes, full paths, extensions and sizes are retained. Metadata retrieval
+remains payload-free and writes no files. `--metadata-only` exits after selection.
+The default metadata timeout is 120 seconds (`--timeout`: 1–3600 seconds).
 
-Supported extensions, ignoring case: `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`,
-`.flv`, `.wmv`, `.m4v`, `.mpeg`, `.mpg`, `.ts`, `.m2ts`. Padding files, symlinks and
-non-video extensions are excluded. Listings include full paths, formats,
-MiB/GiB sizes and original zero-based torrent indexes. File extensions identify
-candidates; they do not verify codecs or container compatibility.
+Default mode probes the actual container bytes, buffers a capacity-limited startup
+range, then starts LibVLC. Terminal controls do not require Enter on a TTY:
 
-After selection the default mode starts a cache simulation. Commands:
-
-| Command | Effect |
+| Key | Action |
 |---|---|
-| `seek 8388608` | Seek to a selected-file byte offset; report verified cache hit or miss |
-| `rate 524288` | Change simulated consumption to 524,288 bytes/s |
-| `pause` / `play` | Pause/resume simulated consumption; prefetch continues |
-| `status` | Print cache, throughput, window and buffer diagnostics |
-| `q` / `quit` | End the session and remove its temporary files |
+| P | Pause / resume |
+| F | Seek forward 10 seconds, bounded by known duration |
+| B | Seek backward 10 seconds |
+| S | Stop playback and remove the cache |
+| Q | Quit and remove the cache |
 
-The configured consumption rate defaults to 1 MiB/s. It is an explicit simulator
-input, not an inferred media bitrate. Network throughput is measured from actual
-payload counters and smoothed with an EWMA. `--simulate-seconds` (1–86400) ends
-automatically and permits continued simulation when piped stdin reaches EOF.
-Otherwise EOF exits. SIGINT/SIGTERM also unwind the cache. Missing playback data
-causes buffering; a 120-second verified-data stall produces an error and cleanup.
+SIGINT/SIGTERM also cancel reads and unwind the session. Terminal settings are
+restored on exit. Closing stdin disables controls while playback continues to
+media EOF; a piped magnet/selection can therefore play unattended. Status displays
+VLC's time/duration, buffering, observed network speed, allocated cache bytes and
+the desired/verified/downloading window state.
 
-## Bounded disk storage
+`--bitrate` supplies an initial bytes-per-second estimate (default 1 MiB/s).
+Once VLC exposes duration, the cache uses file-size/duration as an approximate
+average consumption rate. VBR and container overhead make this an estimate, not
+a codec guarantee. Byte scheduling follows actual demux byte consumption; VLC
+timestamps provide the displayed playback position.
 
-Each session uses `$XDG_CACHE_HOME/intezam/session-XXXXXX/` or, by default,
-`~/.cache/intezam/session-XXXXXX/`:
+`--headless` uses software decoding, a fixed 320×240 memory video output and a
+dummy audio output. It is intended for automated validation, not watching a film.
+`--simulate` preserves the previous disk-cache harness with `seek BYTE`,
+`rate BYTES_PER_SECOND`, `pause`, `play`, `status`, and `q` commands.
+
+## Containers and codecs
+
+Extension filtering still supports `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`, `.flv`,
+`.wmv`, `.m4v`, `.mpeg`, `.mpg`, `.ts`, and `.m2ts`, ignoring case. Padding files,
+symlinks and non-video extensions are excluded. Extensions identify candidates;
+they do not establish container or codec compatibility.
+
+- MP4/MOV/M4V: bounded top-level ISO BMFF atom-header reads locate `moov`, including
+  after `mdat`. Payload boxes are skipped by byte offset and scanning stops once
+  `moov` is found. VLC can then request the
+  actual metadata in bounded chunks, including near EOF.
+- MKV/WebM: EBML signatures and DocType identify the family. VLC's demuxers request
+  headers, cues/indexes and media through the same seekable verified-byte interface.
+- AVI, MPEG-TS/M2TS and MPEG program streams are signature-probed and delegated
+  to VLC. Unknown signatures also receive normal VLC probing.
+
+No decoder or timestamp-to-byte index is reimplemented. Supported codecs depend
+on the installed VLC plugins. Automatic AVI index repair, Matroska directory
+preloading and cluster preloading are disabled. Excessive startup/index scanning
+is rejected instead of allowing an automatic whole-file scan.
+
+## Verified reads and buffering
+
+`TorrentVideoSource` owns a cache worker. Missing read ranges become urgent piece
+requests; callback threads sleep on a condition variable while libtorrent runs
+independently. Reads are limited to 16 KiB and one torrent piece at a time. A pinned
+read lease protects verified disk data while it is copied into VLC's buffer.
+Incomplete or unverified pieces are never exposed. Zero means actual EOF; waiting,
+timeout, cancellation and errors are separate paths.
+
+Playback data keeps the dynamic 1/3-behind, 2/3-ahead policy. A container metadata
+request outside that window reduces the playback window until its exact union of
+pieces fits the existing slots. It does not allocate a second cache or move the
+playback anchor to a known `moov` range. Other demux seek/read requests update the
+byte-consumption position, while already verified overlapping data is reused.
+
+Ordinary time seeks use `libvlc_media_player_set_time()` and retain parsed demux
+metadata. If the seek does not progress within 750 ms, the controller suspends
+old reads, stops the old input and reopens it with `start-time`. Suspension wakes
+blocked callbacks before LibVLC 3's synchronous stop, avoiding a shutdown deadlock.
+Seeking is available when VLC has a usable duration and seek support. A cache hit
+does not guarantee an instant decoded frame if keyframe dependencies are missing.
+
+VLC's own prefetch filter is explicitly bounded to **64 KiB in RAM**, with 16 KiB
+reads and a one-byte seek threshold. Its default large read-ahead is not used.
+During startup and user seeks, a unique-range guard charges the complete
+selected-file footprint of requested torrent pieces. It permits at most 90% of the
+file and an absolute capacity-derived 8–16 MiB allowance before playback progress.
+Repeated reads of the same piece do not consume that allowance again. The guard
+rejects unusually expensive probing/index reconstruction rather than fetching the
+whole video. Decoder buffers and parsed metadata in VLC remain separate from
+the managed on-disk video cache.
+
+## Disk budget and cleanup
+
+The disk cache architecture is retained: one preallocated slot file under
+`$XDG_CACHE_HOME/intezam/session-XXXXXX/`, or `~/.cache/intezam/session-XXXXXX/`:
 
 ```text
-stream.cache   # fixed-size preallocated slots, reused in place
+stream.cache   # fixed size; whole-piece slots reused in place
 session.lock   # empty advisory lock; mappings/resume state stay in memory
 ```
 
-The budget is `floor(selected_video_size / 40)` bytes. Complete torrent pieces,
-including bytes overlapping neighboring files, occupy filesystem-aligned slots.
-Slot count is calculated after charging the allocated blocks of the session
-directory, lock file and shared cache root directory, plus an allocation-unit
-reserve. `posix_fallocate()` reserves the file before any payload requests. File
-length is fixed; writes outside reserved slots are rejected. Actual allocated
-blocks (`st_blocks * 512`) are checked at allocation and after writes.
+Maximum budget is `floor(video_size / 40)` bytes. Complete pieces, filesystem
+alignment, session/root directory blocks, lock allocation and an allocation-unit
+reserve are accounted for before requesting payload. Actual allocated blocks
+(`st_blocks * 512`) are checked after preallocation and writes. Container metadata,
+incomplete pieces and pinned readers consume the same slots. Writes cannot grow
+the file. Insufficient capacity, ENOSPC and other storage failures are reported.
+Known tmpfs/ramfs roots are rejected.
 
-If the budget cannot accommodate the required whole pieces/logical segment,
-allocation overhead, or a filesystem that supports preallocation, the application
-reports the limitation. ENOSPC and other filesystem errors stop the session.
-Known RAM-backed tmpfs/ramfs roots are rejected; set `XDG_CACHE_HOME` to a
-disk-backed filesystem if necessary.
-Reader pins can temporarily defer new pieces; they never increase capacity.
-There are no ordinary full-size torrent files, part files or on-disk resume files.
+The bound covers managed cache file/directory allocation, not RAM, filesystem
+journals, external snapshots or device-wide metadata. Concurrent sessions each
+have their own budget. No normal full-size torrent payload, part file, sparse
+video, on-disk resume file or external streaming staging file is created.
 
-The disk bound covers application-owned cache file/directory allocations, not
-RAM, filesystem journals, external snapshots or device-wide metadata that cannot
-be attributed through `stat`. The root directory is shared and remains after
-session cleanup; other live sessions have their own budgets. It is not a global
-quota across concurrent sessions.
+Normal exit, stop, EOF and handled failures remove the session directory.
+Outstanding read leases retain their data until released. After SIGKILL/crash,
+the next cache initialization removes recognized abandoned session directories
+only after acquiring their lock; live sessions and unknown contents are preserved.
+The empty shared root directory remains.
 
-On normal exit the session directory is removed. After a crash/SIGKILL, the next
-cache initialization removes recognized abandoned session directories only after
-successfully acquiring their lock. Live sessions and unrecognized contents are
-preserved. An outstanding playback read lease keeps its disk data and lock alive
-until the reader releases it, even if the torrent session has already ended.
-
-## Sliding window and seeking
-
-Logical segments are half a torrent piece (minimum 16 KiB), relative to the video.
-They can straddle torrent pieces when the video starts at an unaligned offset.
-The segment **count is dynamic**: throughput, measured variability, configured
-consumption and contiguous verified buffer health determine a target horizon.
-It is clipped to the available whole-piece slots. Away from file boundaries,
-`floor(window_segment_count / 3)` segments precede the current segment; the rest
-contain current playback and forward prefetch. Boundary windows shift inward.
-
-The desired window, admitted/queued pieces, actual download queue, verified
-pieces and readable segments are tracked separately. Downloads are prioritized
-at playback first, then ahead, then behind, with piece deadlines. Verified reads
-use pins so eviction cannot overwrite active readers. Overlapping verified and
-complete partial blocks are retained; unused old data can remain opportunistically
-until space is needed. A target-window move does not make missing data readable.
-
-Libtorrent 2.1 has no public single-piece availability-reset API. When a slot must
-be evicted, Intezam pauses the torrent, takes an **in-memory** resume snapshot,
-removes it, waits for its storage to release, reuses slots, and re-adds it with
-only the resident verified pieces advertised. Complete retained blocks are
-restored as unfinished pieces; peers, trackers and v2 hash state are retained.
-This supported-API approach costs brief disconnections/reconnections on eviction.
-It is a correctness-first foundation, not a guarantee of uninterrupted real-time
-playback or instantaneous buffering after an uncached seek.
-
-The custom disk implementation performs bounded reads/writes/hashes on the
-libtorrent network thread and posts completion callbacks as required. A future
-disk worker could improve throughput on slow drives; no unbounded disk job queue
-is introduced here. See [Guide.md](Guide.md) for architecture and API references.
+Libtorrent 2.1 has no public single-piece availability-reset operation. Slot
+eviction still uses the existing pause/snapshot/remove/re-add barrier, retaining
+verified overlap, complete partial blocks and peer/hash state in memory. This
+connection churn can cause rebuffering. Strict capacity and successful test
+fixtures do not imply uninterrupted playback for every torrent/network/container.
+Streaming sessions use outbound TCP by default and allow incoming uTP. Libtorrent
+otherwise repeats optimistic uTP negotiation after each re-add, even for a TCP-only
+peer. Embedders can override `CacheStreamOptions::settings` when uTP-only outbound
+access is needed, with the corresponding reconnect cost.
 
 ## Tests
 
+FFmpeg is optional for the application and is used only to generate test media:
+
 ```bash
+sudo pacman -S --needed ffmpeg
 ctest --test-dir build --output-on-failure
-./build/cache_tests
-./build/streaming_tests
 ```
 
-- Metadata-only local peer: invalid magnets, timeouts, zero payload requests and
-  zero created files/directories.
-- Detection/selection: all extensions, case, original indexes, 64-bit sizes,
-  invalid input, cancellation and EOF.
-- Disk/window policy: actual allocated block measurements, strict budget, dynamic
-  segment count, positioning and boundary cases, unaligned piece mapping,
-  verified read gating, concurrent pinned readers, reuse, insufficient capacity,
-  allocation failure, normal cleanup and crash recovery while preserving live locks.
-- Local torrent streaming: v1 multi-file, v2 and hybrid torrents, real libtorrent
-  verification, cached and uncached seeks, eviction/re-download, pinned data,
-  short final pieces, network starvation, corrupted payload rejection and cleanup.
-  A synthetic seeder serves zero-filled payload over loopback without writing a
-  complete source video.
+When FFmpeg is available, CTest generates short noisy H.264/AAC and VP9/Opus
+fixtures, tests them through a real loopback torrent and LibVLC, then removes the
+generated media. The seeder's source fixtures are test inputs, not client cache
+files. Client data is checked separately on a disk-backed filesystem.
 
-No public swarm is contacted by the CTest fixtures. Tests print independently
-measured disk allocation and the corresponding byte budget.
-Cache fixtures are created in the test working directory (normally `build/`),
-which must be disk-backed, rather than relying on a potentially RAM-backed `/tmp`.
+Executed automated scenarios include MP4 with front/tail `moov`, MKV, WebM, MOV,
+M4V, AVI, MPEG-TS, decoded video/audio counters, pause/resume, forward/backward time
+seeks, byte-cache hits/misses, peer interruption/recovery, throttled reads, blocked
+callback cancellation, stop during download, EOF, cleanup and actual allocated
+disk blocks. A subprocess test also drives the complete CLI from magnet input
+through selection, tail-metadata playback and EOF with default network settings.
+Container unit tests verify bounded atom scanning and malformed
+headers. Existing metadata-only, file-selection, v1/v2/hybrid cache, reader-pin,
+allocation-failure and stale-session tests remain in CTest.
 
-Local Btrfs measurements with libtorrent 2.1.2:
+The automated output test uses memory video and dummy audio outputs. Visual
+desktop rendering, audible sound, hardware decoding, arbitrary codecs, damaged
+or encrypted media, public swarms and sustained WAN performance are **not**
+validated by that headless test. These require separate manual/compatibility tests.
+FFmpeg absence is reported at configure time and skips the real-media test;
+container/cache/unit tests still run.
 
-| Fixture | Maximum budget | Measured allocation |
-|---|---:|---:|
-| 16 MiB v1 video | 419,430 bytes | 393,216 bytes |
-| 16 MiB + 123 bytes v2 video | 419,433 bytes | 393,216 bytes |
-| 128 MiB slot/reader test | 3,355,443 bytes | 3,342,336 bytes |
+The local normal run passed all **9 CTest checks**. Separate CLI smoke runs also
+verified quitting during startup and SIGTERM cleanup. Tail-MP4 playback peaked at
+**327,680 allocated bytes against a 347,812-byte budget**, including managed
+directories and lock/cache files.
 
-The full CLI simulation also passed a live `du -s -B1` check on Btrfs, timed
-cleanup and SIGTERM cleanup. Filesystem rounding varies; tests enforce the budget
-using the actual allocation of each run. AddressSanitizer/UndefinedBehaviorSanitizer
-validation can be reproduced with:
+For callback/lifetime checks:
 
 ```bash
 cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug \
@@ -187,6 +219,24 @@ cmake -S . -B build-sanitize -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-sanitize -j2
 ctest --test-dir build-sanitize --output-on-failure
 ```
+
+On this system the default LeakSanitizer run completes playback but fails its
+exit check: 1,048 bytes in 21 allocations originate in dynamically loaded plugin
+initialization and Fontconfig. A standalone LibVLC file player, linked without
+Intezam or libtorrent, reproduces the same allocation families (216 bytes in five
+allocations for one player). No invalid-memory or undefined-behavior report was
+observed. This is **not** a leak-clean sanitizer result. To run the address/UB
+checks separately while retaining leak checking on the non-playback tests:
+
+```bash
+ctest --test-dir build-sanitize --output-on-failure -E 'generate_vlc_media|vlc_cache_playback|cli_magnet_to_playback|cleanup_vlc_media'
+ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-sanitize --output-on-failure -R 'vlc_cache_playback|cli_magnet_to_playback'
+```
+
+Set `INTEZAM_VLC_DEBUG=1` for verbose VLC diagnostics. Normal playback reports
+callback/cache failures and fatal VLC errors through the CLI instead of printing
+every unsuccessful demuxer probe. See [Guide.md](Guide.md) for implementation
+boundaries, synchronization and API references.
 
 ## License
 

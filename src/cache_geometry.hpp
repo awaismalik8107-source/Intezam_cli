@@ -5,6 +5,13 @@
 
 namespace intezam {
 
+struct VideoRange {
+    std::int64_t offset;
+    std::int64_t length;
+    bool operator==(const VideoRange& other) const { return offset == other.offset && length == other.length; }
+    bool operator!=(const VideoRange& other) const { return !(*this == other); }
+};
+
 struct PieceGeometry {
     std::int64_t video_size;
     std::int64_t video_offset;

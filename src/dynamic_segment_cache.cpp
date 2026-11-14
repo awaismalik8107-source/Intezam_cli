@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <set>
 
 namespace intezam {
 
@@ -46,7 +47,7 @@ void DynamicSegmentCache::updateBufferHealth(double seconds)
     buffer_seconds_ = seconds;
 }
 
-SegmentWindow DynamicSegmentCache::window() const
+SegmentWindow DynamicSegmentCache::window(const std::vector<int>& urgent_pieces) const
 {
     const auto total = (geometry_.video_size - 1) / segment_size_ + 1;
     const auto current = position_ / segment_size_;
@@ -65,9 +66,11 @@ SegmentWindow DynamicSegmentCache::window() const
         const auto begin = first * segment_size_;
         const auto end = std::min(geometry_.video_size, (first + count) * segment_size_);
         auto pieces = geometry_.piecesForRange(begin, end - begin);
-        if (pieces.size() <= slots_) return {first, first + count - 1, current, begin, end, std::move(pieces)};
+        std::set<int> required(pieces.begin(), pieces.end());
+        required.insert(urgent_pieces.begin(), urgent_pieces.end());
+        if (required.size() <= slots_) return {first, first + count - 1, current, begin, end, std::move(pieces)};
     }
-    throw std::runtime_error("2.5% cache cannot cover the current logical segment's intersecting pieces.");
+    throw std::runtime_error("2.5% cache cannot fit playback and required container/read pieces together.");
 }
 
 } // namespace intezam

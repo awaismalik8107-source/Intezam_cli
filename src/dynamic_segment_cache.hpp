@@ -25,7 +25,7 @@ public:
     void updateNetworkSpeed(double bytes_per_second);
     void updateVideoBitrate(double bytes_per_second);
     void updateBufferHealth(double seconds);
-    SegmentWindow window() const;
+    SegmentWindow window(const std::vector<int>& urgent_pieces = {}) const;
     double networkSpeed() const { return speed_; }
     double videoBitrate() const { return bitrate_; }
     std::int64_t playbackPosition() const { return position_; }
