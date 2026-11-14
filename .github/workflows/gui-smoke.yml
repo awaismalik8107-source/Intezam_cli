@@ -5,7 +5,7 @@ on:
       - review/gui-episode-flow-20261114
 jobs:
   desktop-gui-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
