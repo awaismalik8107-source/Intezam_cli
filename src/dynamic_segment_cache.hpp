@@ -29,6 +29,8 @@ public:
     void updateNetworkSpeed(double bytes_per_second);
     void updateVideoBitrate(double bytes_per_second);
     void updateBufferHealth(double seconds);
+    // Explicit adaptive horizon; legacy callers retain their original formula.
+    void setAdaptiveForwardSeconds(double seconds);
     SegmentWindow window(const std::vector<int>& urgent_pieces = {}) const;
     SegmentWindow planWindow(const std::vector<int>& urgent_pieces = {});
     double networkSpeed() const { return speed_; }
@@ -47,6 +49,7 @@ private:
     double speed_ = 0;
     double jitter_ = 0;
     double buffer_seconds_ = 0;
+    std::optional<double> adaptive_forward_seconds_;
     bool observed_ = false;
     std::optional<SegmentWindow> rolling_window_;
 };

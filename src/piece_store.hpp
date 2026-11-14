@@ -56,11 +56,15 @@ public:
         std::optional<std::size_t> reserved_slots = {},
         CacheBudgetOptions budget = {CacheBudgetMode::strict, 25});
     std::size_t slotCount() const { return file_->slotCount(); }
+    std::size_t growthLimitSlots() const;
+    bool growToSlots(std::size_t slots);
+    std::string growthError() const;
     static std::size_t automaticReservation(std::size_t slots);
     std::size_t reservedSlots() const;
     void setReservedSlots(std::size_t slots);
     SlotInventory inventory() const;
     void setProtectedPieces(const std::vector<int>& pieces);
+    std::vector<int> protectedPieces() const;
     // Uses free slots only; required reads may borrow reserved capacity.
     AdmissionResult admit(const std::vector<int>& required, const std::vector<int>& prefetch);
     std::vector<int> reclaimablePieces(const std::vector<int>& keep) const;
@@ -102,6 +106,8 @@ private:
     std::unique_ptr<CacheFile> file_;
     mutable std::mutex mutex_;
     std::map<int, Slot> slots_;
+    std::set<std::size_t> free_slot_indices_;
+    std::set<std::size_t> used_slot_indices_;
     std::set<int> protected_pieces_;
     std::size_t reserved_slots_ = 0;
 };

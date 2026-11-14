@@ -41,6 +41,9 @@ cmake --build build-cli -j2
 ```bash
 ./build/intezam
 ./build/intezam --timeout 60 --bitrate 1048576
+./build/intezam --cache-max-mib 128 --cache-free-reserve-mib 512
+./build/intezam --buffer-seconds 30
+./build/intezam --legacy-cache
 ./build/intezam --no-ui
 ./build/intezam --strict-cache
 ./build/intezam --cache-max-percent 30
@@ -53,11 +56,18 @@ cmake --build build-cli -j2
 Paste a magnet and choose a video by its displayed number. Original zero-based
 torrent indexes, full paths, extensions and sizes are retained. Metadata retrieval
 remains payload-free and writes no files. `--metadata-only` exits after selection.
-Adaptive mode keeps manual selection, including samples whose 2.5% target is
-smaller than a torrent piece. It raises the budget only enough to provide four
-whole aligned pieces plus filesystem overhead, up to 25% of the selected video.
-`--cache-max-percent N` changes that ceiling (3–99); `--strict-cache` keeps the
-original 2.5% limit and its only-eligible-video automatic selection. Filesystem
+The default **Adaptive Streaming Engine 2.0** sizes the cache from estimated
+consumption, useful verified throughput, network variability and forward-buffer
+requirements. It starts with a 24-second forward horizon, at least four aligned
+slots, an absolute **256 MiB** maximum and a **256 MiB** free-space reserve.
+`--cache-max-mib`, `--cache-free-reserve-mib` and `--buffer-seconds` configure those
+limits; the latter sets the initial horizon (12–600 seconds). Physical growth
+appends slots safely; physical shrinking waits until teardown. GUI files and
+controls are unchanged. See [formulas, configuration, tests and measurements](docs/adaptive-engine-2.md).
+`--legacy-cache` restores the former automatic 2.5% target/four-piece minimum,
+bounded by 25% of the selected video. `--cache-max-percent N` selects that legacy
+mode with a different ceiling (3–99). `--strict-cache` keeps the original 2.5%
+limit and its only-eligible-video automatic selection. Filesystem
 allocation is checked again when playback starts. The default metadata timeout
 is 120 seconds (`--timeout`: 1–3600 seconds).
 
@@ -160,7 +170,7 @@ rejects unusually expensive probing/index reconstruction rather than fetching th
 whole video. Decoder buffers and parsed metadata in VLC remain separate from
 the managed on-disk video cache.
 
-Startup/resume watermarks adapt to observed network speed versus estimated
+In legacy modes, startup/resume watermarks adapt to observed network speed versus estimated
 consumption: 6 seconds for a fast swarm, 8 seconds near parity, 12 seconds for a
 slow/unknown swarm, clipped by the actual forward window, one third of capacity
 and remaining bytes. The download horizon grows to about 30 seconds ahead when
@@ -171,6 +181,17 @@ urgent reads are immediate and behind-window retention has lower priority. Exist
 forward deadlines stay in place; only changes are published. When verified runway
 falls below two piece durations (at least 0.5 seconds), forward refill can reclaim
 a single cold slot rather than waiting until the next piece becomes an urgent miss.
+
+The default adaptive mode instead uses verified-throughput estimates with short
+and long averages, variability, demand stalls and peer count. Forward targets
+range from 12 to 90 seconds with the default configuration. Startup is typically
+3 seconds on a fast stable swarm, 6 seconds near sustainable throughput, 8 seconds
+while unknown, or 16 seconds plus a variability allowance under a measured deficit.
+Every threshold is clipped to reachable verified capacity and remaining data.
+Low-buffer warnings, emergency pauses and resumption have separate thresholds.
+Priority 7/deadlines cover blocking or imminent data; priority 6 covers near
+future data, 4 distant prefetch and 1 backward retention. Highest priority does
+not increase physical bandwidth. Completing a temporary window retains peers.
 
 The UI labels the readout **estimated verified data ahead of VLC's byte reader**;
 VLC's decoded queues are separate. Brief prefetch waits do not label active
@@ -185,11 +206,20 @@ The disk cache architecture is retained: one preallocated slot file under
 `$XDG_CACHE_HOME/intezam/session-XXXXXX/`, or `~/.cache/intezam/session-XXXXXX/`:
 
 ```text
-stream.cache   # fixed size; whole-piece slots reused in place
+stream.cache   # bounded aligned slots; adaptive mode may append slots
 session.lock   # empty advisory lock; mappings/resume state stay in memory
 ```
 
-The target is `floor(video_size / 40)` bytes. Automatic mode fixes the session
+The adaptive target starts with `consumption_bytes_per_second * forward_seconds
+* 1.5`, then accounts for piece alignment, protected metadata outside the window,
+active pieces, staging and reserved slots. Useful video length caps the target;
+it is not a percentage multiplier. A sustained meaningful change can request
+growth or a smaller logical window. Live growth preserves offsets and serializes
+with disk I/O; live data is never truncated. The absolute maximum includes
+filesystem overhead, and allocation retains the configured free-space reserve.
+
+For explicit legacy modes the target is `floor(video_size / 40)` bytes.
+Automatic mode fixes the session
 budget to `max(target, 4 * aligned_piece_size + measured_overhead + allocation_unit)`.
 It refuses to allocate above `floor(video_size * maximum_percent / 100)` (25% by
 default). The budget never grows during playback. Strict mode uses the target
@@ -284,7 +314,7 @@ validated by that headless test. These require separate manual/compatibility tes
 FFmpeg absence is reported at configure time and skips the real-media test;
 container/cache/unit tests still run.
 
-The updated local normal run passed all **16 CTest checks**. These include reserved-slot,
+The previous smooth-playback milestone passed all **16 CTest checks**. These include reserved-slot,
 batch reconstruction, window stability and VLC peer-outage recovery regressions.
 Separate CLI smoke runs also
 verified quitting during startup and SIGTERM cleanup. Tail-MP4 playback peaked at

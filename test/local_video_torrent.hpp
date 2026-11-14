@@ -121,6 +121,9 @@ public:
     intezam::CacheStreamOptions options() const
     {
         intezam::CacheStreamOptions options;
+        // Historical integration tests explicitly exercise the bounded legacy
+        // cache, including eviction. Adaptive tests opt in with their own limits.
+        options.budget.mode = intezam::CacheBudgetMode::automatic;
         options.root = root_ / "client";
         options.settings = loopbackSettings();
         options.stall_timeout = std::chrono::seconds{15};

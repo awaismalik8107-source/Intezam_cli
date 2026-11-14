@@ -1,8 +1,51 @@
 #include "stream_policy.hpp"
+#include "cache_geometry.hpp"
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace intezam {
+std::int64_t verifiedForwardBytes(const PieceGeometry& geometry, std::int64_t position,
+    const std::function<bool(int)>& is_verified)
+{
+    geometry.validate();
+    if (position < 0 || position > geometry.video_size) throw std::out_of_range("Forward buffer position.");
+    auto global = geometry.video_offset + position;
+    const auto begin = global;
+    const auto end = geometry.video_offset + geometry.video_size;
+    while (global < end) {
+        const auto piece = static_cast<int>(global / geometry.piece_length);
+        if (!is_verified(piece)) break;
+        global = std::min(end, std::int64_t{piece + 1} * geometry.piece_length);
+    }
+    return global - begin;
+}
+
+BufferState AdaptiveBufferController::update(double buffered, AdaptiveBufferTargets targets,
+    bool waiting, bool seeking, double stalled)
+{
+    if (seeking) state_ = BufferState::seeking;
+    else if (stalled >= 3 && buffered < targets.emergency_seconds) state_ = BufferState::stalled;
+    else if (state_ == BufferState::initializing || state_ == BufferState::prebuffering) {
+        state_ = buffered >= targets.startup_seconds ? BufferState::playing : BufferState::prebuffering;
+    } else if (state_ == BufferState::recovering || state_ == BufferState::stalled || state_ == BufferState::seeking) {
+        state_ = buffered >= targets.resume_seconds ? BufferState::playing : BufferState::recovering;
+    } else if (waiting && buffered < targets.emergency_seconds) state_ = BufferState::recovering;
+    else state_ = buffered < targets.low_seconds ? BufferState::buffer_low : BufferState::playing;
+    return state_;
+}
+
+int playbackPiecePriority(bool blocking, double ahead, bool verified, double low, bool buffer_low)
+{
+    if (blocking && !verified) return 7;
+    if (ahead < 0) return 1;
+    if (verified) return 4;
+    if (ahead <= std::max(2.0, low)) return 7;
+    if (ahead <= std::max(8.0, low * 2)) return 6;
+    // In distress, distant data remains eligible but below near-future work.
+    return buffer_low ? 1 : 4;
+}
+
 BufferWatermarks bufferWatermarks(double playback_rate, double network_rate, double forward_capacity)
 {
     playback_rate = std::max(1.0, playback_rate);

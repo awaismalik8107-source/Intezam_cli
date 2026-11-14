@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <atomic>
+#include <string>
 
 namespace intezam {
 
@@ -26,7 +28,11 @@ public:
     std::int64_t allocatedBytes() const;
     std::int64_t budgetBytes() const { return budget_; }
     std::int64_t slotSize() const { return slot_size_; }
-    std::size_t slotCount() const { return slots_; }
+    std::size_t slotCount() const { return slots_.load(); }
+    std::size_t growthLimitSlots() const;
+    // Caller holds PieceStore's I/O lock. Only appends; offsets never change.
+    bool growToSlots(std::size_t slots);
+    const std::string& growthError() const { return growth_error_; }
     const std::filesystem::path& directory() const { return directory_; }
 
 private:
@@ -38,7 +44,10 @@ private:
     int lock_fd_ = -1;
     std::int64_t budget_ = 0;
     std::int64_t slot_size_ = 0;
-    std::size_t slots_ = 0;
+    std::atomic<std::size_t> slots_{0};
+    std::int64_t free_space_reserve_ = 0;
+    bool adaptive_ = false;
+    std::string growth_error_;
 };
 
 } // namespace intezam
