@@ -109,10 +109,16 @@ export function App() {
   const bridgeReady = usePyWebview();
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const activeSearchIdRef = useRef(0);
+  const activeDetailIdRef = useRef(0);
+  const detailsCacheRef = useRef(new Map<string, { entry: MediaEntry; expires: number; hasMore: boolean }>());
 
   const [preferences, setPreferences] = useState<UiPreferences>(loadInitialPreferences);
   const [activeSection, setActiveSection] = useState<NavSection>("home");
   const [selectedMediaKey, setSelectedMediaKey] = useState<string | null>(null);
+  const [detailedMedia, setDetailedMedia] = useState<MediaEntry | null>(null);
+  const [detailsLoading, setDetailsLoading] = useState(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
+  const [detailsHasMore, setDetailsHasMore] = useState(false);
   const [inspectedRow, setInspectedRow] = useState<ScrapedItem | null>(null);
 
   const [mode, setMode] = useState<ScrapeMode>(() => preferences.defaultMode);
@@ -247,12 +253,13 @@ export function App() {
   const selectedMedia = useMemo(() => {
     if (!selectedMediaKey) return null;
     return (
+      (detailedMedia?.key === selectedMediaKey ? detailedMedia : null) ??
       discoveredMedia.find((mEntry) => mEntry.key === selectedMediaKey) ??
       discoveryCatalog.find((mEntry) => mEntry.key === selectedMediaKey) ??
       libraryMedia.find((mEntry) => mEntry.key === selectedMediaKey) ??
       null
     );
-  }, [discoveredMedia, discoveryCatalog, libraryMedia, selectedMediaKey]);
+  }, [detailedMedia, discoveredMedia, discoveryCatalog, libraryMedia, selectedMediaKey]);
 
   const executeSearch = useCallback(
     async (
@@ -337,9 +344,61 @@ export function App() {
     [config.provider_name, mode, pushToast, query],
   );
 
+  // Title-specific release discovery is deferred until the title is opened.
+  // Cache for 90 seconds so returning to the same title does not repeat requests.
+  const loadTitleEpisodes = useCallback(async (media: MediaEntry, force = false) => {
+    const cacheKey = `${mode}:${config.provider_name}:${media.key}`;
+    const cached = detailsCacheRef.current.get(cacheKey);
+    if (!force && cached && cached.expires > Date.now()) {
+      setDetailedMedia(cached.entry);
+      setDetailsHasMore(cached.hasMore);
+      setDetailsError(null);
+      setDetailsLoading(false);
+      return;
+    }
+
+    const requestId = ++activeDetailIdRef.current;
+    setDetailsLoading(true);
+    setDetailsError(null);
+    const collected: ScrapedItem[] = media.sources.map((source) => source.item);
+    let hasMore = false;
+    try {
+      // Bounded on-demand pagination. Do not issue title-expansion requests
+      // for every poster in the search results.
+      for (let page = 1; page <= 3; page += 1) {
+        const response = await searchPaginated(media.title, mode, page);
+        if (requestId !== activeDetailIdRef.current) return;
+        collected.push(...response.items);
+        hasMore = response.has_next_page;
+        if (!hasMore) break;
+      }
+      const resolved = groupItemsToMedia(collected, config.provider_name)
+        .find((entry) => entry.key === media.key);
+      const entry = resolved ?? media;
+      if (requestId !== activeDetailIdRef.current) return;
+      detailsCacheRef.current.set(cacheKey, {
+        entry, hasMore, expires: Date.now() + 90_000,
+      });
+      setDetailedMedia(entry);
+      setDetailsHasMore(hasMore);
+    } catch (err) {
+      if (requestId !== activeDetailIdRef.current) return;
+      setDetailsError(err instanceof Error ? err.message : String(err));
+      // Preserve already-visible releases when an on-demand refresh fails.
+      setDetailedMedia((previous) => previous?.key === media.key ? previous : media);
+    } finally {
+      if (requestId === activeDetailIdRef.current) setDetailsLoading(false);
+    }
+  }, [mode, config.provider_name]);
+
   const handleSelectMedia = useCallback((media: MediaEntry) => {
+    activeDetailIdRef.current += 1;
     setSelectedMediaKey(media.key);
-  }, []);
+    setDetailedMedia(media);
+    setDetailsHasMore(false);
+    setDetailsError(null);
+    void loadTitleEpisodes(media);
+  }, [loadTitleEpisodes]);
 
   const handleToggleLibrary = useCallback(
     async (media: MediaEntry) => {
@@ -426,7 +485,7 @@ export function App() {
 
   const handleCopyUri = useCallback(
     async (source: MediaSource): Promise<boolean> => {
-      const res = await copyToClipboard(source.item.resolved_link);
+      const res = await copyToClipboard(source.item.magnet_link || source.item.resolved_link);
       if (res.ok) {
         pushToast("Link copied successfully.", "success");
         return true;
@@ -707,6 +766,10 @@ export function App() {
                   onLaunchIntezam={handleLaunchIntezam}
                   onStopIntezam={handleStopIntezam}
                   onOpenExternal={handleOpenExternal}
+                  loadingEpisodes={detailsLoading}
+                  episodeError={detailsError}
+                  moreEpisodesAvailable={detailsHasMore}
+                  onLoadEpisodes={() => void loadTitleEpisodes(selectedMedia, true)}
                 />
               ) : activeSection === "home" ? (
                 <HomeView
