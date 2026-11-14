@@ -1,29 +1,9 @@
-import {
-  ArrowLeft,
-  Bookmark,
-  Check,
-  Globe,
-  HardDrive,
-  Magnet,
-  Play,
-  ShieldCheck,
-  Users,
-} from "lucide-react";
-import { m } from "motion/react";
-import { useMemo, useRef, useState } from "react";
+import { ArrowLeft, Bookmark, Check, Copy, Layers3, Magnet, RefreshCw, Search } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { buildEpisodeCatalog } from "../lib/episodeCatalog";
 import { QUALITY_RANK } from "../lib/mediaAdapter";
-import { EASE_CINEMA, PAGE_VARIANTS } from "../lib/motion";
-import type {
-  EngineStatus,
-  MediaEntry,
-  MediaSource,
-  QualityTier,
-  SourceSortKey,
-  StreamSessionState,
-} from "../lib/types";
-import { IntezamFlowPanel } from "./IntezamFlowPanel";
+import type { EngineStatus, MediaEntry, MediaSource, StreamSessionState } from "../lib/types";
 import { PosterArtwork } from "./PosterArtwork";
-import { StatusBadge } from "./StatusBadge";
 
 interface MediaDetailsViewProps {
   media: MediaEntry;
@@ -39,352 +19,253 @@ interface MediaDetailsViewProps {
   onLaunchIntezam: (source: MediaSource) => void;
   onStopIntezam: () => void;
   onOpenExternal: (source: MediaSource) => void;
+  loadingEpisodes?: boolean;
+  episodeError?: string | null;
+  moreEpisodesAvailable?: boolean;
+  onLoadEpisodes?: () => void;
 }
 
-const QUALITY_ORDER: QualityTier[] = ["4K", "1080p", "720p", "Other"];
+function magnetOf(source: MediaSource): string | null {
+  const candidate = (source.item.magnet_link || source.item.resolved_link || "").trim();
+  return candidate.toLowerCase().startsWith("magnet:?") ? candidate : null;
+}
+
+function sourceKey(source: MediaSource): string {
+  return source.infoHash || magnetOf(source) || source.item.view_url || source.sourceTitle;
+}
 
 export function MediaDetailsView({
-  media,
-  isSaved,
-  engineStatus,
-  streamState,
-  verifyingId,
-  strictCacheBudget,
-  onBack,
-  onToggleLibrary,
-  onVerifySource,
-  onCopyUri,
-  onLaunchIntezam,
-  onStopIntezam,
-  onOpenExternal,
+  media, isSaved, onBack, onToggleLibrary, onCopyUri,
+  loadingEpisodes = false, episodeError = null,
+  moreEpisodesAvailable = false, onLoadEpisodes,
 }: MediaDetailsViewProps) {
-  const sourcesRef = useRef<HTMLDivElement | null>(null);
-  const [sortBy, setSortBy] = useState<SourceSortKey>("quality");
-  const [selectedSourceId, setSelectedSourceId] = useState<number | null>(() => {
-    const firstValidMagnet = media.sources.find((s) => s.item.is_valid && s.isMagnet);
-    const firstValid = media.sources.find((s) => s.item.is_valid);
-    return (firstValidMagnet ?? firstValid ?? media.sources[0])?.item.id ?? null;
-  });
+  const catalog = useMemo(() => buildEpisodeCatalog(media.sources), [media.sources]);
+  const [season, setSeason] = useState<number | null>(null);
+  const [episode, setEpisode] = useState<number | null>(null);
+  const [expandedSource, setExpandedSource] = useState<string | null>(null);
 
-  const sortedSources = useMemo(() => {
-    return [...media.sources].sort((a, b) => {
-      if (sortBy === "quality") {
-        const qDiff = QUALITY_RANK[b.qualityTier] - QUALITY_RANK[a.qualityTier];
-        if (qDiff !== 0) return qDiff;
-        return Number(b.item.is_valid) - Number(a.item.is_valid);
-      }
-      if (sortBy === "size") return b.sizeBytes - a.sizeBytes;
-      if (sortBy === "peers") return (b.seeders ?? -1) - (a.seeders ?? -1);
-      return Number(b.item.is_valid) - Number(a.item.is_valid);
-    });
-  }, [media.sources, sortBy]);
+  useEffect(() => {
+    setSeason(null);
+    setEpisode(null);
+    setExpandedSource(null);
+  }, [media.key]);
 
-  const groupedSources = useMemo(() => {
-    const map = new Map<QualityTier, MediaSource[]>();
-    for (const tier of QUALITY_ORDER) map.set(tier, []);
-    for (const src of sortedSources) {
-      map.get(src.qualityTier)?.push(src);
+  const currentSeason = season !== null && catalog.seasons.includes(season)
+    ? season
+    : catalog.seasons[0] ?? 1;
+  const visibleEpisodes = catalog.episodes.filter((entry) => entry.season === currentSeason);
+  const selectedEpisode = visibleEpisodes.find((entry) => entry.number === episode) ?? null;
+  const availableBatches = catalog.batches.filter(
+    (batch) => batch.season === null || batch.season === currentSeason,
+  );
+
+  const sortedSources = useMemo(
+    () => [...(selectedEpisode?.sources ?? [])].sort((a, b) =>
+      Number(Boolean(magnetOf(b))) - Number(Boolean(magnetOf(a))) ||
+      (b.seeders ?? -1) - (a.seeders ?? -1) ||
+      QUALITY_RANK[b.qualityTier] - QUALITY_RANK[a.qualityTier],
+    ),
+    [selectedEpisode],
+  );
+
+  const handleSelectEpisode = (number: number) => {
+    setEpisode(number);
+    setExpandedSource(null);
+  };
+
+  const renderMagnet = (source: MediaSource, showInitially = false) => {
+    const magnet = magnetOf(source);
+    const isOpen = showInitially || expandedSource === sourceKey(source);
+    if (!magnet) {
+      return <p className="text-xs text-amber-200/80">No magnet URI in this release. A torrent-file link is not a magnet link.</p>;
     }
-    return QUALITY_ORDER.filter((tier) => (map.get(tier)?.length ?? 0) > 0).map((tier) => ({
-      tier,
-      sources: map.get(tier)!,
-    }));
-  }, [sortedSources]);
-
-  const selectedSource =
-    media.sources.find((s) => s.item.id === selectedSourceId) ?? sortedSources[0] ?? null;
-
-  const handlePlayBest = () => {
-    if (selectedSource) {
-      sourcesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      if (
-        selectedSource.isMagnet &&
-        selectedSource.item.is_valid &&
-        engineStatus?.intezam_binary_available
-      ) {
-        onLaunchIntezam(selectedSource);
-      }
-    }
+    return (
+      <div className="space-y-2">
+        {!isOpen && (
+          <button
+            type="button"
+            onClick={() => setExpandedSource(sourceKey(source))}
+            className="text-xs font-medium text-[#AFA6FF] hover:text-white"
+          >
+            Show magnet URI
+          </button>
+        )}
+        {isOpen && (
+          <div className="space-y-2">
+            <code className="block max-h-28 overflow-auto break-all rounded-lg border border-white/10 bg-[#090B12] p-3 font-mono text-[11px] leading-relaxed text-[#C8D0E2] select-all">{magnet}</code>
+            <button
+              type="button"
+              onClick={() => void onCopyUri(source)}
+              className="inline-flex items-center gap-2 rounded-lg border border-[#786BFF]/35 bg-[#786BFF]/10 px-3 py-2 text-xs font-semibold text-[#DAD6FF] hover:bg-[#786BFF]/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+            >
+              <Copy className="h-3.5 w-3.5" aria-hidden="true" /> Copy magnet link
+            </button>
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
-    <m.div
-      variants={PAGE_VARIANTS}
-      initial="initial"
-      animate="animate"
-      exit="exit"
-      className="space-y-6 pb-10"
-    >
-      {/* Cinematic Backdrop Header */}
-      <section className="relative overflow-hidden rounded-2xl border border-white/[0.08] bg-[#111522] p-5 sm:p-6">
+    <div className="space-y-6 pb-12">
+      <section className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#111522] p-5 sm:p-7">
         <PosterArtwork
-          title={media.title}
-          year={media.year}
-          quality={media.bestQuality}
-          mediaType={media.mediaType}
-          variant="backdrop"
+          title={media.title} year={media.year} quality={media.bestQuality}
+          mediaType={media.mediaType} variant="backdrop"
         />
-
-        <div className="relative z-10 flex flex-col gap-5 md:flex-row md:items-end">
-          {/* Poster Thumbnail */}
-          <m.div
-            initial={{ opacity: 0, scale: 0.96 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.3, ease: EASE_CINEMA }}
-            className="hidden aspect-[2/3] w-[136px] shrink-0 overflow-hidden rounded-xl border border-white/15 shadow-2xl md:block"
-          >
-            <PosterArtwork
-              title={media.title}
-              year={media.year}
-              quality={media.bestQuality}
-              mediaType={media.mediaType}
-            />
-          </m.div>
-
-          {/* Title & Genuine Metadata */}
-          <div className="flex-1 space-y-4">
-            <m.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.28, ease: EASE_CINEMA }}
-              className="space-y-2"
-            >
-              <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                <span className="rounded-md border border-white/15 bg-black/40 px-2 py-0.5 font-mono text-[#949CAF]">
-                  {media.providerName}
-                </span>
-                {media.year && (
-                  <span className="rounded-md border border-white/15 bg-black/40 px-2 py-0.5 font-mono text-[#F8FAFC]">
-                    {media.year}
-                  </span>
-                )}
-                {media.seasonEpisode && (
-                  <span className="rounded-md border border-[#786BFF]/35 bg-[#786BFF]/15 px-2 py-0.5 font-mono text-[#F8FAFC]">
-                    {media.seasonEpisode}
-                  </span>
-                )}
-                {media.bestQuality !== "Other" && (
-                  <span className="rounded-md border border-[#38BDF8]/30 bg-[#38BDF8]/10 px-2 py-0.5 font-mono text-[#38BDF8]">
-                    {media.bestQuality} (inferred)
-                  </span>
-                )}
-              </div>
-
-              <h2 className="text-2xl font-bold tracking-tight text-[#F8FAFC] sm:text-3xl">
-                {media.title}
-              </h2>
-            </m.div>
-
-            <m.p
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.28, delay: 0.06, ease: EASE_CINEMA }}
-              className="max-w-2xl text-xs leading-relaxed text-[#949CAF] sm:text-[13px]"
-            >
-              {media.sources.length} extracted{" "}
-              {media.sources.length === 1 ? "source" : "sources"} · {media.verifiedCount} passed
-              initial URI validation
-              {media.largestSizeLabel !== "N/A" ? ` · Up to ${media.largestSizeLabel}` : ""}
-              {media.latestDate !== "N/A" ? ` · Latest date ${media.latestDate}` : ""}. Metadata
-              tags such as resolution or codec are inferred from source titles until stream
-              metadata is retrieved.
-            </m.p>
-
-            {/* Primary Actions */}
-            <m.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.28, delay: 0.1, ease: EASE_CINEMA }}
-              className="flex flex-wrap items-center gap-2.5 pt-1"
-            >
+        <div className="relative z-10 flex flex-col gap-5 sm:flex-row sm:items-start">
+          <div className="hidden w-28 shrink-0 overflow-hidden rounded-xl border border-white/15 shadow-xl sm:block">
+            <PosterArtwork title={media.title} year={media.year} quality={media.bestQuality} mediaType={media.mediaType} />
+          </div>
+          <div className="min-w-0 flex-1 space-y-3">
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-[#AAB5CA]">
+              <span className="rounded-md border border-white/10 bg-black/40 px-2 py-1">{media.providerName}</span>
+              <span className="rounded-md border border-white/10 bg-black/40 px-2 py-1">{media.mediaType === "series" ? "Series" : "Release"}</span>
+              <span className="rounded-md border border-white/10 bg-black/40 px-2 py-1">{media.sources.length} collected releases</span>
+            </div>
+            <h2 className="break-words text-2xl font-bold tracking-tight text-white sm:text-3xl">{media.title}</h2>
+            <p className="max-w-xl text-sm leading-relaxed text-[#AAB5CA]">
+              Browse available seasons, choose an episode, then inspect and copy its magnet links.
+              Intezam playback is not connected to this screen.
+            </p>
+            <div className="flex flex-wrap gap-2 pt-2">
               <button
-                type="button"
-                onClick={handlePlayBest}
-                className="inline-flex h-10 items-center gap-2 rounded-xl bg-gradient-to-r from-[#786BFF] to-[#5B8DEF] px-5 text-xs font-semibold text-[#F8FAFC] shadow-lg shadow-[#786BFF]/25 transition-transform hover:scale-[1.015] active:scale-[0.985] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
-              >
-                <Play className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
-                <span>
-                  {selectedSource?.isMagnet && engineStatus?.intezam_binary_available
-                    ? "Watch with Intezam"
-                    : "View Sources"}
-                </span>
-              </button>
-
+                type="button" onClick={onBack}
+                className="inline-flex items-center gap-2 rounded-lg border border-white/15 bg-[#191E2E] px-3 py-2 text-xs font-medium text-white hover:bg-[#232A40]"
+              ><ArrowLeft className="h-4 w-4" />Back to results</button>
               <button
-                type="button"
-                onClick={() => onToggleLibrary(media)}
-                className="inline-flex h-10 items-center gap-2 rounded-xl border border-white/15 bg-[#191E2E] px-4 text-xs font-medium text-[#F8FAFC] transition-colors hover:bg-[#232A40] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
-              >
-                {isSaved ? (
-                  <>
-                    <Check className="h-3.5 w-3.5 text-emerald-400" aria-hidden="true" />
-                    <span>In Library</span>
-                  </>
-                ) : (
-                  <>
-                    <Bookmark className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>Add to Library</span>
-                  </>
-                )}
-              </button>
-
-              <button
-                type="button"
-                onClick={onBack}
-                className="inline-flex h-10 items-center gap-1.5 rounded-xl border border-white/10 bg-[#090B12]/70 px-3.5 text-xs font-medium text-[#949CAF] transition-colors hover:text-[#F8FAFC] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
-              >
-                <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>Back</span>
-              </button>
-            </m.div>
+                type="button" onClick={() => onToggleLibrary(media)}
+                className="inline-flex items-center gap-2 rounded-lg border border-white/15 bg-[#191E2E] px-3 py-2 text-xs font-medium text-white hover:bg-[#232A40]"
+              >{isSaved ? <Check className="h-4 w-4" /> : <Bookmark className="h-4 w-4" />}
+                {isSaved ? "Saved to Library" : "Add to Library"}</button>
+            </div>
           </div>
         </div>
       </section>
 
-      {/* Intezam Flow Source Preparation Panel for Active Source */}
-      {selectedSource && (
-        <IntezamFlowPanel
-          source={selectedSource}
-          engineStatus={engineStatus}
-          streamState={streamState}
-          isVerifying={verifyingId === selectedSource.item.id}
-          strictCacheBudget={strictCacheBudget}
-          onVerify={onVerifySource}
-          onCopyUri={onCopyUri}
-          onLaunchIntezam={onLaunchIntezam}
-          onStopIntezam={onStopIntezam}
-          onOpenExternal={onOpenExternal}
-        />
-      )}
-
-      {/* Stream Source Selection — Grouped by Quality */}
-      <section ref={sourcesRef} className="space-y-5">
+      <section className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-base font-semibold tracking-tight text-[#F8FAFC]">
-              Stream Sources
-            </h3>
-            <p className="mt-0.5 text-xs text-[#949CAF]">
-              Select any source card to verify its URI or prepare Intezam Flow playback
+            <h3 className="text-lg font-semibold text-white">Episodes</h3>
+            <p className="mt-1 text-xs text-[#AAB5CA]">
+              {catalog.episodes.length} distinct episodes found in {catalog.seasons.length} identified season(s). Counts reflect releases found, not an official episode list.
             </p>
           </div>
-
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-[#949CAF]">Sort sources</span>
-            <select
-              aria-label="Sort stream sources"
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as SourceSortKey)}
-              className="h-8 rounded-lg border border-white/10 bg-[#111522] px-2.5 text-xs text-[#F8FAFC] focus:border-[#786BFF] focus:outline-none"
-            >
-              <option value="quality">Quality (Inferred)</option>
-              <option value="size">File Size</option>
-              <option value="peers">Seeders</option>
-              <option value="verified">Verification Status</option>
-            </select>
-          </div>
+          {loadingEpisodes ? (
+            <span role="status" className="inline-flex items-center gap-2 text-xs text-[#B3A8FF]"><RefreshCw className="h-3.5 w-3.5 animate-spin" />Finding episodes...</span>
+          ) : onLoadEpisodes ? (
+            <button
+              type="button" onClick={onLoadEpisodes}
+              className="inline-flex items-center gap-2 rounded-lg border border-white/10 px-3 py-2 text-xs text-[#D5D7E3] hover:bg-white/10"
+            ><RefreshCw className="h-3.5 w-3.5" />Refresh sources</button>
+          ) : null}
         </div>
-
-        {groupedSources.length === 0 ? (
-          <div className="rounded-2xl border border-white/[0.06] bg-[#111522] p-8 text-center text-xs text-[#949CAF]">
-            No streaming sources were found for this entry.
+        {episodeError && <p role="alert" className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-100">{episodeError}</p>}
+        {moreEpisodesAvailable && (
+          <p className="text-xs text-[#AAB5CA]">Additional search pages are available. The current list is not necessarily complete.</p>
+        )}
+        {catalog.seasons.length > 0 && (
+          <div role="group" aria-label="Choose season" className="flex flex-wrap gap-2">
+            {catalog.seasons.map((value) => (
+              <button
+                key={value} type="button" onClick={() => { setSeason(value); setEpisode(null); setExpandedSource(null); }}
+                aria-pressed={currentSeason === value}
+                className={`rounded-lg px-4 py-2 text-xs font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${currentSeason === value ? "border border-[#786BFF]/60 bg-[#786BFF]/20 text-white" : "border border-white/10 bg-[#191E2E] text-[#AAB5CA] hover:text-white"}`}
+              >Season {value}</button>
+            ))}
+          </div>
+        )}
+        {visibleEpisodes.length > 0 ? (
+          <div role="group" aria-label="Choose episode" className="grid grid-cols-4 gap-2 sm:grid-cols-6 md:grid-cols-8 xl:grid-cols-10">
+            {visibleEpisodes.map((entry) => (
+              <button
+                type="button" key={entry.number} onClick={() => handleSelectEpisode(entry.number)}
+                aria-label={`Episode ${entry.number}`} aria-pressed={episode === entry.number}
+                className={`flex min-h-16 flex-col items-center justify-center gap-1 rounded-xl border px-2 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${episode === entry.number ? "border-[#786BFF] bg-[#786BFF]/20 text-white" : "border-white/10 bg-[#191E2E] text-[#D2D7E4] hover:border-white/25 hover:bg-[#232A40]"}`}
+              >
+                <span className="text-[10px] text-[#AAB5CA]">EP</span>
+                <strong className="text-base">{String(entry.number).padStart(2, "0")}</strong>
+                <span className="text-[10px] text-[#AAB5CA]">{entry.sources.length} source{entry.sources.length === 1 ? "" : "s"}</span>
+              </button>
+            ))}
           </div>
         ) : (
-          <div className="space-y-5">
-            {groupedSources.map((group) => (
-              <div key={group.tier} className="space-y-2.5">
-                <div className="flex items-center gap-2">
-                  <span className="rounded-md border border-white/10 bg-[#191E2E] px-2 py-0.5 font-mono text-[11px] font-semibold text-[#F8FAFC]">
-                    {group.tier === "Other" ? "Other / Unknown Resolution" : `${group.tier} (Inferred)`}
-                  </span>
-                  <span className="font-mono text-[11px] text-[#949CAF]">
-                    {group.sources.length} {group.sources.length === 1 ? "source" : "sources"}
-                  </span>
+          <div className="flex items-center gap-3 rounded-xl border border-dashed border-white/10 bg-[#0C101C] p-5 text-xs text-[#AAB5CA]">
+            <Search className="h-5 w-5 shrink-0" />No individually numbered episodes were identified for this season. Check batch releases below or refresh sources.
+          </div>
+        )}
+      </section>
+
+      <section aria-live="polite" className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6">
+        <div>
+          <h3 className="text-lg font-semibold text-white">
+            {selectedEpisode ? `Season ${selectedEpisode.season} · Episode ${selectedEpisode.number} — Magnet sources` : "Select an episode"}
+          </h3>
+          <p className="mt-1 text-xs text-[#AAB5CA]">
+            {selectedEpisode ? "Compare available releases and copy the magnet you want." : "Source links appear here after you choose an episode above."}
+          </p>
+        </div>
+        {selectedEpisode && (
+          <div className="space-y-3">
+            {sortedSources.map((source) => (
+              <article key={sourceKey(source)} className="space-y-3 rounded-xl border border-white/[0.08] bg-[#191E2E] p-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Magnet className="h-4 w-4 shrink-0 text-[#AFA6FF]" />
+                  <div className="min-w-0 flex-1">
+                    <p className="break-words text-sm font-medium text-white">{source.sourceTitle}</p>
+                    <p className="mt-1 text-[11px] text-[#AAB5CA]">
+                      {source.qualityTier} (inferred) · {source.item.size} · {source.seeders ?? "?"} seeders · {source.providerName}
+                    </p>
+                  </div>
                 </div>
-
-                <div className="grid gap-2.5 md:grid-cols-2">
-                  {group.sources.map((src) => {
-                    const isSelected = selectedSource?.item.id === src.item.id;
-                    return (
-                      <m.button
-                        key={src.item.id}
-                        type="button"
-                        layout="position"
-                        onClick={() => setSelectedSourceId(src.item.id)}
-                        className={`flex flex-col justify-between gap-3 rounded-xl border p-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${
-                          isSelected
-                            ? "border-[#786BFF]/60 bg-[#191E2E] shadow-[0_0_0_1px_rgba(120,107,255,0.25)]"
-                            : "border-white/[0.07] bg-[#111522] hover:border-white/20 hover:bg-[#191E2E]/75"
-                        }`}
-                      >
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="flex min-w-0 items-start gap-2.5">
-                            <span
-                              className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border ${
-                                src.isMagnet
-                                  ? "border-[#38BDF8]/25 bg-[#38BDF8]/10 text-[#38BDF8]"
-                                  : "border-[#786BFF]/25 bg-[#786BFF]/10 text-[#786BFF]"
-                              }`}
-                              aria-hidden="true"
-                            >
-                              {src.isMagnet ? (
-                                <Magnet className="h-3.5 w-3.5" />
-                              ) : (
-                                <Globe className="h-3.5 w-3.5" />
-                              )}
-                            </span>
-                            <div className="min-w-0">
-                              <div className="line-clamp-2 text-[13px] font-medium text-[#F8FAFC]">
-                                {src.sourceTitle}
-                              </div>
-                              <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-[#949CAF]">
-                                <span>{src.providerName}</span>
-                                {src.inferredCodec && (
-                                  <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[#F8FAFC]">
-                                    {src.inferredCodec} (inferred)
-                                  </span>
-                                )}
-                                {src.inferredContainer && (
-                                  <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[#F8FAFC]">
-                                    {src.inferredContainer}
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-                          </div>
-
-                          <StatusBadge
-                            isValid={src.item.is_valid}
-                            message={src.item.verification_msg}
-                            isVerifying={verifyingId === src.item.id}
-                          />
-                        </div>
-
-                        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/[0.05] pt-2.5 font-mono text-[11px] text-[#949CAF]">
-                          <div className="flex items-center gap-3">
-                            <span className="inline-flex items-center gap-1 text-[#F8FAFC]">
-                              <HardDrive className="h-3 w-3 text-[#786BFF]" aria-hidden="true" />
-                              {src.item.size}
-                            </span>
-                            <span className="inline-flex items-center gap-1">
-                              <Users className="h-3 w-3 text-[#38BDF8]" aria-hidden="true" />
-                              {src.item.stats}
-                            </span>
-                          </div>
-                          <span className="inline-flex items-center gap-1 text-[10.5px]">
-                            <ShieldCheck className="h-3 w-3" aria-hidden="true" />
-                            {src.item.date}
-                          </span>
-                        </div>
-                      </m.button>
-                    );
-                  })}
-                </div>
-              </div>
+                {renderMagnet(source, true)}
+              </article>
             ))}
           </div>
         )}
       </section>
-    </m.div>
+
+      {availableBatches.length > 0 && (
+        <section className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6">
+          <div className="flex items-center gap-3">
+            <Layers3 className="h-5 w-5 text-[#AFA6FF]" />
+            <div>
+              <h3 className="text-lg font-semibold text-white">Batch & season packs</h3>
+              <p className="mt-1 text-xs text-[#AAB5CA]">Full-season torrents remain separate from individual episodes. Contents are not assumed until inspected.</p>
+            </div>
+          </div>
+          <div className="space-y-3">
+            {availableBatches.map((batch) => (
+              <article key={sourceKey(batch.source)} className="space-y-3 rounded-xl border border-white/10 bg-[#191E2E] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <p className="break-words text-sm font-medium text-white">{batch.source.sourceTitle}</p>
+                    <p className="mt-1 text-xs text-[#AAB5CA]">{batch.firstEpisode !== null && batch.lastEpisode !== null ? `Episodes ${batch.firstEpisode}–${batch.lastEpisode} (inferred from title)` : "Episode range unverified"} · {batch.source.item.size}</p>
+                  </div>
+                  <span className="shrink-0 rounded-full border border-[#786BFF]/35 px-2 py-1 text-[10px] text-[#AFA6FF]">Batch</span>
+                </div>
+                {renderMagnet(batch.source)}
+              </article>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {catalog.other.length > 0 && (
+        <details className="rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6">
+          <summary className="cursor-pointer text-sm font-semibold text-white">
+            Unclassified releases ({catalog.other.length}) — show raw sources
+          </summary>
+          <div className="mt-4 space-y-3">
+            {catalog.other.map((source) => (
+              <article key={sourceKey(source)} className="space-y-2 rounded-xl border border-white/10 bg-[#191E2E] p-3">
+                <p className="break-words text-xs text-white">{source.sourceTitle}</p>
+                {renderMagnet(source)}
+              </article>
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
   );
 }
