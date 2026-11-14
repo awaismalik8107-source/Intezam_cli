@@ -23,6 +23,7 @@ interface MediaDetailsViewProps {
   episodeError?: string | null;
   moreEpisodesAvailable?: boolean;
   onLoadEpisodes?: () => void;
+  onLoadMoreEpisodes?: () => void;
 }
 
 function magnetOf(source: MediaSource): string | null {
@@ -37,7 +38,7 @@ function sourceKey(source: MediaSource): string {
 export function MediaDetailsView({
   media, isSaved, onBack, onToggleLibrary, onCopyUri,
   loadingEpisodes = false, episodeError = null,
-  moreEpisodesAvailable = false, onLoadEpisodes,
+  moreEpisodesAvailable = false, onLoadEpisodes, onLoadMoreEpisodes,
 }: MediaDetailsViewProps) {
   const catalog = useMemo(() => buildEpisodeCatalog(media.sources), [media.sources]);
   const [season, setSeason] = useState<number | null>(null);
@@ -162,8 +163,11 @@ export function MediaDetailsView({
         </div>
         {episodeError && <p role="alert" className="rounded-lg border border-amber-400/20 bg-amber-400/5 p-3 text-xs text-amber-100">{episodeError}</p>}
         {moreEpisodesAvailable && (
-          <p className="text-xs text-[#AAB5CA]">Additional search pages are available. The current list is not necessarily complete.</p>
-        )}
+          <div className="flex flex-wrap items-center gap-3 rounded-lg border border-white/10 bg-[#191E2E] p-3">
+            <p className="flex-1 text-xs text-[#AAB5CA]">More results exist. Load additional pages to discover other episodes and seasons.</p>
+            <button type="button" disabled={loadingEpisodes} onClick={onLoadMoreEpisodes} className="rounded-lg border border-[#786BFF]/35 px-3 py-2 text-xs font-semibold text-[#DAD6FF] hover:bg-[#786BFF]/20 disabled:opacity-50">Load more episodes</button>
+          </div>
+        )
         {catalog.seasons.length > 0 && (
           <div role="group" aria-label="Choose season" className="flex flex-wrap gap-2">
             {catalog.seasons.map((value) => (
