@@ -2,12 +2,14 @@
 
 #include "torrent_cache_session.hpp"
 #include "vlc_player.hpp"
+#include "cli_status_renderer.hpp"
 
 namespace intezam {
 
 struct PlaybackOptions {
     CacheStreamOptions cache;
     VlcOptions vlc;
+    CliStatusOptions monitoring{};
 };
 
 void runVlcPlayback(const std::string& magnet,

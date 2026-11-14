@@ -6,8 +6,14 @@
 #include <thread>
 
 namespace intezam {
-enum class PlaybackCommandType { toggle_pause, seek, skip, volume, mute };
+enum class PlaybackCommandType { toggle_pause, seek, skip, volume, mute, adjust_volume };
 struct PlaybackCommand { PlaybackCommandType type; std::int64_t value = 0; };
+enum class StartupStage { connecting, reading_container, buffering, opening_video, complete };
+struct StartupProgress {
+    StartupStage stage = StartupStage::connecting;
+    double buffered_seconds = 0;
+    double target_seconds = 0; // estimated using the current authoritative buffer policy
+};
 struct PlaybackSnapshot {
     PlaybackStatus player;
     VideoSourceStatus source;
@@ -15,6 +21,7 @@ struct PlaybackSnapshot {
     std::string notice;
     bool ready = false;
     bool finished = false;
+    StartupProgress startup;
 };
 class PlaybackControls {
 public:
@@ -38,6 +45,7 @@ public:
 private:
     void run(const std::string& magnet, std::shared_ptr<const libtorrent::torrent_info> metadata, const VideoFile& video);
     void apply(VlcPlayer& player, PlaybackCommand command);
+    void setStartupStage(StartupStage stage, const std::string& phase);
     PlaybackOptions options_;
     std::atomic<bool> stopping_{false};
     mutable std::mutex mutex_;

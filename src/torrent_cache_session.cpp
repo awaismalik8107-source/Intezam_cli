@@ -98,6 +98,10 @@ TorrentCacheSession::TorrentCacheSession(const std::string& magnet,
         }
     }
     known_peers_ = params.peers;
+    for (const auto& peer : options.bootstrap_peers) {
+        if (peer.port() != 0 && !peer.address().is_unspecified()
+            && std::find(known_peers_.begin(), known_peers_.end(), peer) == known_peers_.end()) known_peers_.push_back(peer);
+    }
     params.ti = std::make_shared<lt::torrent_info>(*metadata_);
     lt::session_params session_params(options.settings);
     session_params.settings.set_int(lt::settings_pack::alert_mask,

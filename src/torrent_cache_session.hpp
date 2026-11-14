@@ -31,6 +31,7 @@ struct CacheStreamOptions {
     std::function<bool()> cancelled;
     std::optional<std::size_t> reserved_slots; // automatic when unset; no extra disk allocation
     std::function<void(int)> on_piece_verified; // network thread; must not throw or call control APIs
+    std::vector<libtorrent::tcp::endpoint> bootstrap_peers; // discovered by the metadata session
 };
 
 struct CacheDiagnostics {

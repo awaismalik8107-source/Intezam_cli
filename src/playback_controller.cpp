@@ -48,14 +48,37 @@ PlaybackSnapshot PlaybackController::snapshot() const
     std::shared_ptr<TorrentVideoSource> source;
     PlaybackSnapshot result;
     { std::lock_guard<std::mutex> lock(mutex_); result = snapshot_; source = source_; }
-    if (source && !result.finished) result.source = source->status();
+    if (source && !result.finished) {
+        result.source = source->status();
+        const auto& cache = result.source.cache;
+        result.startup.buffered_seconds = cache.forward_buffer_seconds;
+        if (result.startup.stage == StartupStage::buffering) {
+            const auto rate = options_.cache.playback_bytes_per_second;
+            const auto seconds = cache.adaptive_budget ? cache.adaptive_target.startup_seconds
+                : result.source.buffer_targets.high_seconds;
+            // Report the estimated prebuffer goal, including its selected-file
+            // and physical-capacity bounds. This does not alter that policy.
+            const auto bytes = std::min<double>({double(source->size()), double(source->capacity() / 3),
+                std::max(16384.0, rate * seconds)});
+            result.startup.target_seconds = bytes / rate;
+        }
+    }
     return result;
+}
+void PlaybackController::setStartupStage(StartupStage stage, const std::string& phase)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.startup.stage = stage;
+    snapshot_.phase = phase;
 }
 void PlaybackController::apply(VlcPlayer& player, PlaybackCommand command)
 {
     switch (command.type) {
         case PlaybackCommandType::toggle_pause: player.togglePause(); break;
         case PlaybackCommandType::volume: player.setVolume(static_cast<int>(command.value)); break;
+        case PlaybackCommandType::adjust_volume:
+            player.setVolume(std::clamp(player.status().volume + static_cast<int>(std::clamp<std::int64_t>(command.value, -100, 100)), 0, 100));
+            break;
         case PlaybackCommandType::mute: player.setMuted(!player.status().muted); break;
         case PlaybackCommandType::seek:
         case PlaybackCommandType::skip: {
@@ -77,16 +100,19 @@ void PlaybackController::run(const std::string& magnet, std::shared_ptr<const li
         cache_options.cancelled = [this, external] { return stopping_.load() || (external && external()); };
         if (stopping_) throw ReadCancelled{};
         source = std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
-        { std::lock_guard<std::mutex> lock(mutex_); source_ = source; snapshot_.phase = "Reading container and buffering…"; }
+        { std::lock_guard<std::mutex> lock(mutex_); source_ = source; }
         if (stopping_) { source->cancelPendingReads(); throw ReadCancelled{}; }
+        setStartupStage(StartupStage::reading_container, "Reading video headers");
         source->setContainer(probeContainer(*source));
+        setStartupStage(StartupStage::buffering, "Building startup buffer");
         source->prebuffer();
         if (stopping_) throw ReadCancelled{};
+        setStartupStage(StartupStage::opening_video, "Opening video");
         VlcPlayer player(source, options_.vlc);
         player.play();
         const auto started = std::chrono::steady_clock::now();
         bool decoded = false;
-        { std::lock_guard<std::mutex> lock(mutex_); snapshot_.ready = true; snapshot_.phase.clear(); }
+        { std::lock_guard<std::mutex> lock(mutex_); snapshot_.ready = true; }
         while (!stopping_) {
             std::deque<PlaybackCommand> commands;
             { std::lock_guard<std::mutex> lock(mutex_); commands.swap(commands_); }
@@ -104,6 +130,7 @@ void PlaybackController::run(const std::string& magnet, std::shared_ptr<const li
             if (!cache.error.empty()) throw std::runtime_error(cache.error);
             if (!media.error.empty()) throw std::runtime_error(media.error);
             if (media.state == libvlc_Error) throw std::runtime_error("VLC could not play this video.");
+            if (!decoded && media.decoded_video_frames > 0) setStartupStage(StartupStage::complete, {});
             decoded = decoded || media.decoded_video_frames > 0;
             { std::lock_guard<std::mutex> lock(mutex_); snapshot_.player = media; snapshot_.source = cache; }
             if (media.state == libvlc_Ended) {

@@ -36,6 +36,7 @@ void runQtPlayback(const std::string& magnet, std::shared_ptr<const libtorrent::
     QApplication app(argc, argv);
     app.setApplicationName("Intezam");
     PlaybackSignals signal_handlers;
+    CliStatusRenderer monitor(std::cout, options.monitoring);
     // Window construction precedes player construction, but needs the controller interface.
     PlaybackController controller(options);
     PlayerWindow window(controller, QString::fromStdString(video.path), video.size_bytes);
@@ -46,11 +47,36 @@ void runQtPlayback(const std::string& magnet, std::shared_ptr<const libtorrent::
     QTimer signal_timer;
     QObject::connect(&signal_timer, &QTimer::timeout, &window, [&] { if (interrupted) window.close(); });
     signal_timer.start(100);
-    std::cout << "Qt playback controls opened. Space: pause; arrows: ±10s; M: mute; F: fullscreen.\n" << std::flush;
+    bool started = false;
+    std::string last_notice, last_error, last_phase;
+    QTimer status_timer;
+    QObject::connect(&status_timer, &QTimer::timeout, &window, [&] {
+        const auto snapshot = controller.snapshot();
+        if (!snapshot.phase.empty() && snapshot.phase != last_phase && !snapshot.finished)
+            monitor.event("Loading: " + snapshot.phase);
+        last_phase = snapshot.phase;
+        if (!started && snapshot.player.decoded_video_frames > 0) {
+            monitor.event("Playback started.");
+            started = true;
+        }
+        if (!snapshot.notice.empty() && snapshot.notice != last_notice)
+            monitor.event("Playback control: " + snapshot.notice);
+        last_notice = snapshot.notice;
+        if (!snapshot.player.error.empty() && snapshot.player.error != last_error)
+            monitor.event("Playback failed: " + snapshot.player.error);
+        last_error = snapshot.player.error;
+        monitor.update(snapshot.player, snapshot.source, snapshot.phase);
+    });
+    status_timer.start(700);
+    monitor.event("Native player opened. Space: pause; arrows: skip; Up/Down: volume; F: fullscreen.");
     app.exec();
     controller.stopAndWait(); // Also covers an external application quit bypassing closeEvent.
     const auto result = controller.snapshot();
-    if (!result.player.error.empty()) throw std::runtime_error(result.player.error);
-    std::cout << "Playback stopped. Temporary cache removed.\n";
+    if (!result.player.error.empty()) {
+        if (last_error != result.player.error) monitor.event("Playback failed: " + result.player.error);
+        monitor.finish();
+        throw std::runtime_error(result.player.error);
+    }
+    monitor.event("Playback stopped. Temporary cache removed.");
 }
 }

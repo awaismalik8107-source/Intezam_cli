@@ -1,16 +1,13 @@
 #include "vlc_playback.hpp"
 #include "torrent_video_source.hpp"
-#include "video_selection.hpp"
 
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <future>
-#include <iomanip>
 #include <iostream>
 #include <poll.h>
-#include <sstream>
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
@@ -72,35 +69,6 @@ private:
     bool closed_ = false;
 };
 
-std::string timestamp(std::int64_t milliseconds)
-{
-    const auto seconds = milliseconds / 1000;
-    std::ostringstream output;
-    output << std::setfill('0') << std::setw(2) << seconds / 3600 << ':'
-           << std::setw(2) << (seconds / 60) % 60 << ':' << std::setw(2) << seconds % 60;
-    return output.str();
-}
-
-void displayPlayback(const VideoSourceStatus& source, const PlaybackStatus& player, bool prepared, std::int64_t video_size)
-{
-    const auto& cache = source.cache;
-    std::cout << "\nStatus: " << (player.waiting_for_buffer ? "BUFFERING" : VlcPlayer::stateName(player.state))
-              << (prepared ? "" : " (container/startup)")
-              << "\nPosition: " << timestamp(player.time_ms) << " / " << timestamp(player.duration_ms)
-              << "\nVLC Buffering: " << std::clamp(player.buffering_percent, 0.0f, 100.0f) << "%"
-              << "\nNetwork Speed: " << formatVideoSize(static_cast<std::int64_t>(cache.download_bytes_per_second)) << "/s"
-              << "\nCache Usage: " << cache.allocated_bytes << " / " << cache.budget_bytes << " bytes ("
-              << std::fixed << std::setprecision(2) << cache.budget_bytes * 100.0 / video_size << "% of video)"
-              << "\nFree / Reserved Slots: " << cache.performance.free_slots << " / " << cache.performance.reserved_slots
-              << "\nTorrent Rebuilds: " << cache.torrent_rebuilds
-              << "\nVerified Read Wait: " << source.performance.wait_microseconds / 1000 << " ms; stalls >=50ms: "
-              << source.performance.stalls
-              << "\nCached Window (target): S" << cache.desired.first_segment << " - S" << cache.desired.last_segment
-              << "\nVerified / Downloading / Queued Pieces: " << cache.verified_pieces << " / "
-              << cache.downloading_pieces << " / " << cache.queued_pieces
-              << "\nForward Buffer (estimated): " << cache.forward_buffer_seconds << " seconds\n" << std::flush;
-}
-
 } // namespace
 
 void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent::torrent_info> metadata,
@@ -111,8 +79,10 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
     auto cache_options = options.cache;
     const auto external_cancel = cache_options.cancelled;
     cache_options.cancelled = [external_cancel] { return interrupted != 0 || (external_cancel && external_cancel()); };
-    std::cout << "\nSelected Video: " << video.path << "\nInitializing VLC and bounded torrent cache...\n"
-              << "Controls: P pause/resume, F forward 10s, B backward 10s, S stop, Q quit\n" << std::flush;
+    CliStatusRenderer monitor(std::cout, options.monitoring);
+    monitor.event("Selected Video: " + video.path);
+    monitor.event("Initializing VLC and bounded torrent cache...");
+    monitor.event("Controls: P/Space pause, F forward 10s, B backward 10s, S stop, Q quit");
     auto source = std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
     VlcPlayer player(source, options.vlc);
     auto preparation = std::async(std::launch::async, [source] {
@@ -129,7 +99,7 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
         while (!interrupted) {
             if (!started && preparation.wait_for(std::chrono::milliseconds{0}) == std::future_status::ready) {
                 const auto container = preparation.get();
-                std::cout << "Container: " << container.name << (container.moov_at_end ? " (moov near EOF)" : "") << '\n';
+                monitor.event("Container: " + container.name + (container.moov_at_end ? " (moov near EOF)" : ""));
                 player.play();
                 started = true;
                 started_at = std::chrono::steady_clock::now();
@@ -139,30 +109,32 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
             if (!cache.error.empty()) throw std::runtime_error(cache.error);
             if (!media.error.empty()) throw std::runtime_error(media.error);
             if (media.state == libvlc_Error) throw std::runtime_error("VLC playback failed; check installed demuxers/codecs and media validity.");
+            if (!decoded && media.decoded_video_frames > 0) monitor.event("Playback started.");
             decoded = decoded || media.decoded_video_frames > 0;
             if (started && media.state == libvlc_Ended) {
                 if (!decoded) throw std::runtime_error("VLC reached end without decoding video frames.");
-                std::cout << "\nEnd of video.\n";
+                monitor.event("End of video.");
                 break;
             }
             const auto now = std::chrono::steady_clock::now();
             if (started && !decoded && now - started_at > options.cache.stall_timeout) {
                 throw std::runtime_error("VLC startup timed out before any video frame was decoded.");
             }
-            if (now - displayed >= std::chrono::seconds{1}) {
-                displayPlayback(cache, media, started, video.size_bytes);
+            if (now - displayed >= std::chrono::milliseconds{700}) {
+                monitor.update(media, cache, started ? "" : "Preparing playback");
                 displayed = now;
             }
             const int key = keys.next();
             if (key == 'q' || key == 'Q' || key == 's' || key == 'S') break;
             if (started) {
-                if (key == 'p' || key == 'P') player.togglePause();
+                if (key == 'p' || key == 'P' || key == ' ') player.togglePause();
                 else if (key == 'f' || key == 'F' || key == 'b' || key == 'B') {
-                    if (media.duration_ms <= 0 || !media.seekable) std::cout << "Time seeking is not available for this stream yet.\n";
+                    if (media.duration_ms <= 0 || !media.seekable) monitor.event("Time seeking is not available for this stream yet.");
                     else {
                         const auto target = std::clamp<std::int64_t>(media.time_ms + ((key == 'f' || key == 'F') ? 10000 : -10000),
                             0, std::max<std::int64_t>(0, media.duration_ms - 1));
-                        player.seekTo(target);
+                        try { player.seekTo(target); }
+                        catch (const std::exception& error) { monitor.event("Seek error: " + std::string(error.what())); }
                     }
                 }
             }
@@ -179,7 +151,7 @@ void runVlcPlayback(const std::string& magnet, std::shared_ptr<const libtorrent:
         if (preparation.valid()) { try { preparation.get(); } catch (...) {} }
         std::rethrow_exception(failure);
     }
-    std::cout << "Playback stopped. Temporary cache removed.\n";
+    monitor.event("Playback stopped. Temporary cache removed.");
 }
 
 } // namespace intezam

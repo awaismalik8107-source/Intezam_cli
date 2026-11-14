@@ -35,6 +35,7 @@ struct CliOptions {
     bool headless = false;
     bool no_ui = false;
     intezam::CacheBudgetOptions budget{intezam::CacheBudgetMode::adaptive, 25};
+    intezam::CliStatusOptions monitoring;
 };
 
 int parsePositiveInteger(std::string_view argument, int maximum)
@@ -58,6 +59,15 @@ CliOptions parseOptions(int argc, char* argv[])
         else if (argument == "--simulate") options.simulate = true;
         else if (argument == "--headless") options.headless = true;
         else if (argument == "--no-ui") options.no_ui = true;
+        else if (argument == "--monitor" || argument == "--monitor-log") {
+            if (++index >= argc) throw std::invalid_argument("Missing value for " + std::string(argument));
+            const std::string_view value{argv[index]};
+            if (argument == "--monitor-log") options.monitoring.log_file = argv[index];
+            else if (value == "compact") options.monitoring.verbosity = intezam::MonitorVerbosity::compact;
+            else if (value == "detailed") options.monitoring.verbosity = intezam::MonitorVerbosity::detailed;
+            else if (value == "debug") options.monitoring.verbosity = intezam::MonitorVerbosity::debug;
+            else throw std::invalid_argument("Monitor level must be compact, detailed, or debug.");
+        }
         else if (argument == "--strict-cache") options.budget.mode = intezam::CacheBudgetMode::strict;
         else if (argument == "--legacy-cache") options.budget.mode = intezam::CacheBudgetMode::automatic;
         else if (argument == "--cache-max-mib" || argument == "--cache-free-reserve-mib" || argument == "--buffer-seconds") {
@@ -108,6 +118,7 @@ int main(int argc, char* argv[])
         const auto cli = parseOptions(argc, argv);
         if (cli.help) {
             std::cout << "Usage: intezam [--timeout SECONDS] [--metadata-only]\n"
+                      << "               [--monitor compact|detailed|debug] [--monitor-log PATH]\n"
                       << "               [--bitrate BYTES_PER_SECOND] [--headless | --no-ui]\n"
                       << "               [--cache-max-mib MIB] [--cache-free-reserve-mib MIB] [--buffer-seconds 12..600]\n"
                       << "               [--strict-cache | --legacy-cache | --cache-max-percent 3..99]\n"
@@ -139,7 +150,8 @@ int main(int argc, char* argv[])
 
         std::cout << "Retrieving metadata only (timeout: "
                   << options.timeout.count() / 1000 << " seconds)...\n" << std::flush;
-        const auto metadata = intezam::retrieveTorrentMetadata(magnet, options);
+        const auto discovery = intezam::retrieveTorrentMetadataWithPeers(magnet, options);
+        const auto& metadata = discovery.metadata;
         const auto videos = intezam::detectVideoFiles(*metadata);
         std::cout << "\nTorrent: " << metadata->name()
                   << "\nTotal Files: " << metadata->num_files()
@@ -173,8 +185,10 @@ int main(int argc, char* argv[])
             intezam::runCacheSimulation(magnet, metadata, *selected_video, simulation);
         } else {
             intezam::PlaybackOptions playback;
+            playback.cache.bootstrap_peers = discovery.peers;
             playback.cache.playback_bytes_per_second = cli.bitrate;
             playback.cache.budget = cli.budget;
+            playback.monitoring = cli.monitoring;
             playback.vlc.headless = cli.headless;
 #ifdef INTEZAM_QT_UI
             if (!cli.headless && !cli.no_ui) intezam::runQtPlayback(magnet, metadata, *selected_video, playback);

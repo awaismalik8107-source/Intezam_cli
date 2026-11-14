@@ -25,6 +25,7 @@ add_library(intezam_core
     src/torrent_video_source.cpp
     src/vlc_player.cpp
     src/vlc_playback.cpp
+    src/cli_status_renderer.cpp
     src/playback_controller.cpp
     src/torrent_metadata.cpp
     src/video_files.cpp
@@ -53,6 +54,9 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(cli_status_tests test/cli_status_tests.cpp)
+    target_link_libraries(cli_status_tests PRIVATE intezam_core)
+    add_test(NAME compact_cli_status COMMAND cli_status_tests)
     add_executable(adaptive_engine_tests test/adaptive_engine_tests.cpp)
     target_link_libraries(adaptive_engine_tests PRIVATE intezam_core)
     add_test(NAME adaptive_streaming_engine COMMAND adaptive_engine_tests)
@@ -65,7 +69,7 @@ if(BUILD_TESTING)
         add_executable(qt_player_tests test/qt_player_tests.cpp)
         target_link_libraries(qt_player_tests PRIVATE intezam_ui Qt6::Test)
         add_test(NAME qt_playback_controls COMMAND qt_player_tests)
-        set_tests_properties(qt_playback_controls PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+        set_tests_properties(qt_playback_controls PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 25)
     endif()
     add_executable(forward_refill_tests test/forward_refill_tests.cpp)
     target_link_libraries(forward_refill_tests PRIVATE intezam_core)

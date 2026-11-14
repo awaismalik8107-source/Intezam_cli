@@ -12,7 +12,11 @@
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/torrent_flags.hpp>
 #include <libtorrent/torrent_status.hpp>
+#include <boost/asio/read_until.hpp>
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio/write.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -22,6 +26,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -119,6 +124,47 @@ struct TorrentRequestCounter : lt::torrent_plugin {
     std::atomic<int>& requests_;
 };
 
+class LocalTracker {
+public:
+    explicit LocalTracker(unsigned short seed_port)
+        : acceptor_(context_, {lt::make_address("127.0.0.1"), 0})
+    {
+        lt::entry reply;
+        reply["interval"] = 3600;
+        reply["peers"] = std::string("\x7f\x00\x00\x01", 4)
+            + static_cast<char>(seed_port >> 8) + static_cast<char>(seed_port & 255);
+        std::string body;
+        lt::bencode(std::back_inserter(body), reply);
+        response_ = "HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(body.size())
+            + "\r\nConnection: close\r\n\r\n" + body;
+        accept();
+        thread_ = std::thread([this] { context_.run(); });
+    }
+    ~LocalTracker() { context_.stop(); thread_.join(); }
+    std::string url() const
+    { return "http://127.0.0.1:" + std::to_string(acceptor_.local_endpoint().port()) + "/announce"; }
+private:
+    void accept()
+    {
+        auto socket = std::make_shared<lt::tcp::socket>(context_);
+        acceptor_.async_accept(*socket, [this, socket](const lt::error_code& error) {
+            if (error) return;
+            auto request = std::make_shared<boost::asio::streambuf>();
+            boost::asio::async_read_until(*socket, *request, "\r\n\r\n",
+                [this, socket, request](const lt::error_code& read_error, std::size_t) {
+                    if (read_error) return;
+                    boost::asio::async_write(*socket, boost::asio::buffer(response_),
+                        [socket](const lt::error_code&, std::size_t) {});
+                });
+            accept();
+        });
+    }
+    boost::asio::io_context context_;
+    lt::tcp::acceptor acceptor_;
+    std::string response_;
+    std::thread thread_;
+};
+
 void rejectsInvalidMagnetsAndTimeouts()
 {
     for (const auto& magnet : {"", "not a magnet", "https://example.com/file.torrent",
@@ -177,16 +223,22 @@ void retrievesMetadataWithoutPayloadOrFilesystemWrites()
         seed_session.pop_alerts(&alerts);
     }
     require(seed_session.listen_port() != 0, "local seeder listening");
+    LocalTracker tracker(static_cast<unsigned short>(seed_session.listen_port()));
 
     intezam::MetadataOptions options;
     options.settings = loopbackSettings();
     options.timeout = 10s;
     // A magnet can request file priorities and web seeds. Neither may enable payload.
     const auto magnet = lt::make_magnet_uri(seed_params)
-        + "&x.pe=127.0.0.1:" + std::to_string(seed_session.listen_port())
+        + "&tr=" + tracker.url()
         + "&so=1&ws=http%3A%2F%2F127.0.0.1%3A1%2Fvideo";
-    const auto metadata = intezam::retrieveTorrentMetadata(magnet, options);
+    const auto discovery = intezam::retrieveTorrentMetadataWithPeers(magnet, options);
+    const auto& metadata = discovery.metadata;
     require(metadata != nullptr, "metadata received");
+    const lt::tcp::endpoint seed_endpoint{lt::make_address("127.0.0.1"),
+        static_cast<unsigned short>(seed_session.listen_port())};
+    require(std::count(discovery.peers.begin(), discovery.peers.end(), seed_endpoint) == 1,
+        "metadata hands a tracker-discovered seeder to playback without duplicates");
     require(metadata->info_hashes() == seed_params.ti->info_hashes(), "correct torrent");
     const auto videos = intezam::detectVideoFiles(*metadata);
     require(videos.size() == 1, "detect local fixture video");

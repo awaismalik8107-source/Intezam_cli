@@ -43,26 +43,45 @@ lt::add_torrent_params metadataTorrentParams(const std::string& magnet)
     return params;
 }
 
-std::shared_ptr<const lt::torrent_info> waitForMetadata(
+void rememberPeer(std::vector<lt::tcp::endpoint>& peers, const lt::tcp::endpoint& endpoint)
+{
+    if (endpoint.port() != 0 && !endpoint.address().is_unspecified()
+        && std::find(peers.begin(), peers.end(), endpoint) == peers.end()) peers.push_back(endpoint);
+}
+
+void rememberOutgoingPeer(const lt::alert* alert, const lt::torrent_handle& torrent,
+    std::vector<lt::tcp::endpoint>& peers)
+{
+    // Incoming source ports may be ephemeral rather than listening ports.
+    const auto* connected = lt::alert_cast<lt::peer_connect_alert>(alert);
+    if (connected && connected->handle == torrent && connected->direction == lt::peer_connect_alert::direction_t::out)
+        rememberPeer(peers, connected->endpoint);
+}
+
+MetadataResult waitForMetadata(
     lt::session& session, const lt::torrent_handle& torrent, std::chrono::milliseconds timeout)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     std::string last_failure;
+    std::vector<lt::tcp::endpoint> peers;
     while (std::chrono::steady_clock::now() < deadline) {
         // Also check the handle in case the metadata alert was dropped from the queue.
         if (const auto metadata = torrent.torrent_file()) {
-            return metadata;
+            return {metadata, std::move(peers)};
         }
         const auto remaining = deadline - std::chrono::steady_clock::now();
         session.wait_for_alert(std::min(remaining,
             std::chrono::steady_clock::duration{std::chrono::seconds{1}}));
         std::vector<lt::alert*> alerts;
         session.pop_alerts(&alerts);
+        // Capture the entire batch before returning on metadata_received_alert.
+        // A metadata-only peer can disconnect as soon as the exchange finishes.
+        for (const auto* alert : alerts) rememberOutgoingPeer(alert, torrent, peers);
         for (const auto* alert : alerts) {
             if (const auto* received = lt::alert_cast<lt::metadata_received_alert>(alert);
                 received && received->handle == torrent) {
                 if (const auto metadata = torrent.torrent_file()) {
-                    return metadata;
+                    return {metadata, std::move(peers)};
                 }
             }
             if (const auto* failed = lt::alert_cast<lt::metadata_failed_alert>(alert);
@@ -113,17 +132,18 @@ lt::settings_pack metadataSessionSettings()
     return settings;
 }
 
-std::shared_ptr<const lt::torrent_info> retrieveTorrentMetadata(
+MetadataResult retrieveTorrentMetadataWithPeers(
     const std::string& magnet, const MetadataOptions& options)
 {
     if (options.timeout <= std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("Metadata timeout must be positive.");
     }
     auto torrent_params = metadataTorrentParams(magnet);
+    auto peers = torrent_params.peers;
     lt::session_params session_params(options.settings);
     session_params.settings.set_int(lt::settings_pack::alert_mask,
         static_cast<int>(static_cast<std::uint32_t>(
-            lt::alert_category::status | lt::alert_category::error)));
+            lt::alert_category::status | lt::alert_category::error | lt::alert_category::connect)));
     // Defense against ANY storage writes, including empty files, directories,
     // part files and accidental checks of existing files. This is not a cache.
     session_params.disk_io_constructor = lt::disabled_disk_io_constructor;
@@ -133,10 +153,21 @@ std::shared_ptr<const lt::torrent_info> retrieveTorrentMetadata(
     if (error) {
         throw std::runtime_error("Cannot add torrent for metadata: " + error.message());
     }
-    const auto metadata = waitForMetadata(session, torrent, options.timeout);
+    auto result = waitForMetadata(session, torrent, options.timeout);
+    // Also drain connections posted just before the handle's metadata fast path.
+    std::vector<lt::alert*> alerts;
+    session.pop_alerts(&alerts);
+    for (const auto* alert : alerts) rememberOutgoingPeer(alert, torrent, result.peers);
+    for (const auto& peer : peers) rememberPeer(result.peers, peer);
     torrent.pause();
     session.remove_torrent(torrent);
-    return metadata;
+    return result;
+}
+
+std::shared_ptr<const lt::torrent_info> retrieveTorrentMetadata(
+    const std::string& magnet, const MetadataOptions& options)
+{
+    return retrieveTorrentMetadataWithPeers(magnet, options).metadata;
 }
 
 } // namespace intezam

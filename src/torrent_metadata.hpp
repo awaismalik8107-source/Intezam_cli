@@ -1,12 +1,14 @@
 #pragma once
 
 #include <libtorrent/settings_pack.hpp>
+#include <libtorrent/socket.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/version.hpp>
 
 #include <chrono>
 #include <memory>
 #include <string>
+#include <vector>
 
 #if LIBTORRENT_VERSION_NUM < 20100
 #error "Intezam requires libtorrent-rasterbar 2.1.0 or newer for its cache disk interface."
@@ -20,6 +22,16 @@ struct MetadataOptions {
     std::chrono::milliseconds timeout{120000};
     libtorrent::settings_pack settings = metadataSessionSettings();
 };
+
+struct MetadataResult {
+    std::shared_ptr<const libtorrent::torrent_info> metadata;
+    std::vector<libtorrent::tcp::endpoint> peers;
+};
+
+// Keep usable outgoing peer addresses so playback can reconnect without waiting
+// for another discovery round. The metadata session still performs no payload I/O.
+MetadataResult retrieveTorrentMetadataWithPeers(
+    const std::string& magnet, const MetadataOptions& options = {});
 
 // Returns owned, in-memory metadata. The session is closed before returning.
 // Throws invalid_argument for invalid input and runtime_error for retrieval failures.

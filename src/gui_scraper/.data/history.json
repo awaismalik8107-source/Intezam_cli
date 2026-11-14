@@ -1,8 +1,14 @@
 [
   {
+    "query": "Frieren",
+    "mode": "mock",
+    "result_count": 1,
+    "searched_at": "2026-11-14T20:16:04.204152+00:00"
+  },
+  {
     "query": "demon slayer",
     "mode": "mock",
-    "result_count": 24,
-    "searched_at": "2026-11-14T15:48:13.678745+00:00"
+    "result_count": 1,
+    "searched_at": "2026-11-14T20:14:28.748821+00:00"
   }
 ]
