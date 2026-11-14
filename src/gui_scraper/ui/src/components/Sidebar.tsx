@@ -2,7 +2,7 @@ import {
   Bookmark,
   Compass,
   Home,
-  PlayCircle,
+  Magnet,
   Puzzle,
   Search,
   Settings,
@@ -27,11 +27,10 @@ const NAV_ITEMS: ReadonlyArray<{
   icon: typeof Home;
 }> = [
   { id: "home", label: "Home", icon: Home },
+  { id: "search", label: "Search Shows", icon: Search },
   { id: "discover", label: "Discover", icon: Compass },
-  { id: "extensions", label: "Extensions", icon: Puzzle },
-  { id: "search", label: "Search", icon: Search },
   { id: "library", label: "Library", icon: Bookmark },
-  { id: "continue", label: "Continue Watching", icon: PlayCircle },
+  { id: "extensions", label: "Extensions", icon: Puzzle },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
@@ -39,13 +38,11 @@ export function Sidebar({
   activeSection,
   onSelectSection,
   libraryCount,
-  watchCount,
-  engineStatus,
 }: SidebarProps) {
   return (
     <aside
       aria-label="Primary navigation"
-      className="flex h-full w-[72px] shrink-0 flex-col justify-between border-r border-white/[0.06] bg-[#0B0D16] px-2.5 py-4 md:w-[224px] md:px-3.5"
+      className="flex h-full w-[68px] shrink-0 flex-col justify-between border-r border-white/[0.06] bg-[#0B0D16] px-2 py-4 md:w-[220px] md:px-3.5"
     >
       <div className="space-y-6">
         {/* Brand mark */}
@@ -55,7 +52,9 @@ export function Sidebar({
             <div className="text-[13.5px] font-semibold tracking-[0.12em] text-[#F8FAFC]">
               INTEZAM
             </div>
-            <div className="text-[10.5px] font-medium text-[#949CAF]">Cinema Stream</div>
+            <div className="text-[10.5px] font-medium text-[#949CAF]">
+              Anime Magnet Browser
+            </div>
           </div>
         </div>
 
@@ -65,12 +64,7 @@ export function Sidebar({
             {NAV_ITEMS.map((item) => {
               const Icon = item.icon;
               const isActive = activeSection === item.id;
-              const badgeCount =
-                item.id === "library"
-                  ? libraryCount
-                  : item.id === "continue"
-                    ? watchCount
-                    : 0;
+              const badgeCount = item.id === "library" ? libraryCount : 0;
 
               return (
                 <button
@@ -107,7 +101,7 @@ export function Sidebar({
                   </span>
                   {item.id === "extensions" && (
                     <span
-                      title="Nyaa Extension Active"
+                      title="Advanced Nyaa Torrent Browser"
                       className="relative z-10 ml-auto hidden items-center gap-1 md:inline-flex"
                     >
                       <NyaaLogo size={17} className="rounded shadow-sm shadow-[#3582F7]/30" />
@@ -125,30 +119,20 @@ export function Sidebar({
         </LayoutGroup>
       </div>
 
-      {/* Bottom Engine Status Card */}
+      {/* Discovery Workflow Status Card */}
       <div className="hidden rounded-xl border border-white/[0.07] bg-[#111522] p-3 md:block">
         <div className="flex items-center justify-between">
-          <span className="text-[11px] font-medium text-[#949CAF]">Intezam Engine</span>
-          <span
-            className={`h-2 w-2 rounded-full ${
-              engineStatus?.stream_active
-                ? "bg-[#38BDF8] animate-pulse"
-                : engineStatus?.intezam_binary_available
-                  ? "bg-emerald-400"
-                  : "bg-amber-400"
-            }`}
-            aria-hidden="true"
-          />
+          <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[#CFC9FF]">
+            <Magnet className="h-3.5 w-3.5 text-[#786BFF]" aria-hidden="true" />
+            <span>Magnet Discovery</span>
+          </span>
+          <span className="h-2 w-2 rounded-full bg-emerald-400" aria-hidden="true" />
         </div>
         <div className="mt-1 text-xs font-medium text-[#F8FAFC]">
-          {engineStatus?.stream_active
-            ? "Stream Active"
-            : engineStatus?.intezam_binary_available
-              ? "LibVLC + Cache Ready"
-              : "Scraper + External Mode"}
+          Show → Season → Episode
         </div>
         <div className="mt-1 font-mono text-[10px] text-[#949CAF]">
-          2.5% rolling cache policy
+          Copy-only · No auto-playback
         </div>
       </div>
     </aside>

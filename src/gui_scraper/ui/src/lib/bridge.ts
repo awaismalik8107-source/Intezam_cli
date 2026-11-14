@@ -1,7 +1,10 @@
 import type {
   CopyClipboardResponse,
+  DiscoverShowSourcesResponse,
+  DiscoverShowsResponse,
   EngineStatus,
   LibraryEntry,
+  MediaIdentity,
   PaginatedSearchResponse,
   PyWebViewApi,
   SaveConfigResponse,
@@ -9,6 +12,7 @@ import type {
   ScrapedItem,
   ScraperConfig,
   SearchHistoryEntry,
+  SourceSearchFilters,
   StreamSessionState,
   VerifyUrlResponse,
   WatchHistoryEntry,
@@ -42,10 +46,12 @@ export async function searchPaginated(
   query: string,
   mode: ScrapeMode,
   page = 1,
+  forceRefresh = false,
+  filters?: SourceSearchFilters,
 ): Promise<PaginatedSearchResponse> {
   const api = getApi();
   if (typeof api.search_paginated === "function") {
-    const res = await api.search_paginated(query, mode, page);
+    const res = await api.search_paginated(query, mode, page, forceRefresh, filters);
     if (res && Array.isArray(res.items)) {
       return res;
     }
@@ -56,6 +62,49 @@ export async function searchPaginated(
     page,
     has_next_page: false,
     total_pages: page,
+  };
+}
+
+export async function discoverShows(
+  query: string,
+  mode: ScrapeMode,
+): Promise<DiscoverShowsResponse> {
+  const api = getApi();
+  if (typeof api.discover_shows === "function") {
+    const res = await api.discover_shows(query, mode);
+    if (res && Array.isArray(res.shows)) {
+      return res;
+    }
+  }
+  return {
+    shows: [],
+    query,
+    mode,
+  };
+}
+
+export async function discoverShowSources(
+  show: Partial<MediaIdentity> & { canonical_id: string; official_title: string },
+  mode: ScrapeMode,
+  page = 1,
+  forceRefresh = false,
+  filters?: SourceSearchFilters,
+): Promise<DiscoverShowSourcesResponse> {
+  const api = getApi();
+  if (typeof api.discover_show_sources === "function") {
+    const res = await api.discover_show_sources(show, mode, page, forceRefresh, filters);
+    if (res && Array.isArray(res.items)) {
+      return res;
+    }
+  }
+  const fallback = await searchPaginated(show.official_title, mode, page, forceRefresh, filters);
+  return {
+    canonical_id: show.canonical_id,
+    items: fallback.items,
+    page: fallback.page,
+    has_next_page: fallback.has_next_page,
+    total_pages: fallback.total_pages,
+    provider_statuses: fallback.provider_statuses ?? [],
   };
 }
 

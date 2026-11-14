@@ -17,6 +17,8 @@ import { usePyWebview } from "./hooks/usePyWebview";
 import {
   clearWatchHistory,
   copyToClipboard,
+  discoverShowSources,
+  discoverShows,
   getAppLogs,
   getConfig,
   getEngineStatus,
@@ -35,17 +37,25 @@ import {
   toggleLibraryItem,
   verifyUrl,
 } from "./lib/bridge";
-import { groupItemsToMedia, stripStatusPrefix } from "./lib/mediaAdapter";
+import {
+  adaptMetadataToMediaEntry,
+  groupItemsToMedia,
+  mergeSourcesIntoMediaEntry,
+  stripStatusPrefix,
+} from "./lib/mediaAdapter";
 import type {
   EngineStatus,
   LibraryEntry,
   MediaEntry,
+  MediaIdentity,
   MediaSource,
   NavSection,
+  ProviderRetrievalStatus,
   ScrapeMode,
   ScrapedItem,
   ScraperConfig,
   SearchHistoryEntry,
+  SourceSearchFilters,
   StreamSessionState,
   ToastMessage,
   ToastType,
@@ -125,6 +135,13 @@ export function App() {
   const [mode, setMode] = useState<ScrapeMode>(() => preferences.defaultMode);
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<ScrapedItem[]>([]);
+  const [metadataEntries, setMetadataEntries] = useState<MediaEntry[]>([]);
+  const [sourceFilters, setSourceFilters] = useState<SourceSearchFilters>({
+    category: "1_0",
+    filter_mode: "0",
+    sort_by: "seeders",
+    sort_order: "desc",
+  });
   const [hasSearched, setHasSearched] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -216,10 +233,18 @@ export function App() {
     return () => window.clearInterval(timer);
   }, [bridgeReady, pushToast, streamState?.active]);
 
-  const discoveredMedia = useMemo(
-    () => groupItemsToMedia(items, config.provider_name),
-    [items, config.provider_name],
-  );
+  const discoveredMedia = useMemo(() => {
+    const groupedFromItems = groupItemsToMedia(items, config.provider_name);
+    if (metadataEntries.length === 0) {
+      return groupedFromItems;
+    }
+    const existingKeys = new Set(metadataEntries.map((m) => m.key));
+    const existingTitles = new Set(metadataEntries.map((m) => m.title.toLowerCase()));
+    const extras = groupedFromItems.filter(
+      (g) => !existingKeys.has(g.key) && !existingTitles.has(g.title.toLowerCase()),
+    );
+    return [...metadataEntries, ...extras];
+  }, [items, metadataEntries, config.provider_name]);
 
   const libraryMedia = useMemo<MediaEntry[]>(
     () =>
@@ -293,7 +318,33 @@ export function App() {
       setSearchError(null);
 
       try {
-        const res = await searchPaginated(targetQuery, targetMode, safePage);
+        // Stage 9: Metadata-first show discovery (no torrent scraping per card)
+        let metaShows: MediaEntry[] = [];
+        if (safePage === 1 && !append && activeSection !== "extensions") {
+          const discoverRes = await discoverShows(targetQuery, targetMode);
+          if (requestId !== activeSearchIdRef.current) return;
+          if (discoverRes.shows && discoverRes.shows.length > 0) {
+            metaShows = discoverRes.shows.map((identity: MediaIdentity) =>
+              adaptMetadataToMediaEntry(identity, [], config.provider_name),
+            );
+            setMetadataEntries(metaShows);
+            setItems([]);
+            setCurrentPage(1);
+            setTotalPages(1);
+            setHasNextPage(false);
+            setDiscoveryCatalog((prev) => {
+              const incomingKeys = new Set(metaShows.map((g) => g.key));
+              return [...metaShows, ...prev.filter((g) => !incomingKeys.has(g.key))].slice(0, 36);
+            });
+            const hist = await getSearchHistory();
+            setSearchHistory(hist);
+            return;
+          }
+          setMetadataEntries([]);
+        }
+
+        // Raw / paginated torrent search for Extensions view or when no metadata match exists
+        const res = await searchPaginated(targetQuery, targetMode, safePage, false, sourceFilters);
         if (requestId !== activeSearchIdRef.current) return;
 
         const incomingRows = res.items;
@@ -342,59 +393,117 @@ export function App() {
         }
       }
     },
-    [config.provider_name, mode, pushToast, query],
+    [activeSection, config.provider_name, mode, pushToast, query, sourceFilters],
   );
 
-  // Titles are discovered cheaply; episodes are fetched only when opened.
-  // Cache the results so reopening a title avoids repeated HTTP requests.
-  const loadTitleEpisodes = useCallback(async (media: MediaEntry, force = false, startPage = 1) => {
-    const cacheKey = `${mode}:${config.provider_name}:${media.key}`;
-    const cached = detailsCacheRef.current.get(cacheKey);
-    if (startPage === 1 && !force && cached && cached.expires > Date.now()) {
-      setDetailedMedia(cached.entry);
-      setDetailsHasMore(cached.hasMore);
-      setDetailsNextPage(cached.nextPage);
-      setDetailsError(null);
-      setDetailsLoading(false);
-      return;
-    }
+  // Titles are discovered cheaply via canonical metadata; multi-provider torrent sources
+  // are fetched only when a show is opened.
+  const loadTitleEpisodes = useCallback(
+    async (
+      media: MediaEntry,
+      force = false,
+      startPage = 1,
+      overrideFilters?: SourceSearchFilters,
+    ) => {
+      const effectiveFilters = overrideFilters ?? sourceFilters;
+      const filterSig = `${effectiveFilters.category || "1_0"}:${effectiveFilters.sort_by || "seeders"}`;
+      const cacheKey = `${mode}:${filterSig}:${media.key}`;
+      const cached = detailsCacheRef.current.get(cacheKey);
+      if (startPage === 1 && !force && cached && cached.expires > Date.now()) {
+        setDetailedMedia(cached.entry);
+        setDetailsHasMore(cached.hasMore);
+        setDetailsNextPage(cached.nextPage);
+        setDetailsError(null);
+        setDetailsLoading(false);
+        return;
+      }
 
-    const requestId = ++activeDetailIdRef.current;
-    setDetailsLoading(true);
-    setDetailsError(null);
-    const collected: ScrapedItem[] = media.sources.map((source) => source.item);
-    let hasMore = false;
-    let nextPage = startPage;
-    try {
-      // Fetch at most three pages per user action; never search every card.
-      // A subsequent "Load more" resumes exactly where this request stopped.
-      for (let page = startPage; page < startPage + 3; page += 1) {
-        const response = await searchPaginated(media.title, mode, page);
+      const requestId = ++activeDetailIdRef.current;
+      setDetailsLoading(true);
+      setDetailsError(null);
+      const collected: ScrapedItem[] =
+        startPage > 1 ? media.sources.map((source) => source.item) : [];
+      let hasMore = false;
+      let nextPage = startPage;
+      let providerStatuses: ProviderRetrievalStatus[] | undefined = media.providerStatuses;
+      try {
+        const identityPayload: Partial<MediaIdentity> & {
+          canonical_id: string;
+          official_title: string;
+        } = media.metadata ?? {
+          canonical_id: media.key,
+          official_title: media.title,
+          media_type: "anime",
+          release_year: media.year ? Number(media.year) : null,
+          alternate_titles: media.alternateTitles ?? [],
+          genres: media.genres ?? [],
+          seasons: media.officialSeasons ?? [],
+        };
+
+        const response = await discoverShowSources(
+          identityPayload,
+          mode,
+          startPage,
+          force,
+          effectiveFilters,
+        );
         if (requestId !== activeDetailIdRef.current) return;
         collected.push(...response.items);
         hasMore = response.has_next_page;
-        nextPage = page + 1;
-        if (!hasMore) break;
+        nextPage = startPage + 1;
+        providerStatuses = response.provider_statuses;
+
+        const baseEntry = response.show
+          ? adaptMetadataToMediaEntry(response.show, [], config.provider_name, providerStatuses)
+          : media;
+        const entry = mergeSourcesIntoMediaEntry(
+          {
+            ...media,
+            ...baseEntry,
+            posterUrl: baseEntry.posterUrl || media.posterUrl,
+            backdropUrl: baseEntry.backdropUrl || media.backdropUrl,
+            officialSeasons:
+              baseEntry.officialSeasons && baseEntry.officialSeasons.length > 0
+                ? baseEntry.officialSeasons
+                : media.officialSeasons,
+          },
+          collected,
+          config.provider_name,
+          providerStatuses,
+        );
+
+        if (requestId !== activeDetailIdRef.current) return;
+        detailsCacheRef.current.set(cacheKey, {
+          entry,
+          hasMore,
+          nextPage,
+          expires: Date.now() + 90_000,
+        });
+        setDetailedMedia(entry);
+        setDetailsHasMore(hasMore);
+        setDetailsNextPage(nextPage);
+      } catch (err) {
+        if (requestId !== activeDetailIdRef.current) return;
+        setDetailsError(err instanceof Error ? err.message : String(err));
+        const fallbackEntry = mergeSourcesIntoMediaEntry(
+          media,
+          collected,
+          config.provider_name,
+          providerStatuses,
+        );
+        setDetailedMedia((previous) =>
+          collected.length > 0
+            ? fallbackEntry
+            : previous?.key === media.key
+              ? previous
+              : media,
+        );
+      } finally {
+        if (requestId === activeDetailIdRef.current) setDetailsLoading(false);
       }
-      const resolved = groupItemsToMedia(collected, config.provider_name)
-        .find((entry) => entry.key === media.key);
-      const entry = resolved ?? media;
-      if (requestId !== activeDetailIdRef.current) return;
-      detailsCacheRef.current.set(cacheKey, {
-        entry, hasMore, nextPage, expires: Date.now() + 90_000,
-      });
-      setDetailedMedia(entry);
-      setDetailsHasMore(hasMore);
-      setDetailsNextPage(nextPage);
-    } catch (err) {
-      if (requestId !== activeDetailIdRef.current) return;
-      setDetailsError(err instanceof Error ? err.message : String(err));
-      // Keep data that was already collected if later pages fail.
-      setDetailedMedia((previous) => previous?.key === media.key ? previous : media);
-    } finally {
-      if (requestId === activeDetailIdRef.current) setDetailsLoading(false);
-    }
-  }, [mode, config.provider_name]);
+    },
+    [mode, config.provider_name, sourceFilters],
+  );
 
   const handleSelectMedia = useCallback((media: MediaEntry) => {
     activeDetailIdRef.current += 1;
@@ -777,6 +886,11 @@ export function App() {
                   moreEpisodesAvailable={detailsHasMore}
                   onLoadEpisodes={() => void loadTitleEpisodes(selectedMedia, true)}
                   onLoadMoreEpisodes={() => void loadTitleEpisodes(selectedMedia, true, detailsNextPage)}
+                  sourceFilters={sourceFilters}
+                  onChangeSourceFilters={(nextFilters) => {
+                    setSourceFilters(nextFilters);
+                    void loadTitleEpisodes(selectedMedia, true, 1, nextFilters);
+                  }}
                 />
               ) : activeSection === "home" ? (
                 <HomeView
@@ -868,6 +982,10 @@ export function App() {
                     executeSearch(undefined, undefined, false, currentPage + 1, true)
                   }
                   onOpenSettings={() => setActiveSection("settings")}
+                  onOpenAdvancedBrowser={() => {
+                    setSelectedMediaKey(null);
+                    setActiveSection("extensions");
+                  }}
                 />
               ) : activeSection === "library" ? (
                 <LibraryView

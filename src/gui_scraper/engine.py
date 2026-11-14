@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from urllib.parse import quote_plus, urljoin, urlsplit, urlunsplit
@@ -11,6 +14,30 @@ from bs4 import BeautifulSoup, Tag
 
 from .models import ScrapedItem
 from .validator import validate_nyaa_links
+
+_BTIH_RE = re.compile(r"xt=urn:btih:([A-Za-z0-9]{32,40})\b", re.IGNORECASE)
+_QUERY_RES_SUFFIX_RE = re.compile(r"\s+\b(?:2160p|1080p|720p|480p|4k|hevc|x265|x264)\b.*$", re.IGNORECASE)
+
+
+def extract_info_hash(uri: str) -> str:
+    """Extract normalized lowercase BTIH info-hash from a magnet URI when present."""
+    match = _BTIH_RE.search(uri or "")
+    return match.group(1).lower() if match else ""
+
+
+def deduplicate_items(items: list[ScrapedItem]) -> list[ScrapedItem]:
+    """Deduplicate scraped items by BTIH info-hash (or primary link / title fallback)."""
+    seen: set[str] = set()
+    unique: list[ScrapedItem] = []
+    for item in items:
+        btih = extract_info_hash(item.magnet_link or item.resolved_link)
+        key = btih or (item.magnet_link or item.torrent_link or item.view_url or item.title).strip().lower()
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        unique.append(item)
+    return unique
 
 # ---------------------------------------------------------------------------
 # Nyaa URL & Exact Table Selector Constants
@@ -69,6 +96,9 @@ class ConfigurableTableScraper:
         user_agent: str = DEFAULT_USER_AGENT,
         demo_mode: bool = False,
         mock_delay: float = 0.0,
+        cache_ttl: float = 90.0,
+        max_retries: int = 2,
+        retry_backoff: float = 0.25,
         client: httpx.Client | None = None,
     ) -> None:
         self.provider_name = provider_name
@@ -85,8 +115,19 @@ class ConfigurableTableScraper:
         self.user_agent = user_agent
         self.demo_mode = demo_mode
         self.mock_delay = mock_delay
+        self.cache_ttl = cache_ttl
+        self.max_retries = max_retries
+        self.retry_backoff = retry_backoff
         self._client = client
         self._shared_client: httpx.Client | None = None
+        self._cache_lock = threading.Lock()
+        self._cache: dict[tuple[str, str, int, bool], tuple[float, ScrapeResponse]] = {}
+        self._inflight: dict[tuple[str, str, int, bool], threading.Event] = {}
+
+    def clear_cache(self) -> None:
+        """Clear the short-lived scrape response cache."""
+        with self._cache_lock:
+            self._cache.clear()
 
     def _get_http_client(self) -> httpx.Client:
         if self._client is not None:
@@ -105,8 +146,16 @@ class ConfigurableTableScraper:
             self._shared_client.close()
             self._shared_client = None
 
-    def build_search_url(self, query: str = "", page: int = 1) -> str:
-        """Construct the Nyaa browse or search URL with ``quote_plus`` encoding and optional ``&p=`` page."""
+    def build_search_url(
+        self,
+        query: str = "",
+        page: int = 1,
+        category: str | None = None,
+        filter_mode: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ) -> str:
+        """Construct the Nyaa browse or search URL with ``quote_plus`` encoding, category, filter, and optional ``&p=`` page."""
         base = self.base_url.strip().rstrip("/") or BASE_URL
         path = self.search_path.strip() or "/"
         joined = urljoin(base + "/", path.lstrip("/")) if base else path
@@ -118,12 +167,17 @@ class ConfigurableTableScraper:
         param_name = self.query_param.strip() or QUERY_PARAM
         normalized_path = parts.path or "/"
         page_num = max(1, int(page or 1))
+        eff_cat = (category or NYAA_CATEGORY).strip() or NYAA_CATEGORY
+        eff_filter = (filter_mode or NYAA_FILTER).strip() or NYAA_FILTER
+        eff_order = (sort_order or "desc").strip() or "desc"
 
         if not cleaned:
-            encoded_qs = f"{param_name}=&f={NYAA_FILTER}&c={NYAA_CATEGORY}&s=leechers&o=desc"
+            eff_sort = (sort_by or "leechers").strip() or "leechers"
+            encoded_qs = f"{param_name}=&f={eff_filter}&c={eff_cat}&s={eff_sort}&o={eff_order}"
         else:
+            eff_sort = (sort_by or "seeders").strip() or "seeders"
             encoded_q = quote_plus(cleaned)
-            encoded_qs = f"f={NYAA_FILTER}&c={NYAA_CATEGORY}&{param_name}={encoded_q}&s=seeders&o=desc"
+            encoded_qs = f"f={eff_filter}&c={eff_cat}&{param_name}={encoded_q}&s={eff_sort}&o={eff_order}"
 
         if page_num > 1:
             encoded_qs = f"{encoded_qs}&p={page_num}"
@@ -263,49 +317,179 @@ class ConfigurableTableScraper:
         per_page: int = 24,
     ) -> list[ScrapedItem]:
         """Generate multi-page Nyaa-structured rows (24 links/page across 5 pages) for previews."""
-        topic = query.strip() or "Anime Browse (Category 1_2)"
-        slug = "-".join(topic.lower().split()) or "nyaa-sample"
+        raw_query = (query or "").strip()
+        topic = _QUERY_RES_SUFFIX_RE.sub("", raw_query).strip() or raw_query
         base = self.base_url.strip().rstrip("/") or BASE_URL
         page_num = max(1, min(5, int(page or 1)))
         count = max(1, int(per_page or 24))
+        start_offset = (page_num - 1) * count
 
-        groups = [
-            ("SubsPlease", "1080p", "1.4 GiB", "MKV"),
-            ("Erai-raws", "1080p Multiple Subtitle", "1.6 GiB", "MKV"),
-            ("Judas", "1080p HEVC x265 10bit", "640.2 MiB", "MKV"),
-            ("EMBER", "720p HEVC", "390.5 MiB", "MKV"),
-            ("VARYG", "2160p 4K WEB-DL Dual-Audio", "3.2 GiB", "MKV"),
-            ("ASW", "1080p HEVC Dual-Audio", "485.0 MiB", "MKV"),
-            ("DKB", "1080p HEVC 10bit", "510.8 MiB", "MKV"),
-            ("Toonshub", "1080p WEB-DL AAC", "1.1 GiB", "MP4"),
+        browse_shows = [
+            "Frieren: Beyond Journey's End",
+            "Dan Da Dan",
+            "Delicious in Dungeon",
+            "Solo Leveling",
+            "The Apothecary Diaries",
+            "Orb: On the Movements of the Earth",
         ]
 
+        specs: list[tuple[str, str, str, str, bool]] = []
+        if not topic:
+            # Default browse: 6 distinct anime shows across multiple episodes, seasons, and batches
+            for idx in range(count):
+                show_name = browse_shows[idx % len(browse_shows)]
+                ep_num = ((page_num - 1) * 4) + (idx // len(browse_shows)) + 1
+                if idx % 6 == 5:
+                    batch_variants = [
+                        (f"[Judas] {show_name} Season 1 Batch [1080p HEVC x265 10bit].mkv", "6.8 GiB", "s1-batch-1080p"),
+                        (f"[SubsPlease] {show_name} - 01-12 [1080p][Batch].mkv", "8.2 GiB", "s1-range-01-12"),
+                        (f"[SubsPlease] {show_name} - 13-25 [1080p][Batch].mkv", "8.9 GiB", "s1-range-13-25"),
+                        (f"[EMBER] {show_name} Complete Series [1080p Dual-Audio].mkv", "16.4 GiB", "complete-series"),
+                    ]
+                    b_title, b_size, b_tag = batch_variants[(idx // len(browse_shows)) % len(batch_variants)]
+                    specs.append(
+                        (
+                            b_title,
+                            b_size,
+                            f"{show_name}-{b_tag}-p{page_num}",
+                            "mkv",
+                            True,
+                        )
+                    )
+                elif idx % 6 == 4:
+                    specs.append(
+                        (
+                            f"[SubsPlease] {show_name} S02E{ep_num:02d} (1080p) [HEVC].mkv",
+                            "1.4 GiB",
+                            f"{show_name}-s2e{ep_num:02d}",
+                            "mkv",
+                            True,
+                        )
+                    )
+                elif idx % 2 == 0:
+                    specs.append(
+                        (
+                            f"[SubsPlease] {show_name} - {ep_num:02d} (1080p) [HEVC].mkv",
+                            "1.4 GiB",
+                            f"{show_name}-e{ep_num:02d}-1080p",
+                            "mkv",
+                            True,
+                        )
+                    )
+                else:
+                    specs.append(
+                        (
+                            f"[Erai-raws] {show_name} - {ep_num:02d} [720p][Multiple Subtitle].mkv",
+                            "680.5 MiB",
+                            f"{show_name}-e{ep_num:02d}-720p",
+                            "mkv",
+                            True,
+                        )
+                    )
+        elif page_num == 1:
+            # Stage A / Page 1 for a specific show: rich multi-resolution episodes, Season 1 & Season 2,
+            # three distinct batch kinds, one .torrent-only release, and one unclassified special.
+            page1_templates: list[tuple[str, str, str, str, bool]] = [
+                (f"[SubsPlease] {topic} - 01 (1080p) [HEVC].mkv", "1.4 GiB", "s1e01-1080p", "mkv", True),
+                (f"[Erai-raws] {topic} - 01 [720p][AVC].mkv", "640.2 MiB", "s1e01-720p", "mkv", True),
+                (f"[VARYG] {topic} - 01 [2160p 4K WEB-DL Dual-Audio].mkv", "3.2 GiB", "s1e01-2160p", "mkv", True),
+                (f"[SubsPlease] {topic} - 02 (1080p) [HEVC].mkv", "1.4 GiB", "s1e02-1080p", "mkv", True),
+                (f"[EMBER] {topic} - 02 [720p HEVC].mkv", "395.0 MiB", "s1e02-720p", "mkv", True),
+                (f"[Toonshub] {topic} - 02 [1080p WEB-DL AAC].mp4", "1.1 GiB", "s1e02-torrent-only", "mp4", False),
+                (f"[SubsPlease] {topic} - 03 (1080p) [HEVC].mkv", "1.4 GiB", "s1e03-1080p", "mkv", True),
+                (f"[Judas] {topic} - 03 [1080p HEVC x265 10bit].mkv", "580.4 MiB", "s1e03-hevc", "mkv", True),
+                (f"[SubsPlease] {topic} - 04 (1080p) [HEVC].mkv", "1.4 GiB", "s1e04-1080p", "mkv", True),
+                (f"[Erai-raws] {topic} - 04 [720p][AVC].mkv", "650.0 MiB", "s1e04-720p", "mkv", True),
+                (f"[SubsPlease] {topic} - 05 (1080p) [HEVC].mkv", "1.3 GiB", "s1e05-1080p", "mkv", True),
+                (f"[ASW] {topic} - 05 [1080p HEVC Dual-Audio].mkv", "490.0 MiB", "s1e05-asw", "mkv", True),
+                (f"[SubsPlease] {topic} - 06 (1080p) [HEVC].mkv", "1.4 GiB", "s1e06-1080p", "mkv", True),
+                (f"[SubsPlease] {topic} - 07 (1080p) [HEVC].mkv", "1.4 GiB", "s1e07-1080p", "mkv", True),
+                (f"[SubsPlease] {topic} - 08 (1080p) [HEVC].mkv", "1.5 GiB", "s1e08-1080p", "mkv", True),
+                (f"[SubsPlease] {topic} S02E01 (1080p) [HEVC].mkv", "1.5 GiB", "s2e01-1080p", "mkv", True),
+                (f"[Erai-raws] {topic} S02E01 [720p][AVC].mkv", "670.0 MiB", "s2e01-720p", "mkv", True),
+                (f"[SubsPlease] {topic} Season 2 Episode 2 [1080p].mkv", "1.4 GiB", "s2e02-1080p", "mkv", True),
+                (f"[Judas] {topic} S02E03 [1080p HEVC x265 10bit].mkv", "610.0 MiB", "s2e03-1080p", "mkv", True),
+                (f"[SubsPlease] {topic} Season 2 - 04 [1080p].mkv", "1.4 GiB", "s2e04-1080p", "mkv", True),
+                (f"[SubsPlease] {topic} - 01-12 [1080p][Batch].mkv", "14.8 GiB", "s1-range-01-12", "mkv", True),
+                (f"[Judas] {topic} Season 1 Batch [1080p HEVC x265 10bit].mkv", "7.4 GiB", "s1-full-batch", "mkv", True),
+                (f"[EMBER] {topic} Complete Series [1080p Dual-Audio].mkv", "28.6 GiB", "complete-series-pack", "mkv", True),
+                (f"[SubsPlease] {topic} - Special Original Soundtrack & PV [1080p].mkv", "890.0 MiB", "special-ost-pv", "mkv", True),
+            ]
+            for idx in range(count):
+                specs.append(page1_templates[idx % len(page1_templates)])
+        else:
+            # Pages 2..5: progressive later episodes across Season 1 (09..24) and Season 2 (05..16)
+            groups = [
+                ("SubsPlease", "1080p", "1.4 GiB", "mkv"),
+                ("Erai-raws", "1080p Multiple Subtitle", "1.6 GiB", "mkv"),
+                ("Judas", "1080p HEVC x265 10bit", "640.2 MiB", "mkv"),
+                ("EMBER", "720p HEVC", "390.5 MiB", "mkv"),
+                ("VARYG", "2160p 4K WEB-DL Dual-Audio", "3.2 GiB", "mkv"),
+                ("ASW", "1080p HEVC Dual-Audio", "485.0 MiB", "mkv"),
+            ]
+            base_ep_s1 = 8 + (page_num - 2) * 4
+            base_ep_s2 = 4 + (page_num - 2) * 3
+            for offset in range(count):
+                group_name, profile, size_label, ext = groups[offset % len(groups)]
+                if offset == count - 2:
+                    specs.append(
+                        (
+                            f"[{group_name}] {topic} Season {min(3, page_num)} Batch [{profile}].{ext}",
+                            "8.4 GiB",
+                            f"s{min(3, page_num)}-batch-p{page_num}",
+                            ext,
+                            True,
+                        )
+                    )
+                elif offset % 3 == 2:
+                    s2_ep = base_ep_s2 + (offset // 6) + 1
+                    specs.append(
+                        (
+                            f"[{group_name}] {topic} S02E{s2_ep:02d} [{profile}].{ext}",
+                            size_label,
+                            f"s2e{s2_ep:02d}-p{page_num}-{offset}",
+                            ext,
+                            True,
+                        )
+                    )
+                else:
+                    s1_ep = min(28, base_ep_s1 + (offset // 3) + 1)
+                    specs.append(
+                        (
+                            f"[{group_name}] {topic} - {s1_ep:02d} [{profile}].{ext}",
+                            size_label,
+                            f"s1e{s1_ep:02d}-p{page_num}-{offset}",
+                            ext,
+                            True,
+                        )
+                    )
+
+        slug = "-".join((topic or "nyaa-browse").lower().split())
         items: list[ScrapedItem] = []
-        start_offset = (page_num - 1) * count
 
         for offset in range(count):
             global_idx = start_offset + offset + 1
-            group_name, profile, size, ext = groups[offset % len(groups)]
-            episode_num = ((global_idx - 1) % 24) + 1
             torrent_id = 1894000 + (page_num * 100) + offset + 1
-            is_batch = offset % 7 == 6
-
-            if is_batch:
-                title = f"[{group_name}] {topic} (Batch 01-24) [{profile}].{ext.lower()}"
-                size_label = f"{4.2 + (offset % 5) * 1.3:.1f} GiB"
-            else:
-                title = f"[{group_name}] {topic} - {episode_num:02d} [{profile}] [{torrent_id:08X}].{ext.lower()}"
-                size_label = size
+            title, size_label, tag_slug, _ext, has_magnet = specs[offset]
 
             seeders = max(6, 1650 - global_idx * 13 + ((offset % 4) * 45))
             leechers = max(1, int(seeders * 0.08) + (offset % 9))
             downloads = seeders * 18 + (offset * 120)
             day = max(1, 14 - ((global_idx - 1) // 8))
             date = f"2026-11-{day:02d} {(23 - (offset % 20)):02d}:{(offset * 7) % 60:02d}"
-            relative_date = f"{global_idx} hour(s) ago" if global_idx < 24 else f"{(global_idx // 24) + 1} day(s) ago"
+            relative_date = (
+                f"{global_idx} hour(s) ago"
+                if global_idx < 24
+                else f"{(global_idx // 24) + 1} day(s) ago"
+            )
 
-            btih_hex = f"{torrent_id:08x}" * 5
-            magnet_link = f"magnet:?xt=urn:btih:{btih_hex}&dn={quote_plus(slug + f'-p{page_num}-{offset + 1}')}"
+            btih_hex = hashlib.sha1(title.encode("utf-8")).hexdigest()
+            magnet_link = (
+                f"magnet:?xt=urn:btih:{btih_hex}&dn={quote_plus(slug + '-' + tag_slug)}"
+                if has_magnet
+                else ""
+            )
+            torrent_id = 1800000 + (int(btih_hex[:6], 16) % 900000)
             torrent_link = f"{base}/download/{torrent_id}.torrent"
             view_url = f"{base}/view/{torrent_id}"
 
@@ -343,20 +527,90 @@ class ConfigurableTableScraper:
         query: str = "",
         demo_mode: bool | None = None,
         page: int = 1,
+        force_refresh: bool = False,
+        category: str | None = None,
+        filter_mode: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
     ) -> ScrapeResponse:
-        """Execute a Nyaa browse (empty query) or search for ``page`` in Mock or Live HTTP mode."""
+        """Execute a Nyaa browse (empty query) or search for ``page`` with short-lived caching, in-flight deduplication, and bounded retry."""
         cleaned_query = (query or "").strip()
         page_num = max(1, int(page or 1))
-
         use_demo = self.demo_mode if demo_mode is None else demo_mode
+        eff_cat = (category or NYAA_CATEGORY).strip() or NYAA_CATEGORY
+        eff_filter = (filter_mode or NYAA_FILTER).strip() or NYAA_FILTER
+        eff_sort = (sort_by or ("seeders" if cleaned_query else "leechers")).strip()
+        eff_order = (sort_order or "desc").strip()
+        cache_key = (
+            f"{self.base_url.strip().rstrip('/')}:{eff_cat}:{eff_filter}:{eff_sort}:{eff_order}",
+            cleaned_query.lower(),
+            page_num,
+            bool(use_demo),
+        )
+
+        if not force_refresh and self.cache_ttl > 0:
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None and cached[0] > time.monotonic():
+                    return cached[1]
+
+        # Prevent duplicate concurrent requests for the same (base_url, query, page, mode)
+        wait_event: threading.Event | None = None
+        own_event: threading.Event | None = None
+        with self._cache_lock:
+            if not force_refresh and cache_key in self._inflight:
+                wait_event = self._inflight[cache_key]
+            else:
+                own_event = threading.Event()
+                self._inflight[cache_key] = own_event
+
+        if wait_event is not None:
+            wait_event.wait(timeout=max(1.0, self.timeout * 2))
+            with self._cache_lock:
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return cached[1]
+
+        try:
+            result = self._execute_search_uncached(
+                cleaned_query,
+                use_demo,
+                page_num,
+                category=eff_cat,
+                filter_mode=eff_filter,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
+            if result.error is None and self.cache_ttl > 0:
+                with self._cache_lock:
+                    self._cache[cache_key] = (time.monotonic() + self.cache_ttl, result)
+            return result
+        finally:
+            if own_event is not None:
+                with self._cache_lock:
+                    if self._inflight.get(cache_key) is own_event:
+                        del self._inflight[cache_key]
+                    own_event.set()
+
+    def _execute_search_uncached(
+        self,
+        cleaned_query: str,
+        use_demo: bool,
+        page_num: int,
+        category: str | None = None,
+        filter_mode: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ) -> ScrapeResponse:
+        eff_cat = (category or NYAA_CATEGORY).strip() or NYAA_CATEGORY
         if use_demo:
             if self.mock_delay > 0:
                 time.sleep(self.mock_delay)
-            mock_items = self.get_mock_items(cleaned_query, page=page_num)
+            mock_items = deduplicate_items(self.get_mock_items(cleaned_query, page=page_num))
             return ScrapeResponse(
                 items=mock_items,
                 error=None,
-                request_url=f"mock://nyaa-category-1_2?p={page_num}",
+                request_url=f"mock://nyaa-category-{eff_cat}?p={page_num}",
                 is_demo=True,
                 page=page_num,
                 has_next_page=page_num < 5,
@@ -367,57 +621,80 @@ class ConfigurableTableScraper:
             return ScrapeResponse(items=[], error="ROW_SELECTOR cannot be empty.", page=page_num)
 
         try:
-            target_url = self.build_search_url(cleaned_query, page=page_num)
+            target_url = self.build_search_url(
+                cleaned_query,
+                page=page_num,
+                category=category,
+                filter_mode=filter_mode,
+                sort_by=sort_by,
+                sort_order=sort_order,
+            )
         except ValueError as exc:
             return ScrapeResponse(items=[], error=f"Invalid URL configuration: {exc}", page=page_num)
 
         headers = {"User-Agent": self.user_agent}
+        attempts = max(1, int(self.max_retries) + 1)
 
-        try:
-            http_client = self._get_http_client()
-            response = http_client.get(
-                target_url,
-                headers=headers,
-                timeout=self.timeout,
-                follow_redirects=True,
-            )
-            response.raise_for_status()
-            items = self.parse_html(response.text, base_url=str(response.url))
-            has_next, total_pages = self.parse_pagination(response.text, current_page=page_num)
-            return ScrapeResponse(
-                items=items,
-                error=None,
-                request_url=str(response.url),
-                is_demo=False,
-                page=page_num,
-                has_next_page=has_next,
-                total_pages=total_pages,
-            )
-        except httpx.TimeoutException:
-            return ScrapeResponse(
-                items=[],
-                error=f"Request timed out after {self.timeout:.1f}s ({target_url}).",
-                request_url=target_url,
-                page=page_num,
-            )
-        except httpx.HTTPStatusError as exc:
-            return ScrapeResponse(
-                items=[],
-                error=f"HTTP {exc.response.status_code} {exc.response.reason_phrase} from {exc.request.url}",
-                request_url=str(exc.request.url),
-                page=page_num,
-            )
-        except httpx.HTTPError as exc:
-            return ScrapeResponse(
-                items=[],
-                error=f"Network error while fetching {target_url}: {exc}",
-                request_url=target_url,
-                page=page_num,
-            )
-        except Exception as exc:
-            return ScrapeResponse(
-                items=[],
-                error=f"Failed to parse HTML with current selectors: {exc}",
-                request_url=target_url,
-                page=page_num,
-            )
+        for attempt in range(attempts):
+            try:
+                http_client = self._get_http_client()
+                response = http_client.get(
+                    target_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                )
+                if response.status_code in {429, 502, 503, 504} and attempt + 1 < attempts:
+                    time.sleep(self.retry_backoff * (2**attempt))
+                    continue
+                response.raise_for_status()
+                items = deduplicate_items(self.parse_html(response.text, base_url=str(response.url)))
+                has_next, total_pages = self.parse_pagination(response.text, current_page=page_num)
+                return ScrapeResponse(
+                    items=items,
+                    error=None,
+                    request_url=str(response.url),
+                    is_demo=False,
+                    page=page_num,
+                    has_next_page=has_next,
+                    total_pages=total_pages,
+                )
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as exc:
+                if attempt + 1 < attempts:
+                    time.sleep(self.retry_backoff * (2**attempt))
+                    continue
+                if isinstance(exc, httpx.TimeoutException):
+                    return ScrapeResponse(
+                        items=[],
+                        error=f"Request timed out after {self.timeout:.1f}s ({target_url}).",
+                        request_url=target_url,
+                        page=page_num,
+                    )
+                return ScrapeResponse(
+                    items=[],
+                    error=f"Network error while fetching {target_url}: {exc}",
+                    request_url=target_url,
+                    page=page_num,
+                )
+            except httpx.HTTPStatusError as exc:
+                return ScrapeResponse(
+                    items=[],
+                    error=f"HTTP {exc.response.status_code} {exc.response.reason_phrase} from {exc.request.url}",
+                    request_url=str(exc.request.url),
+                    page=page_num,
+                )
+            except httpx.HTTPError as exc:
+                return ScrapeResponse(
+                    items=[],
+                    error=f"Network error while fetching {target_url}: {exc}",
+                    request_url=target_url,
+                    page=page_num,
+                )
+            except Exception as exc:
+                return ScrapeResponse(
+                    items=[],
+                    error=f"Failed to parse HTML with current selectors: {exc}",
+                    request_url=target_url,
+                    page=page_num,
+                )
+        return ScrapeResponse(items=[], error=f"Request failed for {target_url}.", request_url=target_url, page=page_num)

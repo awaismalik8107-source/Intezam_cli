@@ -35,28 +35,31 @@ export function TopBar({
 }: TopBarProps) {
   return (
     <header className="relative shrink-0 border-b border-white/[0.06] bg-[#0B0D16]">
-      <div className="flex h-16 items-center justify-between gap-4 px-5">
+      <div className="flex min-h-16 flex-wrap items-center justify-between gap-3 px-4 py-2 sm:px-5">
         {/* Left: Back button or Page Title */}
-        <div className="flex min-w-0 items-center gap-3">
+        <div className="flex min-w-0 max-w-[45%] items-center gap-2.5 sm:max-w-[42%]">
           {canGoBack && (
             <button
               type="button"
               onClick={onGoBack}
               aria-label="Back to browse"
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/10 bg-[#111522] px-2.5 text-xs font-medium text-[#F8FAFC] transition-colors hover:bg-[#191E2E] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+              className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-white/10 bg-[#111522] px-2.5 text-xs font-medium text-[#F8FAFC] transition-colors hover:bg-[#191E2E] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
             >
               <ArrowLeft className="h-3.5 w-3.5" aria-hidden="true" />
               <span>Back</span>
             </button>
           )}
-          <h1 className="truncate text-sm font-semibold tracking-tight text-[#F8FAFC]">
+          <h1
+            title={pageTitle}
+            className="truncate text-sm font-semibold tracking-tight text-[#F8FAFC]"
+          >
             {pageTitle}
           </h1>
         </div>
 
-        {/* Center/Right: Integrated Cinema Search Field + Mode Pill + Settings */}
-        <div className="flex flex-1 items-center justify-end gap-3">
-          <div className="flex w-full max-w-[480px] items-center gap-2 rounded-full border border-white/10 bg-[#111522] py-1 pl-3.5 pr-1.5 transition-colors focus-within:border-[#786BFF]/60">
+        {/* Right: Search Field + Mode Pill + Settings */}
+        <div className="flex flex-1 items-center justify-end gap-2.5">
+          <div className="flex w-full max-w-[440px] items-center gap-2 rounded-full border border-white/10 bg-[#111522] py-1 pl-3.5 pr-1.5 transition-colors focus-within:border-[#786BFF]/60">
             {isLoading ? (
               <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[#38BDF8]" aria-hidden="true" />
             ) : (
@@ -70,8 +73,8 @@ export function TopBar({
               value={query}
               autoComplete="off"
               spellCheck={false}
-              aria-label="Search Nyaa or browse default endpoint"
-              placeholder="Search Nyaa releases, or press Enter to browse..."
+              aria-label="Search anime shows or browse catalog"
+              placeholder="Search anime title (e.g. Frieren)..."
               onChange={(e) => onQueryChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
@@ -79,7 +82,7 @@ export function TopBar({
                   onSearch();
                 }
               }}
-              className="w-full bg-transparent text-[13px] text-[#F8FAFC] placeholder-[#949CAF]/70 focus:outline-none"
+              className="min-w-0 flex-1 bg-transparent text-[13px] text-[#F8FAFC] placeholder-[#949CAF]/70 focus:outline-none"
             />
 
             {query.length > 0 && (
@@ -96,7 +99,7 @@ export function TopBar({
               </button>
             )}
 
-            <kbd className="hidden select-none rounded-md border border-white/10 bg-[#191E2E] px-1.5 py-0.5 font-mono text-[10px] text-[#949CAF] md:inline-block">
+            <kbd className="hidden select-none rounded-md border border-white/10 bg-[#191E2E] px-1.5 py-0.5 font-mono text-[10px] text-[#949CAF] lg:inline-block">
               Ctrl+K
             </kbd>
 
@@ -105,7 +108,7 @@ export function TopBar({
               <div
                 role="tablist"
                 aria-label="Source mode"
-                className="flex items-center rounded-full border border-white/[0.08] bg-[#090B12] p-0.5"
+                className="flex shrink-0 items-center rounded-full border border-white/[0.08] bg-[#090B12] p-0.5"
               >
                 {(["mock", "live"] as const).map((mOption) => {
                   const active = mode === mOption;
@@ -142,7 +145,9 @@ export function TopBar({
             className="hidden items-center gap-1.5 rounded-full border border-white/[0.08] bg-[#111522] px-2.5 py-1 text-[11px] text-[#949CAF] xl:flex"
           >
             <span
-              className={`h-1.5 w-1.5 rounded-full ${bridgeReady ? "bg-emerald-400" : "bg-amber-400 animate-pulse"}`}
+              className={`h-1.5 w-1.5 rounded-full ${
+                bridgeReady ? "bg-emerald-400" : "bg-amber-400 animate-pulse"
+              }`}
               aria-hidden="true"
             />
             <span>{bridgeReady ? "Ready" : "Init"}</span>
@@ -161,7 +166,7 @@ export function TopBar({
         </div>
       </div>
 
-      {/* Intezam Flowing-Light Data Progress Indicator */}
+      {/* Progress Indicator */}
       {isLoading && (
         <div
           aria-hidden="true"

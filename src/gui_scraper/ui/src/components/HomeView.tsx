@@ -23,7 +23,7 @@ interface HomeViewProps {
   onLaunchWatchEntry: (entry: WatchHistoryEntry) => void;
 }
 
-const STARTER_QUERIES = ["Frieren 1080p", "Dandadan", "Dungeon Meshi", "Orb 1080p"] as const;
+const STARTER_QUERIES = ["Frieren", "Dan Da Dan", "Delicious in Dungeon", "Solo Leveling"] as const;
 
 export function HomeView({
   discoveredMedia,
@@ -71,6 +71,8 @@ export function HomeView({
                 quality={featured.bestQuality}
                 mediaType={featured.mediaType}
                 variant="backdrop"
+                posterUrl={featured.posterUrl}
+                backdropUrl={featured.backdropUrl}
               />
 
               <div className="relative z-10 max-w-2xl space-y-3.5">
@@ -100,13 +102,11 @@ export function HomeView({
                 </h2>
 
                 <p className="max-w-xl text-xs leading-relaxed text-[#949CAF] sm:text-[13px]">
-                  {featured.verifiedCount} verified{" "}
-                  {featured.verifiedCount === 1 ? "link" : "links"} available
-                  {featured.magnetCount > 0 ? ` · ${featured.magnetCount} magnet stream(s)` : ""}
-                  {featured.largestSizeLabel !== "N/A"
-                    ? ` · Largest asset ${featured.largestSizeLabel}`
-                    : ""}
-                  . Select to inspect streams and prepare Intezam Flow playback.
+                  {featured.sources.length} discovered{" "}
+                  {featured.sources.length === 1 ? "release" : "releases"}
+                  {featured.magnetCount > 0 ? ` · ${featured.magnetCount} magnet URI(s)` : ""}.
+                  Open this show to browse seasons, select an episode, and copy a verified magnet
+                  link.
                 </p>
 
                 <div className="flex flex-wrap items-center gap-3 pt-1">
@@ -115,8 +115,8 @@ export function HomeView({
                     onClick={() => onSelectMedia(featured)}
                     className="inline-flex h-10 items-center gap-2 rounded-xl bg-gradient-to-r from-[#786BFF] to-[#5B8DEF] px-5 text-xs font-semibold text-[#F8FAFC] shadow-lg shadow-[#786BFF]/25 transition-transform duration-150 hover:scale-[1.015] active:scale-[0.985] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
                   >
-                    <Play className="h-3.5 w-3.5 fill-current" aria-hidden="true" />
-                    <span>View Sources</span>
+                    <Search className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Browse Episodes & Magnets</span>
                   </button>
 
                   <button
@@ -173,11 +173,11 @@ export function HomeView({
                   Intezam Cinema Discovery
                 </span>
                 <h2 className="text-2xl font-bold tracking-tight text-[#F8FAFC] sm:text-3xl">
-                  Your next watch starts here.
+                  Discover anime shows & copy magnet links.
                 </h2>
                 <p className="max-w-xl text-xs leading-relaxed text-[#949CAF] sm:text-[13px]">
-                  Search configured providers or preview with Mock Data to organize releases into
-                  media cards, verify stream URIs, and launch playback through Intezam Flow.
+                  Search configured providers or preview with Mock Data to group releases by show,
+                  navigate seasons and episodes, and copy verified magnet URIs.
                 </p>
 
                 <div className="flex flex-wrap items-center gap-2 pt-1">

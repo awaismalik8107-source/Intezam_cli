@@ -1,5 +1,13 @@
 import { parseReleaseTitle, showKey } from "./episodeCatalog";
-import type { MediaEntry, MediaSource, QualityTier, ScrapedItem, ScraperConfig } from "./types";
+import type {
+  MediaEntry,
+  MediaIdentity,
+  MediaSource,
+  ProviderRetrievalStatus,
+  QualityTier,
+  ScrapedItem,
+  ScraperConfig,
+} from "./types";
 
 const SIZE_UNIT_MULTIPLIERS: Record<string, number> = {
   "": 1,
@@ -36,7 +44,7 @@ export function stripStatusPrefix(msg: string): string {
 
 export function extractMagnetInfoHash(uri: string): string | null {
   const match = String(uri || "").match(/xt=urn:btih:([a-zA-Z0-9]+)/i);
-  return match ? match[1] : null;
+  return match ? match[1].toLowerCase() : null;
 }
 
 export function extractHostname(uri: string): string | null {
@@ -106,21 +114,27 @@ export function adaptScrapedItem(item: ScrapedItem, providerName: string): Media
   const leechers = typeof item.leechers === "number" ? item.leechers : parsedPeers.leechers;
   const primaryUri = (item.magnet_link || item.resolved_link || "").trim();
   const lowerUri = primaryUri.toLowerCase();
+  const parsedRelease = parseReleaseTitle(item.title);
+  const effectiveProvider = item.provider_name || providerName;
+  const infoHash = item.info_hash || extractMagnetInfoHash(primaryUri);
 
   return {
     item,
     sourceTitle: item.title,
     qualityTier: quality.tier,
-    inferredResolution: quality.label,
-    inferredCodec: inferCodec(item.title),
+    inferredResolution: item.resolution && item.resolution !== "SD" ? item.resolution : quality.label,
+    inferredCodec: item.codec || inferCodec(item.title),
     inferredContainer: inferContainer(item.title, primaryUri),
+    inferredSubtitles: item.subtitle_lang || (/\bmulti[-_\s]?sub/i.test(item.title) ? "Multi-Sub" : /\bdual[-_\s]?audio/i.test(item.title) ? "Dual-Audio" : undefined),
+    releaseGroup: parsedRelease.releaseGroup || undefined,
     sizeBytes: parseSizeBytes(item.size),
     seeders,
     leechers,
     isMagnet: lowerUri.startsWith("magnet:"),
-    infoHash: extractMagnetInfoHash(primaryUri),
+    infoHash,
     hostname: extractHostname(item.torrent_link || primaryUri),
-    providerName,
+    providerName: effectiveProvider,
+    providerId: item.provider_id,
   };
 }
 
@@ -133,7 +147,15 @@ export function groupItemsToMedia(items: ScrapedItem[], providerName: string): M
     const key = showKey(title) || `item-${item.id}`;
     const group = grouped.get(key) ?? { title, sources: [], seen: new Set<string>() };
     const source = adaptScrapedItem(item, providerName);
-    const uniqueKey = source.infoHash || item.magnet_link || item.resolved_link || item.view_url || item.title;
+    const uniqueKey = (
+      source.infoHash ||
+      item.magnet_link ||
+      item.resolved_link ||
+      item.view_url ||
+      item.title
+    )
+      .trim()
+      .toLowerCase();
     if (!group.seen.has(uniqueKey)) {
       group.sources.push(source);
       group.seen.add(uniqueKey);
@@ -202,4 +224,126 @@ export function buildPreviewUrl(cfg: Partial<ScraperConfig>, sampleQuery = "frie
   const encoded = encodeURIComponent(sampleQuery.trim()).replace(/%20/g, "+");
   if (!encoded) return `${base}${path}?${param}=&f=0&c=1_2&s=leechers&o=desc`;
   return `${base}${path}?f=0&c=1_2&${encodeURIComponent(param)}=${encoded}&s=seeders&o=desc`;
+}
+
+export function adaptMetadataToMediaEntry(
+  identity: MediaIdentity,
+  items: ScrapedItem[] = [],
+  defaultProviderName = "Multi-Source",
+  providerStatuses?: ProviderRetrievalStatus[],
+): MediaEntry {
+  const baseEntry: MediaEntry = {
+    key: identity.canonical_id || showKey(identity.official_title),
+    title: identity.official_title,
+    year: identity.release_year ? String(identity.release_year) : null,
+    seasonEpisode:
+      identity.seasons.length > 0
+        ? `${identity.seasons.length} Season${identity.seasons.length > 1 ? "s" : ""}`
+        : null,
+    mediaType: "series",
+    sources: [],
+    bestQuality: "Other",
+    verifiedCount: 0,
+    magnetCount: 0,
+    latestDate: identity.release_year ? String(identity.release_year) : "N/A",
+    largestSizeLabel: "N/A",
+    largestSizeBytes: 0,
+    maxSeeders: null,
+    providerName: identity.metadata_provider || defaultProviderName,
+    posterUrl: identity.poster_url || undefined,
+    backdropUrl: identity.backdrop_url || undefined,
+    synopsis: identity.synopsis || undefined,
+    genres: identity.genres?.length ? identity.genres : undefined,
+    alternateTitles: [
+      identity.romaji_title,
+      identity.original_title,
+      ...(identity.alternate_titles || []),
+    ].filter((t): t is string => Boolean(t && t.trim() && t.trim() !== identity.official_title)),
+    officialSeasons: identity.seasons,
+    metadataProvider: identity.metadata_provider,
+    metadata: identity,
+    providerStatuses,
+  };
+
+  if (items.length === 0) {
+    return baseEntry;
+  }
+  return mergeSourcesIntoMediaEntry(baseEntry, items, defaultProviderName, providerStatuses);
+}
+
+export function mergeSourcesIntoMediaEntry(
+  entry: MediaEntry,
+  items: ScrapedItem[],
+  defaultProviderName = "Multi-Source",
+  providerStatuses?: ProviderRetrievalStatus[],
+): MediaEntry {
+  const adapted = items.map((item) =>
+    adaptScrapedItem(item, item.provider_name || defaultProviderName),
+  );
+  const byKey = new Map<string, MediaSource>();
+
+  for (const src of adapted) {
+    const dedupKey = src.infoHash
+      ? `btih:${src.infoHash.toLowerCase()}`
+      : `src:${(src.item.magnet_link || src.item.torrent_link || src.item.view_url || src.sourceTitle).toLowerCase()}`;
+    const existing = byKey.get(dedupKey);
+    if (!existing) {
+      byKey.set(dedupKey, src);
+    } else {
+      const existingProviders = existing.providerName.split(" + ");
+      if (!existingProviders.includes(src.providerName)) {
+        existing.providerName = [...existingProviders, src.providerName].join(" + ");
+      }
+      if ((src.seeders ?? 0) > (existing.seeders ?? 0)) {
+        existing.seeders = src.seeders;
+      }
+    }
+  }
+
+  const sources = [...byKey.values()].sort((a, b) => {
+    if (a.item.is_valid !== b.item.is_valid) return a.item.is_valid ? -1 : 1;
+    const seedA = a.seeders ?? -1;
+    const seedB = b.seeders ?? -1;
+    if (seedA !== seedB) return seedB - seedA;
+    const qDiff = QUALITY_RANK[b.qualityTier] - QUALITY_RANK[a.qualityTier];
+    if (qDiff !== 0) return qDiff;
+    return b.sizeBytes - a.sizeBytes;
+  });
+
+  let bestQuality: QualityTier = sources[0]?.qualityTier ?? entry.bestQuality;
+  let verifiedCount = 0;
+  let magnetCount = 0;
+  let largestSizeBytes = sources[0]?.sizeBytes ?? 0;
+  let largestSizeLabel = sources[0]?.item.size || entry.largestSizeLabel;
+  let maxSeeders: number | null = null;
+  let latestDate = sources[0]?.item.date || entry.latestDate;
+
+  for (const src of sources) {
+    if (QUALITY_RANK[src.qualityTier] > QUALITY_RANK[bestQuality]) bestQuality = src.qualityTier;
+    if (src.item.is_valid) verifiedCount++;
+    if (src.isMagnet) magnetCount++;
+    if (src.sizeBytes > largestSizeBytes) {
+      largestSizeBytes = src.sizeBytes;
+      largestSizeLabel = src.item.size;
+    }
+    if (src.seeders !== null && (maxSeeders === null || src.seeders > maxSeeders)) {
+      maxSeeders = src.seeders;
+    }
+    if (src.item.date && src.item.date > latestDate) {
+      latestDate = src.item.date;
+    }
+  }
+
+  return {
+    ...entry,
+    sources,
+    bestQuality,
+    verifiedCount,
+    magnetCount,
+    latestDate,
+    largestSizeBytes,
+    largestSizeLabel,
+    maxSeeders,
+    providerStatuses: providerStatuses ?? entry.providerStatuses,
+  };
 }

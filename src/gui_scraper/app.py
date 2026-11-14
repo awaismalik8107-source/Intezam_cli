@@ -36,6 +36,9 @@ if __package__ in (None, ""):
         TITLE_SELECTOR,
         ConfigurableTableScraper,
     )
+    from gui_scraper.metadata import CatalogMetadataService
+    from gui_scraper.models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
+    from gui_scraper.providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
     from gui_scraper.storage import LocalMediaStore
     from gui_scraper.validator import inspect_magnet_uri, verify_http_status
 else:
@@ -54,6 +57,9 @@ else:
         TITLE_SELECTOR,
         ConfigurableTableScraper,
     )
+    from .metadata import CatalogMetadataService
+    from .models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
+    from .providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
     from .storage import LocalMediaStore
     from .validator import inspect_magnet_uri, verify_http_status
 
@@ -82,9 +88,15 @@ class ScraperBridge:
         self,
         scraper: ConfigurableTableScraper | None = None,
         store: LocalMediaStore | None = None,
+        metadata_service: CatalogMetadataService | None = None,
+        discovery_engine: MultiProviderDiscoveryEngine | None = None,
     ) -> None:
         self.scraper = scraper or ConfigurableTableScraper(demo_mode=True)
         self.store = store or LocalMediaStore()
+        self.metadata_service = metadata_service or CatalogMetadataService()
+        self.discovery_engine = discovery_engine or MultiProviderDiscoveryEngine(
+            nyaa=NyaaSourceProvider(self.scraper)
+        )
         self._lock = threading.Lock()
         self._stream_lock = threading.Lock()
         self._logs: deque[str] = deque(maxlen=150)
@@ -108,19 +120,185 @@ class ScraperBridge:
         stamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self._logs.append(f"[{stamp}] {message}")
 
+    def discover_shows(
+        self,
+        query: str = "",
+        mode: str = "mock",
+    ) -> dict[str, Any]:
+        """Stage 9: Discover candidate shows from metadata providers (AniList + TMDB/TVMaze) without scraping torrents for every card."""
+        normalized_mode = (mode or "mock").strip().lower()
+        use_demo = normalized_mode in {"mock", "mock data", "demo"}
+        mode_key = "mock" if use_demo else "live"
+        cleaned = (query or "").strip()
+
+        shows, notes = self.metadata_service.search_shows(
+            cleaned,
+            demo_mode=use_demo,
+            limit=8,
+        )
+        if cleaned:
+            self.store.record_search(cleaned, mode_key, len(shows))
+        self._log(
+            f"Metadata discovery ({mode_key}) for {cleaned!r} returned {len(shows)} show(s)."
+        )
+        return {
+            "shows": [s.to_dict() for s in shows],
+            "query": cleaned,
+            "mode": mode_key,
+            "error": None,
+            "provider_notes": notes,
+        }
+
+    def discover_show_sources(
+        self,
+        show: dict[str, Any] | str,
+        mode: str = "mock",
+        page: int = 1,
+        force_refresh: bool = False,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stage 9: On-demand multi-provider torrent discovery and episode matching for a selected show."""
+        normalized_mode = (mode or "mock").strip().lower()
+        use_demo = normalized_mode in {"mock", "mock data", "demo"}
+        mode_key = "mock" if use_demo else "live"
+        page_num = max(1, int(page or 1))
+
+        identity = self._coerce_media_identity(show)
+        search_filters = self._coerce_filters(filters, identity)
+
+        items, statuses, has_next, total_pages = self.discovery_engine.discover_for_show(
+            identity,
+            page=page_num,
+            demo_mode=use_demo,
+            force_refresh=bool(force_refresh),
+            filters=search_filters,
+        )
+        serialized = [asdict(item) for item in items]
+        self._log(
+            f"Show source discovery ({mode_key}, p={page_num}/{total_pages}) for {identity.official_title!r} returned {len(serialized)} source(s)."
+        )
+        return {
+            "canonical_id": identity.canonical_id,
+            "items": serialized,
+            "page": page_num,
+            "has_next_page": has_next,
+            "total_pages": total_pages,
+            "provider_statuses": [s.to_dict() for s in statuses],
+            "error": None,
+        }
+
+    @staticmethod
+    def _coerce_media_identity(show: dict[str, Any] | str) -> MediaIdentity:
+        if isinstance(show, str):
+            return MediaIdentity(
+                canonical_id=f"query:{show.strip().lower()}",
+                official_title=show.strip(),
+                romaji_title=show.strip(),
+            )
+        raw_seasons = show.get("seasons") or []
+        seasons: list[SeasonMetadata] = []
+        for s_raw in raw_seasons:
+            if not isinstance(s_raw, dict):
+                continue
+            eps = [
+                EpisodeMetadata(
+                    episode_number=int(ep.get("episode_number") or 1),
+                    season_number=int(ep.get("season_number") or s_raw.get("season_number") or 1),
+                    title=str(ep.get("title") or ""),
+                    air_date=str(ep.get("air_date") or ""),
+                    overview=str(ep.get("overview") or ""),
+                    still_url=str(ep.get("still_url") or ""),
+                )
+                for ep in (s_raw.get("episodes") or [])
+                if isinstance(ep, dict)
+            ]
+            seasons.append(
+                SeasonMetadata(
+                    season_number=int(s_raw.get("season_number") or 1),
+                    title=str(s_raw.get("title") or ""),
+                    episode_count=int(s_raw.get("episode_count") or len(eps)),
+                    air_year=int(s_raw["air_year"]) if s_raw.get("air_year") else None,
+                    poster_url=str(s_raw.get("poster_url") or ""),
+                    anilist_id=int(s_raw["anilist_id"]) if s_raw.get("anilist_id") else None,
+                    season_aliases=[str(a) for a in (s_raw.get("season_aliases") or []) if a],
+                    episodes=eps,
+                )
+            )
+        official = str(show.get("official_title") or show.get("title") or "Unknown").strip()
+        return MediaIdentity(
+            canonical_id=str(show.get("canonical_id") or show.get("key") or f"show:{official.lower()}"),
+            official_title=official,
+            original_title=str(show.get("original_title") or ""),
+            romaji_title=str(show.get("romaji_title") or ""),
+            alternate_titles=[str(a) for a in (show.get("alternate_titles") or []) if a],
+            tmdb_id=int(show["tmdb_id"]) if show.get("tmdb_id") else None,
+            anilist_id=int(show["anilist_id"]) if show.get("anilist_id") else None,
+            imdb_id=str(show["imdb_id"]) if show.get("imdb_id") else None,
+            tvmaze_id=int(show["tvmaze_id"]) if show.get("tvmaze_id") else None,
+            release_year=int(show["release_year"]) if show.get("release_year") else None,
+            media_type=str(show.get("media_type") or "anime"),
+            synopsis=str(show.get("synopsis") or ""),
+            genres=[str(g) for g in (show.get("genres") or []) if g],
+            status=str(show.get("status") or ""),
+            poster_url=str(show.get("poster_url") or ""),
+            backdrop_url=str(show.get("backdrop_url") or ""),
+            seasons=seasons,
+            metadata_provider=str(show.get("metadata_provider") or ""),
+        )
+
+    @staticmethod
+    def _coerce_filters(
+        filters: dict[str, Any] | None,
+        identity: MediaIdentity | None = None,
+    ) -> SourceSearchFilters:
+        if not isinstance(filters, dict):
+            return SourceSearchFilters(
+                category="anime_all" if (identity is None or identity.media_type == "anime") else "all",
+                imdb_id=identity.imdb_id if identity else None,
+            )
+        return SourceSearchFilters(
+            category=str(filters.get("category") or ("anime_all" if (identity is None or identity.media_type == "anime") else "all")),
+            filter_mode=str(filters.get("filter_mode") or "0"),
+            sort_by=str(filters.get("sort_by") or "seeders"),
+            sort_order=str(filters.get("sort_order") or "desc"),
+            providers=[str(p) for p in (filters.get("providers") or []) if p],
+            resolution=str(filters.get("resolution") or ""),
+            imdb_id=str(filters.get("imdb_id") or (identity.imdb_id if identity else "") or "") or None,
+        )
+
     def search_paginated(
         self,
         query: str = "",
         mode: str = "mock",
         page: int = 1,
+        force_refresh: bool = False,
+        filters: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run a paginated Nyaa browse or search and return items + pagination metadata."""
         normalized_mode = (mode or "mock").strip().lower()
         use_demo = normalized_mode in {"mock", "mock data", "demo"}
         mode_key = "mock" if use_demo else "live"
         page_num = max(1, int(page or 1))
+        cat_arg: str | None = None
+        flt_arg: str | None = None
+        if isinstance(filters, dict):
+            from .providers import NYAA_CATEGORY_MAP
 
-        response = self.scraper.search(query, demo_mode=use_demo, page=page_num)
+            raw_cat = str(filters.get("category") or "").strip()
+            if raw_cat:
+                cat_arg = NYAA_CATEGORY_MAP.get(raw_cat, raw_cat)
+            raw_flt = str(filters.get("filter_mode") or "").strip()
+            if raw_flt in {"0", "1", "2"}:
+                flt_arg = raw_flt
+
+        response = self.scraper.search(
+            query,
+            demo_mode=use_demo,
+            page=page_num,
+            force_refresh=bool(force_refresh),
+            category=cat_arg,
+            filter_mode=flt_arg,
+        )
 
         if response.error:
             self._log(f"Search error ({mode_key}, p={page_num}) for {query!r}: {response.error}")
@@ -249,6 +427,7 @@ class ScraperBridge:
                 str(new_config.get("user_agent", self.scraper.user_agent)).strip()
                 or DEFAULT_USER_AGENT
             )
+            self.scraper.clear_cache()
 
         self._log(f"Updated scraper config for {base_url}.")
         return {"ok": True, "config": self.get_config()}
@@ -268,6 +447,7 @@ class ScraperBridge:
             self.scraper.stats_selector = STATS_SELECTOR
             self.scraper.timeout = DEFAULT_TIMEOUT
             self.scraper.user_agent = DEFAULT_USER_AGENT
+            self.scraper.clear_cache()
 
         self._log("Restored default scraper configuration.")
         return {"ok": True, "config": self.get_config()}

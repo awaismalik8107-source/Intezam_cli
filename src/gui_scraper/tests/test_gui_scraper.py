@@ -543,3 +543,448 @@ def test_ui_html_exists_and_contains_required_elements() -> None:
     assert "Open Magnet in Client" in html
     assert "search_paginated" in html
     assert "Load Page" in html
+    assert "Browse Episodes" in html
+    assert "Multi-Episode Range" in html
+    assert "Full-Season Batch" in html
+    assert "Complete-Series Pack" in html
+    assert "Advanced Torrent Browser" in html
+
+
+def test_info_hash_extraction_and_deduplication() -> None:
+    hash_upper = "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567&dn=ReleaseA"
+    hash_lower = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=ReleaseB"
+    assert engine.extract_info_hash(hash_upper) == "0123456789abcdef0123456789abcdef01234567"
+    assert engine.extract_info_hash(hash_lower) == "0123456789abcdef0123456789abcdef01234567"
+    assert engine.extract_info_hash("https://nyaa.si/download/1.torrent") == ""
+
+    items = [
+        ScrapedItem(
+            id=1,
+            title="[SubsPlease] Frieren - 01 (1080p).mkv",
+            size="1.4 GiB",
+            date="2026-11-14",
+            stats="120S / 10L",
+            raw_link=hash_upper,
+            resolved_link="https://nyaa.si/view/100",
+            is_valid=True,
+            verification_msg="Valid",
+            view_url="https://nyaa.si/view/100",
+            magnet_link=hash_upper,
+            seeders=120,
+            leechers=10,
+        ),
+        ScrapedItem(
+            id=2,
+            title="[SubsPlease] Frieren - 01 (1080p) [Repost].mkv",
+            size="1.4 GiB",
+            date="2026-11-14",
+            stats="450S / 25L",
+            raw_link=hash_lower,
+            resolved_link="https://nyaa.si/view/101",
+            is_valid=True,
+            verification_msg="Valid",
+            view_url="https://nyaa.si/view/101",
+            magnet_link=hash_lower,
+            seeders=450,
+            leechers=25,
+        ),
+        ScrapedItem(
+            id=3,
+            title="[Erai-raws] Frieren - 01 [720p].mkv",
+            size="700 MiB",
+            date="2026-11-14",
+            stats="90S / 5L",
+            raw_link="magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Frieren720",
+            resolved_link="https://nyaa.si/view/102",
+            is_valid=True,
+            verification_msg="Valid",
+            view_url="https://nyaa.si/view/102",
+            magnet_link="magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98&dn=Frieren720",
+            seeders=90,
+            leechers=5,
+        ),
+    ]
+    deduped = engine.deduplicate_items(items)
+    assert len(deduped) == 2
+    assert deduped[0].seeders == 120
+    assert deduped[0].id == 1
+    assert deduped[1].id == 3
+
+
+def test_scraper_ttl_cache_and_retry_backoff() -> None:
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return httpx.Response(503, text="Service Unavailable", request=request)
+        return httpx.Response(200, text=SAMPLE_HTML, request=request)
+
+    transport = httpx.MockTransport(handler)
+    with httpx.Client(transport=transport) as client:
+        scraper = ConfigurableTableScraper(
+            demo_mode=False,
+            client=client,
+            cache_ttl=60.0,
+            max_retries=2,
+            retry_backoff=0.01,
+        )
+        first = scraper.search("Frieren", demo_mode=False, page=1)
+        assert call_count == 2
+        assert len(first.items) == 4
+
+        # Second call within TTL hits cache without another HTTP request
+        second = scraper.search("Frieren", demo_mode=False, page=1)
+        assert call_count == 2
+        assert len(second.items) == 4
+
+        # Force refresh bypasses cache
+        third = scraper.search("Frieren", demo_mode=False, page=1, force_refresh=True)
+        assert call_count == 3
+        assert len(third.items) == 4
+
+
+def test_mock_items_support_multi_season_batches_and_resolutions() -> None:
+    scraper = ConfigurableTableScraper(mock_delay=0.0)
+    browse_items = scraper.get_mock_items("", page=1)
+    assert len(browse_items) == 24
+    titles = [item.title for item in browse_items]
+    assert any("Frieren: Beyond Journey's End" in t for t in titles)
+    assert any("Delicious in Dungeon" in t for t in titles)
+    assert any("The Apothecary Diaries" in t for t in titles)
+
+    show_page_1 = scraper.get_mock_items("Sousou no Frieren", page=1)
+    show_titles = [item.title for item in show_page_1]
+    # Multiple resolutions of EP 01
+    ep1_matches = [t for t in show_titles if "Sousou no Frieren - 01 " in t]
+    assert len(ep1_matches) >= 3
+    # Season 2 releases
+    assert any("S02E01" in t for t in show_titles)
+    # Batch subtypes & unclassified special
+    assert any("01-12" in t for t in show_titles)
+    assert any("Season 1 Batch" in t for t in show_titles)
+    assert any("Complete Series" in t for t in show_titles)
+    assert any("Original Soundtrack" in t for t in show_titles)
+    # Torrent-only item without magnet
+    assert any(not item.magnet_link and bool(item.torrent_link) for item in show_page_1)
+
+
+def test_frontend_episode_catalog_and_grouping_scenarios(tmp_path: Path) -> None:
+    import subprocess
+
+    ui_dir = UI_INDEX_PATH.parents[1]
+    esbuild_bin = ui_dir / "node_modules" / ".bin" / "esbuild"
+    test_entry = ui_dir / "src" / "lib" / "catalogScenariosTest.ts"
+    bundle_out = tmp_path / "catalogScenariosTest.mjs"
+
+    build_proc = subprocess.run(
+        [
+            str(esbuild_bin),
+            str(test_entry),
+            "--bundle",
+            "--platform=node",
+            "--format=esm",
+            f"--outfile={bundle_out}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build_proc.returncode == 0, build_proc.stderr
+
+    run_proc = subprocess.run(
+        ["node", str(bundle_out)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert run_proc.returncode == 0, run_proc.stderr
+    assert "ALL_12_CATALOG_SCENARIO_TESTS_PASSED" in run_proc.stdout
+
+
+def test_canonical_metadata_models_and_providers() -> None:
+    from gui_scraper.metadata import (
+        AniListMetadataProvider,
+        CatalogMetadataService,
+        TMDBMetadataProvider,
+        TVMazeMetadataProvider,
+    )
+    from gui_scraper.models import EpisodeMetadata, MediaIdentity, SeasonMetadata
+
+    identity = MediaIdentity(
+        canonical_id="anilist:154587",
+        official_title="Frieren: Beyond Journey's End",
+        original_title="葬送のフリーレン",
+        romaji_title="Sousou no Frieren",
+        alternate_titles=["Frieren", "Sousou no Frieren"],
+        release_year=2023,
+        media_type="anime",
+        poster_url="https://example.com/frieren.jpg",
+        seasons=[
+            SeasonMetadata(
+                season_number=1,
+                title="Season 1",
+                episode_count=28,
+                episodes=[EpisodeMetadata(episode_number=1, season_number=1, title="The Journey's End")],
+            )
+        ],
+    )
+    titles = identity.all_search_titles()
+    assert titles[0] == "Frieren: Beyond Journey's End"
+    assert "Sousou no Frieren" in titles
+    assert len(titles) == len({t.lower() for t in titles})
+
+    # TMDB normalization
+    tmdb_ident = TMDBMetadataProvider.normalize_tv_payload(
+        {
+            "id": 1396,
+            "name": "Breaking Bad",
+            "original_name": "Breaking Bad",
+            "first_air_date": "2008-01-20",
+            "overview": "A chemistry teacher turns to making meth.",
+            "poster_path": "/bb.jpg",
+            "backdrop_path": "/bb_bg.jpg",
+            "genres": [{"id": 18, "name": "Drama"}],
+            "external_ids": {"imdb_id": "tt0903747"},
+            "seasons": [{"season_number": 1, "name": "Season 1", "episode_count": 7}],
+        }
+    )
+    assert tmdb_ident.canonical_id == "tmdb:tv:1396"
+    assert tmdb_ident.imdb_id == "tt0903747"
+    assert tmdb_ident.poster_url.endswith("/bb.jpg")
+
+    # TVMaze normalization
+    tvmaze_ident = TVMazeMetadataProvider.normalize_show_payload(
+        {
+            "id": 169,
+            "name": "Breaking Bad",
+            "premiered": "2008-01-20",
+            "summary": "<p>High school chemistry teacher.</p>",
+            "genres": ["Drama", "Crime"],
+            "externals": {"imdb": "tt0903747"},
+            "image": {"original": "https://static.tvmaze.com/uploads/images/original_untouched/0/2400.jpg"},
+            "_embedded": {
+                "seasons": [{"number": 1, "name": "Season 1", "episodeOrder": 7}],
+                "episodes": [{"season": 1, "number": 1, "name": "Pilot", "airdate": "2008-01-20"}],
+            },
+        }
+    )
+    assert tvmaze_ident.canonical_id == "tvmaze:169"
+    assert tvmaze_ident.imdb_id == "tt0903747"
+    assert tvmaze_ident.seasons[0].episodes[0].title == "Pilot"
+
+    # AniList normalization
+    anilist_ident = AniListMetadataProvider.normalize_media_list(
+        [
+            {
+                "id": 154587,
+                "idMal": 52991,
+                "format": "TV",
+                "status": "FINISHED",
+                "seasonYear": 2023,
+                "episodes": 28,
+                "title": {
+                    "english": "Frieren: Beyond Journey's End",
+                    "romaji": "Sousou no Frieren",
+                    "native": "葬送のフリーレン",
+                },
+                "synonyms": ["Frieren"],
+                "coverImage": {"extraLarge": "https://s4.anilist.co/frieren.jpg"},
+                "bannerImage": "https://s4.anilist.co/frieren_banner.jpg",
+                "genres": ["Adventure", "Fantasy"],
+            }
+        ]
+    )[0]
+    assert anilist_ident.canonical_id == "anilist:154587"
+    assert anilist_ident.romaji_title == "Sousou no Frieren"
+
+    catalog_svc = CatalogMetadataService()
+    demo_shows, _ = catalog_svc.search_shows("Frieren", demo_mode=True)
+    assert len(demo_shows) >= 1
+    assert demo_shows[0].official_title == "Frieren: Beyond Journey's End"
+
+
+def test_title_identity_matching_and_season_episode_classification() -> None:
+    from gui_scraper.matching import (
+        TitleIdentityMatcher,
+        match_release_to_identity,
+        parse_release_title,
+    )
+    from gui_scraper.models import MediaIdentity, SeasonMetadata, TorrentRelease
+
+    frieren = MediaIdentity(
+        canonical_id="anilist:154587",
+        official_title="Frieren: Beyond Journey's End",
+        romaji_title="Sousou no Frieren",
+        alternate_titles=["Frieren"],
+        release_year=2023,
+        seasons=[
+            SeasonMetadata(
+                season_number=1,
+                title="Season 1",
+                episode_count=28,
+                season_aliases=["Sousou no Frieren"],
+            ),
+            SeasonMetadata(
+                season_number=2,
+                title="Season 2",
+                episode_count=24,
+                season_aliases=["Sousou no Frieren 2nd Season", "Frieren: Beyond Journey's End Season 2"],
+            ),
+        ],
+    )
+
+    m_romaji = match_release_to_identity(
+        TorrentRelease(
+            release_id="nyaa:1",
+            provider_id="nyaa",
+            provider_name="Nyaa",
+            title="[SubsPlease] Sousou no Frieren - 01 (1080p) [F02B964D].mkv",
+        ),
+        frieren,
+    )
+    assert m_romaji.classification == "episode"
+    assert m_romaji.season_number == 1
+    assert m_romaji.episode_number == 1
+
+    # Season 2 via alias
+    m_s2 = match_release_to_identity(
+        TorrentRelease(
+            release_id="nyaa:2",
+            provider_id="nyaa",
+            provider_name="Nyaa",
+            title="[SubsPlease] Sousou no Frieren 2nd Season - 05 (1080p) [A1B2C3D4].mkv",
+        ),
+        frieren,
+    )
+    assert m_s2.classification == "episode"
+    assert m_s2.season_number == 2
+    assert m_s2.episode_number == 5
+
+    # Absolute episode 30 -> Season 2 Episode 2
+    m_abs = match_release_to_identity(
+        TorrentRelease(
+            release_id="nyaa:3",
+            provider_id="nyaa",
+            provider_name="Nyaa",
+            title="[SubsPlease] Sousou no Frieren - 30 (1080p) [A1B2C3D4].mkv",
+        ),
+        frieren,
+    )
+    assert m_abs.classification == "episode"
+    assert m_abs.season_number == 2
+    assert m_abs.episode_number == 2
+
+    # Remake / reboot year disambiguation: Hunter x Hunter (2011) vs (1999)
+    hxh_2011 = MediaIdentity(
+        canonical_id="anilist:11061",
+        official_title="Hunter x Hunter (2011)",
+        romaji_title="Hunter x Hunter",
+        release_year=2011,
+    )
+    score_1999, _, _ = TitleIdentityMatcher.score_release_against_identity(
+        parse_release_title("[Nippon] Hunter x Hunter (1999) - 01 [480p].mkv"),
+        hxh_2011,
+    )
+    assert score_1999 < TitleIdentityMatcher.MATCH_THRESHOLD
+
+    # Spinoff / Movie rejection
+    score_movie, _, _ = TitleIdentityMatcher.score_release_against_identity(
+        parse_release_title("[Group] Sousou no Frieren Movie - 01 [1080p].mkv"),
+        frieren,
+    )
+    assert score_movie < TitleIdentityMatcher.MATCH_THRESHOLD
+
+
+def test_multi_provider_discovery_deduplication_and_failure_isolation(tmp_path: Path) -> None:
+    from gui_scraper.app import ScraperBridge
+    from gui_scraper.models import MediaIdentity, SourceSearchFilters, TorrentRelease
+    from gui_scraper.providers import (
+        EZTVSourceProvider,
+        MultiProviderDiscoveryEngine,
+        NyaaSourceProvider,
+        SourceProvider,
+        SubsPleaseSourceProvider,
+        deduplicate_releases,
+    )
+
+    # 1. Deduplication across providers merges mirror_providers
+    shared_magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Frieren"
+    r1 = TorrentRelease(
+        release_id="nyaa:1",
+        provider_id="nyaa",
+        provider_name="Nyaa",
+        title="[SubsPlease] Sousou no Frieren - 01 (1080p).mkv",
+        magnet_uri=shared_magnet,
+        info_hash="0123456789abcdef0123456789abcdef01234567",
+        size="1.4 GiB",
+        seeders=400,
+    )
+    r2 = TorrentRelease(
+        release_id="subsplease:1",
+        provider_id="subsplease",
+        provider_name="SubsPlease",
+        title="[SubsPlease] Sousou no Frieren - 01 (1080p).mkv",
+        magnet_uri=shared_magnet.upper(),
+        info_hash="0123456789ABCDEF0123456789ABCDEF01234567",
+        size="1.4 GiB",
+        seeders=520,
+    )
+    deduped = deduplicate_releases([r1, r2])
+    assert len(deduped) == 1
+    assert deduped[0].seeders == 520
+    assert deduped[0].mirror_providers == ["Nyaa", "SubsPlease"]
+
+    # 2. Failure isolation when one provider raises an exception
+    class FailingProvider(SourceProvider):
+        provider_id = "eztv"
+        provider_name = "BrokenEZTV"
+
+        def search(self, query, page=1, filters=None, demo_mode=False, force_refresh=False):
+            raise RuntimeError("Simulated provider outage")
+
+        def get_details(self, release_id: str) -> dict:
+            return {}
+
+        def normalize_result(self, raw: object) -> TorrentRelease:
+            return r1
+
+    engine_mp = MultiProviderDiscoveryEngine(
+        nyaa=NyaaSourceProvider(scraper=ConfigurableTableScraper(mock_delay=0.0)),
+        subsplease=SubsPleaseSourceProvider(),
+        eztv=FailingProvider(),  # type: ignore[arg-type]
+    )
+    identity = MediaIdentity(
+        canonical_id="anilist:154587",
+        official_title="Frieren: Beyond Journey's End",
+        romaji_title="Sousou no Frieren",
+        release_year=2023,
+    )
+    items, status_objs, _, _ = engine_mp.discover_for_show(
+        identity,
+        demo_mode=True,
+        page=1,
+        filters=SourceSearchFilters(category="1_0"),
+    )
+    assert len(items) > 0
+    statuses = {s.provider_id: s for s in status_objs}
+    assert statuses["nyaa"].status == "ok"
+    assert statuses["subsplease"].status == "ok"
+    assert statuses["eztv"].status == "error"
+
+    # 3. ScraperBridge discover_shows and discover_show_sources end-to-end
+    bridge = ScraperBridge(store=LocalMediaStore(tmp_path / "store.json"))
+    shows_resp = bridge.discover_shows("Frieren", mode="mock")
+    assert len(shows_resp["shows"]) >= 1
+    sources_resp = bridge.discover_show_sources(
+        shows_resp["shows"][0],
+        mode="mock",
+        page=1,
+        filters={"category": "1_0"},
+    )
+    assert len(sources_resp["items"]) >= 5
+    assert any("SubsPlease" in s["provider_name"] for s in sources_resp["provider_statuses"])
+
+
+
