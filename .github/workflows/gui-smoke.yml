@@ -59,16 +59,28 @@ jobs:
             await page.goto('http://127.0.0.1:4173', {waitUntil:'domcontentloaded'});
             await page.locator('#cinema-search-input').fill('Frieren');
             await page.locator('#cinema-search-input').press('Enter');
-            await page.getByRole('button',{name:'Poster Cards'}).click();
             await page.locator('button[aria-label^="Open details for"]').first().waitFor({timeout:15000});
-            console.log('TITLE CARDS:',await page.locator('button[aria-label^="Open details for"]').count());
+            const titleCount = await page.locator('button[aria-label^="Open details for"]').count();
+            console.log('TITLE CARDS:',titleCount);
+            if (titleCount !== 1) throw Error('Expected a single grouped anime title, got '+titleCount);
             await page.screenshot({path:'gui-search-before.png',fullPage:true});
             await page.locator('button[aria-label^="Open details for"]').first().click();
-            await page.getByText('Stream Sources',{exact:true}).waitFor({timeout:15000});
-            console.log('EXISTING DETAILS SCREEN TEXT:',(await page.locator('main').innerText()).slice(0,2400));
-            console.log('EPISODE PICKER PRESENT:',await page.getByText('Episodes',{exact:true}).count()>0);
+            await page.getByRole('heading',{name:'Episodes',exact:true}).waitFor({timeout:15000});
+            await page.getByRole('button',{name:'Season 2'}).waitFor({timeout:15000});
+            const season1Episodes=await page.getByRole('button',{name:/^Episode [0-9]+$/}).count();
+            console.log('SEASON 1 EPISODES FOUND:',season1Episodes);
+            await page.getByRole('button',{name:'Episode 1'}).click();
+            await page.getByRole('heading',{name:/Season 1.*Episode 1.*Magnet sources/}).waitFor();
+            const magnets = await page.locator('main code').allInnerTexts();
+            console.log('EPISODE 1 MAGNET URI COUNT:',magnets.filter(x=>x.startsWith('magnet:?')).length);
+            if (magnets.filter(x=>x.startsWith('magnet:?')).length!==2) throw Error('Expected two magnet sources for EP 1');
+            await page.getByRole('button',{name:'Episode 2'}).click();
+            await page.getByRole('heading',{name:/Season 1.*Episode 2.*Magnet sources/}).waitFor();
+            await page.getByRole('button',{name:'Season 2'}).click();
+            await page.getByRole('button',{name:'Episode 1'}).click();
+            await page.getByRole('heading',{name:/Season 2.*Episode 1.*Magnet sources/}).waitFor();
             await page.screenshot({path:'gui-details-before.png',fullPage:true});
-            console.log('GUI SMOKE PASSED: React rendered, search was exercised, title opened');
+            console.log('GUI SMOKE PASSED: search => one show => seasons => episodes => magnet sources; batch card preserved');
           } finally {
             await browser.close();
           }
