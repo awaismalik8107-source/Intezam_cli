@@ -167,7 +167,7 @@ export function MediaDetailsView({
             <p className="flex-1 text-xs text-[#AAB5CA]">More results exist. Load additional pages to discover other episodes and seasons.</p>
             <button type="button" disabled={loadingEpisodes} onClick={onLoadMoreEpisodes} className="rounded-lg border border-[#786BFF]/35 px-3 py-2 text-xs font-semibold text-[#DAD6FF] hover:bg-[#786BFF]/20 disabled:opacity-50">Load more episodes</button>
           </div>
-        )
+        )}
         {catalog.seasons.length > 0 && (
           <div role="group" aria-label="Choose season" className="flex flex-wrap gap-2">
             {catalog.seasons.map((value) => (
