@@ -59,8 +59,8 @@ remains payload-free and writes no files. `--metadata-only` exits after selectio
 For normal playback, bounded header prefetch begins while the selection menu is
 open, using the largest video that fits the chosen budget. This prepares at most
 four distinct pieces, limited to 8 MiB unless one whole piece is larger. Choosing
-that candidate reuses its source, connections and verified cache; choosing another
-video cancels and removes the speculative cache first. A video is never selected
+that candidate reuses its source and verified cache, retaining connections where
+peers allow; choosing another video removes the speculative cache first. A video is never selected
 or played automatically. `q`, EOF and Ctrl+C cancel preparation and clean up.
 `--metadata-only` and `--simulate` do not enable this speculative step.
 
@@ -92,7 +92,8 @@ and startup buffer load. It embeds LibVLC video directly and provides play/pause
 stop, ±10 seconds, a seek-on-release timeline, volume/mute, fullscreen, elapsed
 time and duration. The loading view shows the current stage, elapsed time and
 estimated startup-buffer progress until the first decoded frame. Technical
-network and cache metrics appear in the CLI. Stop or close cancels reads and removes the session cache; the UI
+network and cache metrics appear in the CLI. Stop or close cancels reads and
+removes the session cache; the UI
 stays responsive during preparation and shutdown.
 
 Keyboard shortcuts: **Space** play/pause, **Left/Right** ±10 seconds, **M** mute,
