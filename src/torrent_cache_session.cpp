@@ -287,7 +287,10 @@ void TorrentCacheSession::schedule()
 TorrentCacheSession::AdmissionPlan TorrentCacheSession::planAdmissions()
 {
     const auto urgent = urgentPieces();
-    const auto window = controller_.planWindow(urgent);
+    planned_startup_indexes_ = header_read_mode_ ? std::vector<int>{} : startupIndexPieces(urgent);
+    auto constraints = urgent;
+    constraints.insert(constraints.end(), planned_startup_indexes_.begin(), planned_startup_indexes_.end());
+    const auto window = controller_.planWindow(constraints);
     planned_window_ = window;
     if (header_read_mode_) {
         auto headers = window;
@@ -296,19 +299,25 @@ TorrentCacheSession::AdmissionPlan TorrentCacheSession::planAdmissions()
         return {headers, urgent, {}, urgent};
     }
     auto desired = window.pieces;
-    for (int piece : urgent) {
+    for (int piece : constraints) {
         if (std::find(desired.begin(), desired.end(), piece) == desired.end()) desired.push_back(piece);
     }
     const int current = static_cast<int>((geometry_.video_offset + controller_.playbackPosition()) / geometry_.piece_length);
     // Admit playback first, then forward prefetch, then backward retention.
-    std::stable_sort(desired.begin(), desired.end(), [current, &urgent](int left, int right) {
-        const auto rank = [current, &urgent](int piece) {
-            if (std::find(urgent.begin(), urgent.end(), piece) != urgent.end()) return std::int64_t{-1};
-            return piece >= current ? std::int64_t{piece - current} : std::int64_t{current - piece} + 1000000000;
+    std::stable_sort(desired.begin(), desired.end(), [this, current, &urgent](int left, int right) {
+        const auto rank = [this, current, &urgent](int piece) -> std::pair<int, std::int64_t> {
+            if (std::find(urgent.begin(), urgent.end(), piece) != urgent.end()) return {0, piece};
+            const auto offset = std::int64_t{piece} * geometry_.piece_length - geometry_.video_offset;
+            if (startup_prefix_bytes_ > 0 && offset < startup_prefix_bytes_) return {1, piece};
+            if (std::find(planned_startup_indexes_.begin(), planned_startup_indexes_.end(), piece)
+                != planned_startup_indexes_.end()) return {2, piece};
+            return piece >= current ? std::pair<int, std::int64_t>{3, piece - current}
+                : std::pair<int, std::int64_t>{4, current - piece};
         };
         return rank(left) < rank(right);
     });
     AdmissionPlan plan{window, urgent, {}, desired};
+    plan.required.insert(plan.required.end(), planned_startup_indexes_.begin(), planned_startup_indexes_.end());
     for (int piece : currentPieces()) {
         if (std::find(plan.required.begin(), plan.required.end(), piece) == plan.required.end()) plan.required.push_back(piece);
     }
@@ -347,6 +356,7 @@ void TorrentCacheSession::applyPriorities(const AdmissionPlan& plan)
         [&](const auto& entry) { return store_->isVerified(entry.first); });
     if (!retime_deadlines_ && !completed_deadlines && buffer_low == scheduled_buffer_low_
         && admitted == scheduled_ && urgent == scheduled_urgent_ && rate == scheduled_rate_
+        && startup_prefix_bytes_ == scheduled_startup_prefix_ && planned_startup_indexes_ == scheduled_startup_indexes_
         && std::abs(position - scheduled_position_) < geometry_.piece_length / 2) return;
     const auto now = Clock::now();
     std::map<int, lt::download_priority_t> priorities;
@@ -357,13 +367,27 @@ void TorrentCacheSession::applyPriorities(const AdmissionPlan& plan)
         const bool needed = !verified && std::find(urgent.begin(), urgent.end(), piece) != urgent.end();
         const bool forward = offset + geometry_.piece_length > position;
         const double seconds_ahead = forward ? std::max(0.0, double(offset - position) / rate) : -1;
-        const int priority = playbackPiecePriority(needed, seconds_ahead, verified,
-            adaptive_budget_ ? adaptive_target_.low_seconds : 2, buffer_low);
+        const bool startup_prefix = startup_prefix_bytes_ > 0 && offset < startup_prefix_bytes_;
+        const auto index = std::find(planned_startup_indexes_.begin(), planned_startup_indexes_.end(), piece);
+        const bool startup_index = index != planned_startup_indexes_.end();
+        const int priority = !verified && (startup_prefix || startup_index) ? 7
+            : playbackPiecePriority(needed, seconds_ahead, verified,
+                adaptive_budget_ ? adaptive_target_.low_seconds : 2, buffer_low);
         priorities[piece] = lt::download_priority_t{static_cast<std::uint8_t>(priority)};
-        // Libtorrent promotes deadline pieces internally. Limit that set to
-        // current/imminent playback; distant pieces retain priorities 6/4/1.
+        // Deadlines cover imminent playback and the bounded startup work.
+        // Other lookahead retains its ordinary priority.
         if (!verified && priority == 7) {
-            const auto milliseconds = needed ? 0 : pieceDeadlineMilliseconds(offset - position, rate);
+            auto milliseconds = needed ? 0 : pieceDeadlineMilliseconds(offset - position, rate);
+            if (!needed && (startup_prefix || startup_index)) {
+                const auto first = geometry_.video_offset / geometry_.piece_length;
+                const auto prefix_pieces = (geometry_.video_offset % geometry_.piece_length + startup_prefix_bytes_ - 1)
+                    / geometry_.piece_length + 1;
+                const auto order = startup_index && !startup_prefix
+                    ? prefix_pieces + std::distance(planned_startup_indexes_.begin(), index) : piece - first;
+                // Startup has no advancing playback clock: the whole runway is
+                // needed now. A short stagger keeps prefix holes ahead of indexes.
+                milliseconds = static_cast<int>(std::min<std::int64_t>(order * 100, 60000));
+            }
             const auto proposed = now + std::chrono::milliseconds{milliseconds};
             deadlines[piece] = proposed;
         }
@@ -375,6 +399,8 @@ void TorrentCacheSession::applyPriorities(const AdmissionPlan& plan)
     scheduled_rate_ = rate;
     scheduled_position_ = position;
     scheduled_buffer_low_ = buffer_low;
+    scheduled_startup_prefix_ = startup_prefix_bytes_;
+    scheduled_startup_indexes_ = planned_startup_indexes_;
     retime_deadlines_ = false;
 }
 
@@ -442,6 +468,38 @@ std::vector<int> TorrentCacheSession::currentPieces() const
 {
     const auto begin = controller_.playbackPosition() / controller_.segmentSize() * controller_.segmentSize();
     return geometry_.piecesForRange(begin, std::min(controller_.segmentSize(), geometry_.video_size - begin));
+}
+
+std::vector<int> TorrentCacheSession::startupIndexPieces(const std::vector<int>& urgent) const
+{
+    if (startup_prefix_bytes_ == 0 || startup_index_candidates_.empty()) return {};
+    auto required = geometry_.piecesForRange(0, startup_prefix_bytes_);
+    const auto current = currentPieces();
+    required.insert(required.end(), current.begin(), current.end());
+    required.insert(required.end(), urgent.begin(), urgent.end());
+    std::set<int> protected_pieces(required.begin(), required.end());
+    const auto inventory = store_->inventory();
+    const auto logical_slots = adaptive_budget_ ? std::min(inventory.total, adaptive_target_.desired_slots) : inventory.total;
+    const auto window_slots = logical_slots > inventory.reserved_target ? logical_slots - inventory.reserved_target : 1;
+    auto free_slots = inventory.free;
+    for (const int piece : protected_pieces) {
+        if (!store_->contains(piece)) {
+            if (free_slots == 0) return {};
+            --free_slots;
+        }
+    }
+    std::vector<int> indexes;
+    for (const int piece : startup_index_candidates_) {
+        if (protected_pieces.count(piece)) continue;
+        if (protected_pieces.size() >= window_slots) break;
+        if (!store_->contains(piece)) {
+            if (free_slots == 0) continue;
+            --free_slots;
+        }
+        protected_pieces.insert(piece);
+        indexes.push_back(piece);
+    }
+    return indexes;
 }
 
 void TorrentCacheSession::checkCancelled() const
@@ -608,6 +666,30 @@ void TorrentCacheSession::setProtectedMetadata(const std::vector<VideoRange>& ra
     adaptCache();
     // Protection is authoritative even before cooldown permits capacity growth.
     // Required metadata borrows staging slots; fail clearly if still impossible.
+    schedule();
+}
+
+void TorrentCacheSession::setStartupReadAhead(std::int64_t prefix_bytes, const std::vector<VideoRange>& index_ranges)
+{
+    if (prefix_bytes < 0 || prefix_bytes > geometry_.video_size) throw std::out_of_range("Startup prefix range");
+    const auto limit = static_cast<std::size_t>(std::max(1, std::min(4, 8 * 1024 * 1024 / geometry_.piece_length)));
+    std::vector<int> candidates;
+    if (prefix_bytes > 0) {
+        for (const auto& range : index_ranges) {
+            if (range.offset < 0 || range.offset >= geometry_.video_size || range.length <= 0) continue;
+            const auto length = std::min(range.length, geometry_.video_size - range.offset);
+            const int first = static_cast<int>((geometry_.video_offset + range.offset) / geometry_.piece_length);
+            const int last = static_cast<int>((geometry_.video_offset + range.offset + length - 1) / geometry_.piece_length);
+            for (int piece = first; piece <= last && candidates.size() < limit; ++piece) {
+                if (std::find(candidates.begin(), candidates.end(), piece) == candidates.end()) candidates.push_back(piece);
+            }
+            if (candidates.size() == limit) break;
+        }
+    }
+    std::lock_guard<std::mutex> control(control_mutex_);
+    if (prefix_bytes == startup_prefix_bytes_ && candidates == startup_index_candidates_) return;
+    startup_prefix_bytes_ = prefix_bytes;
+    startup_index_candidates_ = std::move(candidates);
     schedule();
 }
 

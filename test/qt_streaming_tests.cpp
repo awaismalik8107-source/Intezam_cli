@@ -138,6 +138,22 @@ void cancelsWhilePreparing(const std::filesystem::path& media)
     controller.stopAndWait(); // Idempotent final teardown after the event loop exits.
     require(controller.snapshot().finished, "final teardown leaves worker joined and stopped");
 }
+void rejectsInvalidPlayerOptionsBeforeWaitingForHeaders(const std::filesystem::path& media)
+{
+    test_support::LocalVideoTorrent torrent(media);
+    torrent.seed.pause();
+    intezam::PlaybackOptions options;
+    options.cache = torrent.options();
+    options.vlc.headless = true;
+    options.vlc.caching_milliseconds = -1;
+    intezam::PlaybackController controller(options);
+    controller.start(torrent.magnet(), torrent.metadata(), torrent.video());
+    waitFor([&] { return controller.snapshot().finished; },
+        "invalid player options must fail before waiting for unavailable headers", 2000);
+    require(controller.snapshot().player.error.find("VLC input caching") != std::string::npos,
+        "report the player initialization error rather than a network timeout");
+    require(std::filesystem::is_empty(options.cache.root), "failed player initialization cleans up its cache");
+}
 }
 int main(int argc, char** argv)
 {
@@ -147,6 +163,7 @@ int main(int argc, char** argv)
     app.setQuitOnLastWindowClosed(false);
     try {
         require(argc >= 2, "media fixture required");
+        rejectsInvalidPlayerOptionsBeforeWaitingForHeaders(argv[1]);
         playsAndCloses(argv[1], native);
         cancelsWhilePreparing(argv[1]);
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

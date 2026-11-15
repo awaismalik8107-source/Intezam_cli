@@ -67,7 +67,7 @@ std::size_t TorrentVideoSource::readVerified(std::int64_t offset, void* buffer, 
         const auto end = std::min(video_size_, offset + until_boundary);
         accountProbeRange(begin, static_cast<std::size_t>(end - begin));
     }
-    if (purpose == ReadPurpose::playback && !container_.isMetadata(offset)) playback_offset_ = offset;
+    if (purpose == ReadPurpose::playback && !preserve_startup_window_ && !container_.isMetadata(offset)) playback_offset_ = offset;
     auto request = std::make_shared<PendingRead>(PendingRead{{offset, static_cast<std::int64_t>(length)}, epoch});
     pending_.push_back(request);
     read_signal_->changed.notify_all();
@@ -157,6 +157,9 @@ void TorrentVideoSource::run()
             std::int64_t offset;
             double rate;
             PlaybackMovement movement;
+            bool headers_ready;
+            std::int64_t startup_bytes;
+            std::vector<VideoRange> startup_indexes;
             {
                 std::lock_guard<std::mutex> lock(read_signal_->mutex);
                 if (!pending_.empty() && pending_.front()->epoch == epoch_) demand = pending_.front()->range;
@@ -164,7 +167,17 @@ void TorrentVideoSource::run()
                 rate = requested_rate_;
                 movement = seek_requested_ ? PlaybackMovement::seek : PlaybackMovement::sequential;
                 seek_requested_ = false;
+                headers_ready = headers_ready_;
+                startup_bytes = preserve_startup_window_ && headers_ready
+                    ? startupBufferTargetBytesLocked() : 0;
+                if (startup_bytes > 0) startup_indexes = container_.startup_ranges;
             }
+            // Tell the scheduler about the whole startup requirement rather
+            // than discovering each missing piece through serial small reads.
+            cache_->setStartupReadAhead(startup_bytes, startup_indexes);
+            // Admit the known index before ordinary lookahead consumes the
+            // free slots. Both transitions run on this single control worker.
+            if (headers_ready) cache_->setHeaderReadMode(false);
             if (movement == PlaybackMovement::seek || applied_offset != offset || applied_demand != demand) {
                 cache_->updateReadRequest(offset, demand, movement);
                 applied_offset = offset;
@@ -227,7 +240,12 @@ void TorrentVideoSource::seekToByte(std::int64_t offset, PlaybackMovement moveme
         checkReadState(epoch_);
         ++epoch_;
         pending_.clear();
-        if (offset < video_size_ && (movement == PlaybackMovement::seek || !container_.isMetadata(offset))) {
+        if (movement == PlaybackMovement::seek) preserve_startup_window_ = false;
+        // Before decoding starts, demuxers may inspect an index near EOF and
+        // return to the opening frames. Serve that demand without evicting the
+        // startup runway or scheduling a rolling download window at the index.
+        if (offset < video_size_ && (movement == PlaybackMovement::seek
+            || (!preserve_startup_window_ && !container_.isMetadata(offset)))) {
             playback_offset_ = offset;
             if (movement == PlaybackMovement::seek || reposition_next_demux_seek_) {
                 seek_requested_ = true;
@@ -252,7 +270,11 @@ void TorrentVideoSource::finishHeaderPreparation(ContainerInfo container, double
     // Apply the rate before enabling rolling downloads, so they start with the
     // header-derived horizon rather than the old provisional byte rate.
     cache_->setPlaybackRate(bytes_per_second);
-    cache_->setHeaderReadMode(false);
+    {
+        std::lock_guard<std::mutex> lock(read_signal_->mutex);
+        headers_ready_ = true;
+    }
+    read_signal_->changed.notify_all();
 }
 
 void TorrentVideoSource::beginPlaybackEpoch()
@@ -268,6 +290,8 @@ void TorrentVideoSource::markPlaybackActive()
 {
     std::lock_guard<std::mutex> lock(read_signal_->mutex);
     probing_ = false;
+    preserve_startup_window_ = false;
+    reposition_next_demux_seek_ = false;
 }
 
 void TorrentVideoSource::observePlayback(bool decoded_frame, bool buffering)
@@ -288,6 +312,7 @@ void TorrentVideoSource::observePlayback(bool decoded_frame, bool buffering)
 void TorrentVideoSource::beginUserSeek()
 {
     std::lock_guard<std::mutex> lock(read_signal_->mutex);
+    preserve_startup_window_ = false;
     user_seek_started_ = Clock::now();
 }
 
@@ -347,11 +372,16 @@ VideoSourceStatus TorrentVideoSource::status() const
     status.stopped = stopping_.load();
     status.buffer_targets = bufferTargetsLocked();
     status.estimated_playback_bytes_per_second = requested_rate_;
-    const auto seconds = status.cache.adaptive_budget ? status.cache.adaptive_target.startup_seconds
-        : status.buffer_targets.high_seconds;
-    status.startup_buffer_target_bytes = std::min<std::int64_t>({video_size_, capacity_.load() / 3,
-        std::max<std::int64_t>(16384, static_cast<std::int64_t>(requested_rate_ * seconds))});
+    status.startup_buffer_target_bytes = startupBufferTargetBytesLocked();
     return status;
+}
+
+std::int64_t TorrentVideoSource::startupBufferTargetBytesLocked() const
+{
+    const auto seconds = status_.cache.adaptive_budget ? status_.cache.adaptive_target.startup_seconds
+        : bufferTargetsLocked().high_seconds;
+    return std::min<std::int64_t>({video_size_, capacity_.load() / 3,
+        std::max<std::int64_t>(16384, static_cast<std::int64_t>(requested_rate_ * seconds))});
 }
 
 void TorrentVideoSource::stop()

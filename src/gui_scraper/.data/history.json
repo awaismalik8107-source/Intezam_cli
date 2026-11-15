@@ -1,32 +1,122 @@
 [
   {
-    "query": "Overgeared",
-    "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T21:20:58.465610+00:00"
+    "query": "attack on titan",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T14:55:09.574891+00:00"
   },
   {
-    "query": "Steins",
-    "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T21:20:51.051186+00:00"
+    "query": "Demon Slayer",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T11:19:53.535221+00:00"
   },
   {
     "query": "Demon Slayer",
     "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T21:20:30.642883+00:00"
+    "result_count": 0,
+    "searched_at": "2026-11-15T11:19:47.622306+00:00"
   },
   {
-    "query": "Demon",
-    "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T21:20:24.879451+00:00"
+    "query": "Breaking Bad",
+    "mode": "live",
+    "result_count": 6,
+    "searched_at": "2026-11-15T11:00:22.129097+00:00"
   },
   {
-    "query": "Frieren",
-    "mode": "mock",
-    "result_count": 1,
-    "searched_at": "2026-11-14T20:16:04.204152+00:00"
+    "query": "NonexistentShowXYZ123",
+    "mode": "live",
+    "result_count": 0,
+    "searched_at": "2026-11-15T10:59:43.889949+00:00"
+  },
+  {
+    "query": "IT",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:42.359785+00:00"
+  },
+  {
+    "query": "You",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:40.774333+00:00"
+  },
+  {
+    "query": "Dark",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:39.190847+00:00"
+  },
+  {
+    "query": "The Office UK",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:37.642719+00:00"
+  },
+  {
+    "query": "The Office 2005",
+    "mode": "live",
+    "result_count": 7,
+    "searched_at": "2026-11-15T10:59:35.956824+00:00"
+  },
+  {
+    "query": "Solo Leveling",
+    "mode": "live",
+    "result_count": 7,
+    "searched_at": "2026-11-15T10:59:32.115381+00:00"
+  },
+  {
+    "query": "Delicious in Dungeon",
+    "mode": "live",
+    "result_count": 4,
+    "searched_at": "2026-11-15T10:59:29.964025+00:00"
+  },
+  {
+    "query": "Bleach",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:27.763068+00:00"
+  },
+  {
+    "query": "Naruto",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:25.890663+00:00"
+  },
+  {
+    "query": "One Piece",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:23.757190+00:00"
+  },
+  {
+    "query": "Kimi no Na wa",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:22.000148+00:00"
+  },
+  {
+    "query": "Your Name",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:19.692208+00:00"
+  },
+  {
+    "query": "Dan Da Dan",
+    "mode": "live",
+    "result_count": 8,
+    "searched_at": "2026-11-15T10:59:18.101497+00:00"
+  },
+  {
+    "query": "Dandadan",
+    "mode": "live",
+    "result_count": 3,
+    "searched_at": "2026-11-15T10:59:16.037079+00:00"
+  },
+  {
+    "query": "Sousou no Frieren",
+    "mode": "live",
+    "result_count": 3,
+    "searched_at": "2026-11-15T10:59:14.246331+00:00"
   }
 ]

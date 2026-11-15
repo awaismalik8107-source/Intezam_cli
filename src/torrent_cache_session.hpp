@@ -86,6 +86,9 @@ public:
     void setPlaybackPosition(std::int64_t byte_offset);
     void setPlaybackRate(double bytes_per_second);
     void setHeaderReadMode(bool enabled);
+    // Temporary ordered deadlines for the opening runway and bounded index hints.
+    // A zero prefix restores ordinary playback scheduling.
+    void setStartupReadAhead(std::int64_t prefix_bytes, const std::vector<VideoRange>& index_ranges = {});
     void setProtectedMetadata(const std::vector<VideoRange>& ranges);
     void updateReadRequest(std::int64_t playback_offset, std::optional<VideoRange> demand,
                            PlaybackMovement movement = PlaybackMovement::sequential);
@@ -120,6 +123,7 @@ private:
     void updatePosition(std::int64_t byte_offset);
     std::vector<int> urgentPieces() const;
     std::vector<int> currentPieces() const;
+    std::vector<int> startupIndexPieces(const std::vector<int>& urgent) const;
     void checkCancelled() const;
     double forwardBufferSeconds() const;
     libtorrent::add_torrent_params safeParams(libtorrent::add_torrent_params params);
@@ -166,6 +170,11 @@ private:
     std::string capacity_constraint_;
     bool header_read_mode_ = false;
     std::vector<int> metadata_pieces_;
+    std::int64_t startup_prefix_bytes_ = 0;
+    std::vector<int> startup_index_candidates_;
+    std::vector<int> planned_startup_indexes_;
+    std::int64_t scheduled_startup_prefix_ = 0;
+    std::vector<int> scheduled_startup_indexes_;
 };
 
 } // namespace intezam

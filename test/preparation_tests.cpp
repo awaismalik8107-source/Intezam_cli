@@ -42,10 +42,74 @@ void waitFor(Predicate ready, const char* message)
     }
 }
 
+void preservesStartupRunwayDuringDemuxIndexReads(const std::filesystem::path& media)
+{
+    test_support::LocalVideoTorrent torrent(media);
+    auto source = torrent.source();
+    source->setContainer(intezam::probeContainer(*source));
+    source->prebuffer();
+    const auto prefix_bytes = source->status().startup_buffer_target_bytes;
+    source->beginPlaybackEpoch();
+    const auto index_offset = source->size() - 4096;
+    source->seekForDemux(index_offset);
+    std::vector<unsigned char> bytes(4096);
+    require(source->read(index_offset, bytes.data(), bytes.size()) > 0, "startup index bytes are delivered");
+    const auto after_index = source->status();
+    require(after_index.cache.playback_position == 0,
+        "a startup index scan must not move the rolling playback window to the end of the movie");
+    require(after_index.cache.forward_buffer_seconds * after_index.cache.playback_bytes_per_second >= prefix_bytes - 16384,
+        "startup index reads retain the verified opening runway");
+    const int opening_piece = static_cast<int>(torrent.video().torrent_offset / 16384);
+    const auto opening_requests = torrent.counts.count(opening_piece);
+    source->seekForDemux(0);
+    require(source->read(0, bytes.data(), bytes.size()) > 0 && torrent.counts.count(opening_piece) == opening_requests,
+        "returning from the startup index uses the already verified opening data");
+    source->markPlaybackActive();
+    source->beginUserSeek();
+    source->beginPlaybackEpoch();
+    const auto target = source->size() / 2;
+    source->seekForDemux(target);
+    require(source->read(target, bytes.data(), bytes.size()) > 0, "user seek still delivers the requested data");
+    waitFor([&] { return source->status().cache.playback_position == target; },
+        "an explicit user seek must still move the playback window");
+    source->stop();
+}
+
+void fetchesKnownIndexWhilePreparingStartup(const std::filesystem::path& media)
+{
+    test_support::LocalVideoTorrent torrent(media);
+    auto options = torrent.options();
+    options.header_read_mode = true;
+    auto source = torrent.source(options);
+    auto container = intezam::probeContainer(*source);
+    const auto index_offset = source->size() - 4096;
+    container.startup_ranges.push_back({index_offset, 4096});
+    const int index_piece = static_cast<int>((torrent.video().torrent_offset + index_offset) / 16384);
+    require(torrent.counts.count(index_piece) == 0, "header probing does not fetch speculative distant indexes");
+    source->finishHeaderPreparation(container, options.playback_bytes_per_second);
+    source->prebuffer();
+    waitFor([&] { return torrent.counts.count(index_piece) > 0; },
+        "the known index is prefetched before VLC asks for it");
+    const auto opening_requests = torrent.counts.count(static_cast<int>(torrent.video().torrent_offset / 16384));
+    source->beginPlaybackEpoch();
+    source->seekForDemux(index_offset);
+    std::vector<unsigned char> bytes(4096);
+    require(source->read(index_offset, bytes.data(), bytes.size()) > 0, "prefetched index remains readable");
+    source->seekForDemux(0);
+    require(source->read(0, bytes.data(), bytes.size()) > 0, "opening data remains available after index prefetch");
+    require(torrent.counts.count(static_cast<int>(torrent.video().torrent_offset / 16384)) == opening_requests,
+        "index prefetch retains the verified opening piece");
+    require(source->status().cache.allocated_bytes <= source->status().cache.budget_bytes,
+        "index prefetch respects the existing cache budget");
+    source->stop();
+}
+
 int main(int argc, char** argv)
 {
     try {
         require(argc == 2, "media fixture required");
+        fetchesKnownIndexWhilePreparingStartup(argv[1]);
+        preservesStartupRunwayDuringDemuxIndexReads(argv[1]);
         test_support::LocalVideoTorrent torrent(argv[1]);
         std::filesystem::path directory;
         {

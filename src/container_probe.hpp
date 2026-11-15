@@ -16,6 +16,8 @@ struct ContainerInfo {
     std::vector<VideoRange> metadata_ranges;
     bool moov_at_end = false;
     std::optional<double> duration_seconds;
+    // Optional bounded index read-ahead hints; these are not permanent metadata pins.
+    std::vector<VideoRange> startup_ranges;
     bool isMetadata(std::int64_t offset) const;
 };
 

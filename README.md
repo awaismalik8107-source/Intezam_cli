@@ -72,6 +72,15 @@ retain the 1 MiB/s fallback; `--bitrate` overrides this startup estimate. VLC ca
 refine the rate once its own duration is available. Buffer safety thresholds,
 verification and disk limits remain in effect.
 
+After selection, the downloader gives all pieces needed for the startup buffer
+ordered, time-critical requests before distant lookahead. For Matroska/WebM, a
+bounded opening-header scan can identify the Cues index and prefetch its first
+128 KiB while the buffer fills. Index prefetch uses available cache space, is
+limited to four pieces (8 MiB, or one larger piece), and ends when playback starts
+or a user seeks. The native window also initializes VLC while headers download.
+The loading view remains visible until the first decoded frame; startup buffer
+safety and the configured disk limit still apply.
+
 The default **Adaptive Streaming Engine 2.0** sizes the cache from estimated
 consumption, useful verified throughput, network variability and forward-buffer
 requirements. It starts with a 24-second forward horizon, at least four aligned

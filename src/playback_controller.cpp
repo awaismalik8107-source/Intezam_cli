@@ -101,6 +101,9 @@ void PlaybackController::run(const std::string& magnet, std::shared_ptr<const li
             : std::make_shared<TorrentVideoSource>(magnet, std::move(metadata), video, cache_options);
         { std::lock_guard<std::mutex> lock(mutex_); source_ = source; }
         if (stopping_) { source->cancelPendingReads(); throw ReadCancelled{}; }
+        // Initialize LibVLC while the source's network worker downloads headers.
+        // Playback still waits for its startup buffer.
+        VlcPlayer player(source, options_.vlc);
         setStartupStage(StartupStage::reading_container, "Reading video headers");
         const auto cached_headers = options_.preparation ? options_.preparation->waitForHeaders() : std::optional<ContainerInfo>{};
         const auto container = cached_headers ? *cached_headers : probeContainer(*source);
@@ -112,7 +115,6 @@ void PlaybackController::run(const std::string& magnet, std::shared_ptr<const li
         source->prebuffer();
         if (stopping_) throw ReadCancelled{};
         setStartupStage(StartupStage::opening_video, "Opening video");
-        VlcPlayer player(source, options_.vlc);
         player.play();
         const auto started = std::chrono::steady_clock::now();
         bool decoded = false;

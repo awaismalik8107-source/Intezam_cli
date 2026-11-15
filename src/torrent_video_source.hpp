@@ -73,6 +73,7 @@ private:
     std::size_t readVerified(std::int64_t offset, void* buffer, std::size_t length, ReadPurpose purpose);
     void run();
     BufferWatermarks bufferTargetsLocked() const;
+    std::int64_t startupBufferTargetBytesLocked() const;
     void checkReadState(std::uint64_t epoch) const;
     void accountProbeRange(std::int64_t offset, std::size_t length);
     void seekToByte(std::int64_t offset, PlaybackMovement movement);
@@ -92,6 +93,8 @@ private:
     std::uint64_t probe_bytes_ = 0;
     std::map<std::int64_t, std::int64_t> probe_ranges_;
     bool probing_ = true;
+    bool preserve_startup_window_ = true;
+    bool headers_ready_ = false;
     bool suspended_ = false;
     std::int64_t playback_offset_ = 0;
     bool seek_requested_ = false;

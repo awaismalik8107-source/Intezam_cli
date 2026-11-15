@@ -23,6 +23,7 @@ public:
         auto* bytes = static_cast<unsigned char*>(buffer);
         for (std::size_t index = 0; index < length; ++index) bytes[index] = fragments[offset + index];
         delivered += length;
+        maximum_read_end = std::max(maximum_read_end, offset + static_cast<std::int64_t>(length));
         return length;
     }
     void put(std::int64_t offset, const std::vector<unsigned char>& bytes)
@@ -33,6 +34,7 @@ public:
     void stop() override {}
     std::map<std::int64_t, unsigned char> fragments;
     std::size_t delivered = 0;
+    std::int64_t maximum_read_end = 0;
 private:
     std::int64_t length_;
 };
@@ -44,11 +46,132 @@ std::vector<unsigned char> atom(std::uint32_t size, const char* type)
             static_cast<unsigned char>(type[0]), static_cast<unsigned char>(type[1]),
             static_cast<unsigned char>(type[2]), static_cast<unsigned char>(type[3])};
 }
+
+using Bytes = std::vector<unsigned char>;
+
+Bytes ebmlElement(Bytes id, const Bytes& body)
+{
+    require(body.size() < 127, "small EBML fixture element");
+    id.push_back(static_cast<unsigned char>(0x80 | body.size()));
+    id.insert(id.end(), body.begin(), body.end());
+    return id;
+}
+
+void append(Bytes& bytes, const Bytes& suffix)
+{ bytes.insert(bytes.end(), suffix.begin(), suffix.end()); }
+
+Bytes cuesSeek(Bytes position, Bytes id = {0x1c, 0x53, 0xbb, 0x6b})
+{
+    auto entry = ebmlElement({0x53, 0xab}, id);
+    append(entry, ebmlElement({0x53, 0xac}, position));
+    return ebmlElement({0x4d, 0xbb}, entry);
+}
+
+Bytes indexedSegment(const Bytes& seek_entries, bool info_first = false)
+{
+    Bytes bytes{0x1a,0x45,0xdf,0xa3,0x87,0x42,0x82,0x84,'w','e','b','m',
+        0x18,0x53,0x80,0x67,0xff}; // Segment body begins at byte 17.
+    const auto info = ebmlElement({0x15,0x49,0xa9,0x66}, {0x44,0x89,0x84,0x47,0xea,0x60,0x00});
+    if (info_first) append(bytes, info);
+    append(bytes, ebmlElement({0x11,0x4d,0x9b,0x74}, seek_entries));
+    if (!info_first) append(bytes, info);
+    append(bytes, {0x1f,0x43,0xb6,0x75,0xff});
+    return bytes;
+}
+
+void findsCuesWithoutReadingDistantIndexes()
+{
+    for (const bool info_first : {false, true}) {
+        SparseSource source(64 * 1024 * 1024);
+        auto entries = cuesSeek({0x01, 0x00, 0x00});
+        append(entries, cuesSeek({0x02, 0x00, 0x00}));
+        source.put(0, indexedSegment(entries, info_first));
+        const auto info = intezam::probeContainer(source);
+        require(info.startup_ranges.size() == 1, "discover one bounded Cues hint from SeekHead");
+        require(info.startup_ranges.front().offset == 17 + 65536,
+            "SeekPosition is relative to the Segment body, not the file");
+        require(info.startup_ranges.front().length == 128 * 1024, "Cues read-ahead is bounded");
+        require(info.duration_seconds && *info.duration_seconds == 120,
+            "index discovery preserves duration before or after SeekHead");
+        require(source.maximum_read_end <= 4096 && source.delivered < 8192,
+            "index discovery reads only front headers and never follows the distant hint");
+        require(!info.isMetadata(17 + 65536), "startup hints are separate from permanent metadata ranges");
+    }
+    SparseSource near_end(100000);
+    near_end.put(0, indexedSegment(cuesSeek({0x01,0x86,0x70}))); // 99952 relative bytes
+    const auto hint = intezam::probeContainer(near_end).startup_ranges;
+    require(hint.size() == 1 && hint.front().offset == 99969 && hint.front().length == 31,
+        "a Cues hint near EOF is clipped to the remaining file");
+}
+
+void ignoresInvalidIndexHints()
+{
+    const std::vector<Bytes> invalid{
+        cuesSeek({}), cuesSeek(Bytes(9, 1)), cuesSeek(Bytes(8, 255)),
+        cuesSeek({0x01,0x86,0xa0}), // Outside the file/Segment.
+        cuesSeek({0x00}, {0x00,0x1c,0x53,0xbb,0x6b}), // Invalid five-byte ID.
+        cuesSeek({0x00}, {0x1c,0x53,0xbb}), // Truncated Cues ID.
+        {0x4d,0xbb,0xff}, // Unknown-sized Seek entry.
+        {0x4d,0xbb,0x88,0x53,0xac,0x81,0x00} // Truncated child bounds.
+    };
+    for (const auto& entries : invalid) {
+        SparseSource source(100000);
+        source.put(0, indexedSegment(entries));
+        const auto info = intezam::probeContainer(source);
+        require(info.startup_ranges.empty(), "invalid or out-of-range index pointers are ignored");
+        require(info.duration_seconds && *info.duration_seconds == 120,
+            "malformed optional Seek entries do not discard valid duration metadata");
+        require(source.maximum_read_end <= 4096, "malformed Seek entries never trigger tail reads");
+    }
+    SparseSource finite_segment(100000);
+    auto bytes = indexedSegment(cuesSeek({0x00,0x10,0x00}));
+    bytes[16] = 0xfe; // Known Segment length 126; pointer is inside file but outside Segment.
+    finite_segment.put(0, bytes);
+    require(intezam::probeContainer(finite_segment).startup_ranges.empty(),
+        "index pointers must remain inside a known-length Segment");
+}
+
+void boundsSeekHeadDiscoveryToTheOpeningHeaders()
+{
+    SparseSource linked(1024 * 1024);
+    linked.put(0, indexedSegment(cuesSeek({0x02,0x00,0x00}, {0x11,0x4d,0x9b,0x74})));
+    linked.put(17 + 131072, ebmlElement({0x11,0x4d,0x9b,0x74}, cuesSeek({0x03,0x00,0x00})));
+    require(intezam::probeContainer(linked).startup_ranges.empty() && linked.maximum_read_end <= 4096,
+        "a linked SeekHead is never followed to a distant piece");
+
+    SparseSource distant(1024 * 1024);
+    auto prefix = indexedSegment({});
+    prefix.resize(17);
+    append(prefix, {0xec,0x21,0x00,0x00}); // Void body 65536 bytes, skipped by size.
+    distant.put(0, prefix);
+    distant.put(17 + 4 + 65536, ebmlElement({0x11,0x4d,0x9b,0x74}, cuesSeek({0x03,0x00,0x00})));
+    require(intezam::probeContainer(distant).startup_ranges.empty() && distant.maximum_read_end <= 4096,
+        "the header scan stops at its 64 KiB prefix bound");
+
+    SparseSource oversized(1024 * 1024);
+    prefix.resize(17);
+    append(prefix, {0x11,0x4d,0x9b,0x74,0x21,0x00,0x00});
+    oversized.put(0, prefix);
+    require(intezam::probeContainer(oversized).startup_ranges.empty() && oversized.maximum_read_end <= 4096,
+        "a SeekHead body that exceeds the prefix allowance is not downloaded");
+
+    SparseSource unknown(1024 * 1024);
+    prefix.resize(17);
+    append(prefix, {0x11,0x4d,0x9b,0x74,0xff});
+    unknown.put(0, prefix);
+    const auto info = intezam::probeContainer(unknown);
+    require(info.type == intezam::ContainerType::webm && info.startup_ranges.empty()
+        && unknown.maximum_read_end <= 4096,
+        "unknown-sized optional SeekHead falls back to normal demux probing");
+}
 } // namespace
 
 int main()
 {
     try {
+        findsCuesWithoutReadingDistantIndexes();
+        ignoresInvalidIndexHints();
+        boundsSeekHeadDiscoveryToTheOpeningHeaders();
         constexpr std::uint32_t length = 64 * 1024 * 1024;
         SparseSource tail(length);
         tail.put(0, atom(24, "ftyp"));

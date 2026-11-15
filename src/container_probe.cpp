@@ -146,7 +146,62 @@ std::optional<double> ebmlInfoDuration(const std::vector<unsigned char>& bytes)
     return seconds;
 }
 
-void probeEbmlInfo(VideoByteSource& source, std::int64_t offset, ContainerInfo& info)
+struct EbmlElement {
+    std::uint64_t id;
+    std::size_t body;
+    std::size_t end;
+};
+
+std::optional<EbmlElement> ebmlElement(const std::vector<unsigned char>& bytes,
+    std::size_t offset, std::size_t end)
+{
+    const auto id = ebmlInteger(bytes, offset, false);
+    if (!id.second || id.second > 4 || id.second > end - offset) return {};
+    const auto size = ebmlInteger(bytes, offset + id.second, true);
+    const auto body = offset + id.second + size.second;
+    if (!size.second || body > end || size.first > end - body
+        || size.first == (std::uint64_t{1} << (7 * size.second)) - 1) return {};
+    return EbmlElement{id.first, body, body + static_cast<std::size_t>(size.first)};
+}
+
+std::optional<std::uint64_t> cuesPosition(const std::vector<unsigned char>& bytes, EbmlElement entry)
+{
+    std::optional<std::uint64_t> target_id;
+    std::optional<std::uint64_t> position;
+    std::size_t offset = entry.body;
+    for (int fields = 0; offset < entry.end && fields < 16; ++fields) {
+        const auto field = ebmlElement(bytes, offset, entry.end);
+        if (!field) return {};
+        const auto length = field->end - field->body;
+        if (field->id == 0x53ab) {
+            if (target_id || length == 0 || length > 4) return {};
+            const auto encoded_id = ebmlInteger(bytes, field->body, false);
+            if (encoded_id.second != length) return {};
+            target_id = encoded_id.first;
+        } else if (field->id == 0x53ac) {
+            if (position || length == 0 || length > 8) return {};
+            position = bigEndian(bytes.data() + field->body, length);
+        }
+        offset = field->end;
+    }
+    if (offset != entry.end || target_id != 0x1c53bb6b) return {};
+    return position;
+}
+
+std::optional<std::uint64_t> seekHeadCuesPosition(const std::vector<unsigned char>& bytes)
+{
+    for (std::size_t offset = 0, entries = 0; offset < bytes.size() && entries < 64; ++entries) {
+        const auto entry = ebmlElement(bytes, offset, bytes.size());
+        if (!entry) return {};
+        if (entry->id == 0x4dbb) {
+            if (const auto position = cuesPosition(bytes, *entry)) return position;
+        }
+        offset = entry->end;
+    }
+    return {};
+}
+
+void probeEbmlSegmentHeaders(VideoByteSource& source, std::int64_t offset, ContainerInfo& info)
 {
     if (offset >= source.size()) return;
     auto header = readHeader(source, offset, 12);
@@ -154,23 +209,34 @@ void probeEbmlInfo(VideoByteSource& source, std::int64_t offset, ContainerInfo& 
     const auto segment_size = ebmlInteger(header, segment.second, true);
     if (segment.first != 0x18538067 || !segment_size.second) return;
     offset += segment.second + segment_size.second;
+    const auto segment_begin = offset;
     const auto unknown = (std::uint64_t{1} << (7 * segment_size.second)) - 1;
     if (segment_size.first != unknown && segment_size.first > static_cast<std::uint64_t>(source.size() - offset)) return;
     const auto end = segment_size.first == unknown ? source.size() : offset + static_cast<std::int64_t>(segment_size.first);
     const auto prefix_end = offset + std::min<std::int64_t>(65536, end - offset);
     for (int elements = 0; offset < end && offset < prefix_end && elements < 64; ++elements) {
-        header = readHeader(source, offset, static_cast<std::size_t>(std::min<std::int64_t>(12, end - offset)));
+        header = readHeader(source, offset, static_cast<std::size_t>(std::min<std::int64_t>(12, prefix_end - offset)));
         const auto id = ebmlInteger(header, 0, false);
         const auto size = ebmlInteger(header, id.second, true);
-        if (!id.second || !size.second || id.first == 0x1f43b675) return; // never scan media clusters
+        if (!id.second || id.second > 4 || !size.second || id.first == 0x1f43b675) return; // never scan media clusters
         const auto body = offset + static_cast<std::int64_t>(id.second + size.second);
-        if (body > end || size.first > static_cast<std::uint64_t>(end - body)) return;
+        if (body > end || size.first > static_cast<std::uint64_t>(end - body)
+            || size.first == (std::uint64_t{1} << (7 * size.second)) - 1) return;
         if (id.first == 0x1549a966) {
-            if (size.first > 65536) return;
+            if (body > prefix_end || size.first > static_cast<std::uint64_t>(prefix_end - body)) return;
             info.duration_seconds = ebmlInfoDuration(readHeader(source, body, size.first));
             info.metadata_ranges.push_back({offset, static_cast<std::int64_t>(size.first + id.second + size.second)});
-            return;
+        } else if (id.first == 0x114d9b74 && info.startup_ranges.empty()) {
+            if (body > prefix_end || size.first > static_cast<std::uint64_t>(prefix_end - body)) return;
+            const auto relative = seekHeadCuesPosition(readHeader(source, body, size.first));
+            // SeekPosition is relative to the Segment's data, not its ID/size.
+            // Validate before addition so malformed unsigned offsets cannot wrap.
+            if (relative && *relative < static_cast<std::uint64_t>(end - segment_begin)) {
+                const auto cues = segment_begin + static_cast<std::int64_t>(*relative);
+                info.startup_ranges.push_back({cues, std::min<std::int64_t>(128 * 1024, end - cues)});
+            }
         }
+        if (info.duration_seconds && !info.startup_ranges.empty()) return;
         offset = body + static_cast<std::int64_t>(size.first);
     }
 }
@@ -201,7 +267,7 @@ ContainerInfo probeEbml(VideoByteSource& source, const std::vector<unsigned char
         }
         offset += size.first;
     }
-    if (root.first + 4 + root.second <= header.size()) probeEbmlInfo(source, end, info);
+    if (root.first + 4 + root.second <= header.size()) probeEbmlSegmentHeaders(source, end, info);
     return info;
 }
 
