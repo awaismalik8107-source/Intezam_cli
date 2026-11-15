@@ -15,6 +15,7 @@ import { TorrentInspectorDrawer } from "./components/TorrentInspectorDrawer";
 import { useKeyboardShortcuts } from "./hooks/useKeyboardShortcuts";
 import { usePyWebview } from "./hooks/usePyWebview";
 import {
+  cancelEpisodeResolution,
   clearWatchHistory,
   copyToClipboard,
   discoverShowSources,
@@ -31,6 +32,7 @@ import {
   recordWatchLaunch,
   removeLibraryItem,
   resetConfig,
+  resolveEpisode,
   saveConfig,
   searchPaginated,
   stopStream,
@@ -45,12 +47,16 @@ import {
 } from "./lib/mediaAdapter";
 import type {
   EngineStatus,
+  EpisodeResolutionOptions,
+  EpisodeResolutionResult,
+  LaunchStreamTargetOptions,
   LibraryEntry,
   MediaEntry,
   MediaIdentity,
   MediaSource,
   NavSection,
   ProviderRetrievalStatus,
+  ResolvedFileCandidate,
   ScrapeMode,
   ScrapedItem,
   ScraperConfig,
@@ -784,12 +790,13 @@ export function App() {
   );
 
   const handleLaunchIntezam = useCallback(
-    async (source: MediaSource) => {
+    async (source: MediaSource, target?: LaunchStreamTargetOptions) => {
       try {
         const res = await launchIntezamStream(
-          source.item.resolved_link,
+          source.item.magnet_link || source.item.resolved_link,
           source.sourceTitle,
           preferences.strictCacheBudget,
+          target,
         );
         if (!res.ok) {
           pushToast(res.error || "Unable to launch Intezam stream.", "error");
@@ -806,6 +813,79 @@ export function App() {
     },
     [preferences.strictCacheBudget, pushToast],
   );
+
+  const handleLaunchResolvedCandidate = useCallback(
+    async (candidate: ResolvedFileCandidate, episodeLabel = "") => {
+      if (candidate.torrent_file_index === null) {
+        pushToast("Cannot launch unverified torrent target without a resolved file index.", "warning");
+        return;
+      }
+      const targetUri = candidate.magnet_uri || candidate.torrent_url;
+      if (!targetUri) {
+        pushToast("Magnet URI is unavailable for this resolved candidate.", "error");
+        return;
+      }
+      try {
+        const displayTitle = episodeLabel
+          ? `${episodeLabel} — ${candidate.filename || candidate.release_title}`
+          : candidate.filename || candidate.release_title;
+        const res = await launchIntezamStream(
+          targetUri,
+          displayTitle,
+          preferences.strictCacheBudget,
+          {
+            torrent_file_index: candidate.torrent_file_index,
+            expected_info_hash: candidate.info_hash,
+            expected_file_path: candidate.file_path,
+            expected_file_size: candidate.file_size_bytes,
+          },
+        );
+        if (!res.ok) {
+          pushToast(res.error || "Unable to launch Intezam stream for resolved episode.", "error");
+          return;
+        }
+        if (res.state) setStreamState(res.state);
+        const [watch, eng] = await Promise.all([getWatchHistory(), getEngineStatus()]);
+        setWatchHistory(watch);
+        setEngineStatus(eng);
+        pushToast(
+          `Launching exact file #${candidate.torrent_file_index}: ${candidate.filename || candidate.file_path}`,
+          "info",
+        );
+      } catch (err) {
+        pushToast(err instanceof Error ? err.message : String(err), "error");
+      }
+    },
+    [preferences.strictCacheBudget, pushToast],
+  );
+
+  const handleResolveEpisode = useCallback(
+    async (
+      mediaEntry: MediaEntry,
+      seasonNumber: number,
+      episodeNumber: number,
+      options?: EpisodeResolutionOptions,
+    ): Promise<EpisodeResolutionResult> => {
+      const payload = mediaEntry.metadata ?? {
+        canonical_id: mediaEntry.key,
+        official_title: mediaEntry.title,
+        alternate_titles: mediaEntry.alternateTitles,
+        media_type: mediaEntry.mediaKind || "anime",
+        release_year:
+          mediaEntry.year && /^\d{4}$/.test(mediaEntry.year) ? Number(mediaEntry.year) : null,
+        seasons: mediaEntry.officialSeasons || [],
+      };
+      return resolveEpisode(payload, seasonNumber, episodeNumber, {
+        mode,
+        ...(options || {}),
+      });
+    },
+    [mode],
+  );
+
+  const handleCancelEpisodeResolution = useCallback(async (requestId = "") => {
+    return cancelEpisodeResolution(requestId);
+  }, []);
 
   const handleStopIntezam = useCallback(async () => {
     const next = await stopStream();
@@ -975,6 +1055,10 @@ export function App() {
                   onLaunchIntezam={handleLaunchIntezam}
                   onStopIntezam={handleStopIntezam}
                   onOpenExternal={handleOpenExternal}
+                  onCopyRawText={handleCopyRawText}
+                  onResolveEpisode={handleResolveEpisode}
+                  onCancelEpisodeResolution={handleCancelEpisodeResolution}
+                  onLaunchResolvedCandidate={handleLaunchResolvedCandidate}
                   loadingEpisodes={detailsLoading}
                   episodeError={detailsError}
                   moreEpisodesAvailable={detailsHasMore}

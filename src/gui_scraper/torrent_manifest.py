@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 from dataclasses import asdict, dataclass, field, replace
 import hashlib
+import ipaddress
 from pathlib import PurePosixPath
 import re
+import socket
 import threading
 import time
-from typing import Any
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Callable
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -47,6 +49,7 @@ class TorrentManifestFile:
     size_label: str
     file_type: str  # "video" | "subtitle" | "auxiliary"
     extension: str = ""
+    torrent_file_index: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -297,12 +300,12 @@ def parse_torrent_manifest_bytes(
         raw_files = info.get(b"files")
         if not isinstance(raw_files, list) or len(raw_files) == 0:
             raise TorrentManifestError("Multi-file torrent contains an empty or invalid 'files' list.")
-        for entry in raw_files:
+        for idx, entry in enumerate(raw_files):
             if not isinstance(entry, dict):
                 raise TorrentManifestError("Malformed file entry inside torrent manifest.")
             attr_raw = entry.get(b"attr")
-            if isinstance(attr_raw, bytes) and b"p" in attr_raw:
-                # Skip BEP 47 padding entries
+            if isinstance(attr_raw, bytes) and (b"p" in attr_raw or b"l" in attr_raw):
+                # Skip BEP 47 padding or symlink entries while preserving libtorrent's 0-based file_index_t.
                 continue
             length = entry.get(b"length")
             if not isinstance(length, int) or isinstance(length, bool) or length < 0:
@@ -324,6 +327,7 @@ def parse_torrent_manifest_bytes(
                     size_label=format_byte_size(length),
                     file_type=ftype,
                     extension=ext,
+                    torrent_file_index=idx,
                 )
             )
     elif b"length" in info:
@@ -341,6 +345,7 @@ def parse_torrent_manifest_bytes(
                 size_label=format_byte_size(length),
                 file_type=ftype,
                 extension=ext,
+                torrent_file_index=0,
             )
         )
     else:
@@ -372,8 +377,74 @@ def parse_torrent_manifest_bytes(
     )
 
 
+def _is_disallowed_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def validate_remote_torrent_url(
+    torrent_url: str,
+    *,
+    allow_private_urls: bool = False,
+    resolve_dns: bool = True,
+) -> str:
+    """Validate HTTP(S) torrent URL and reject loopback, private, link-local, or local hosts."""
+    parsed = urlparse((torrent_url or "").strip())
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        raise TorrentManifestError("Torrent URL must be a valid http:// or https:// URL.")
+    if parsed.username or parsed.password:
+        raise TorrentManifestError("Torrent URLs with embedded credentials are not allowed.")
+
+    host = parsed.hostname.strip().lower().rstrip(".")
+    if not host:
+        raise TorrentManifestError("Torrent URL is missing a valid hostname.")
+
+    if not allow_private_urls:
+        if host in {"localhost", "ip6-localhost"} or host.endswith((".localhost", ".local", ".internal")):
+            raise TorrentManifestError("Blocked unsafe local/private host in torrent URL.")
+        try:
+            literal_ip = ipaddress.ip_address(host)
+        except ValueError:
+            literal_ip = None
+        if literal_ip is not None:
+            if _is_disallowed_ip(literal_ip):
+                raise TorrentManifestError("Blocked loopback/private/link-local IP in torrent URL.")
+        elif resolve_dns:
+            try:
+                port = parsed.port or (443 if scheme == "https" else 80)
+                addr_info = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            except OSError as exc:
+                raise TorrentManifestError(f"Unable to resolve torrent host {host!r}: {exc}") from exc
+            resolved_any = False
+            for info_entry in addr_info:
+                sockaddr = info_entry[4]
+                if not sockaddr:
+                    continue
+                ip_text = str(sockaddr[0]).split("%", 1)[0]
+                try:
+                    addr_ip = ipaddress.ip_address(ip_text)
+                except ValueError:
+                    continue
+                resolved_any = True
+                if _is_disallowed_ip(addr_ip):
+                    raise TorrentManifestError(
+                        f"Blocked resolved private/loopback address ({ip_text}) for torrent URL."
+                    )
+            if not resolved_any:
+                raise TorrentManifestError(f"Torrent host {host!r} did not resolve to any valid IP address.")
+
+    return parsed.geturl()
+
+
 class TorrentManifestInspector:
-    """Thread-safe metadata-only .torrent inspector with BTIH/URL manifest caching."""
+    """Thread-safe metadata-only .torrent inspector with BTIH/URL manifest caching and SSRF guards."""
 
     def __init__(
         self,
@@ -383,12 +454,16 @@ class TorrentManifestInspector:
         user_agent: str = "Intezam-Scraper/2.0",
         cache_ttl: float = DEFAULT_CACHE_TTL_SECONDS,
         max_bytes: int = MAX_TORRENT_BYTES,
+        allow_private_urls: bool = False,
+        magnet_metadata_fetcher: Callable[[str, float, str], TorrentManifestResult] | None = None,
     ) -> None:
         self._client = client
         self.timeout = float(timeout)
         self.user_agent = user_agent
         self.cache_ttl = float(cache_ttl)
         self.max_bytes = int(max_bytes)
+        self.allow_private_urls = bool(allow_private_urls)
+        self.magnet_metadata_fetcher = magnet_metadata_fetcher
         self._lock = threading.Lock()
         self._cache_by_hash: dict[str, tuple[float, TorrentManifestResult]] = {}
         self._cache_by_url: dict[str, tuple[float, TorrentManifestResult]] = {}
@@ -419,9 +494,12 @@ class TorrentManifestInspector:
                 self._cache_by_url[torrent_url] = (now, result)
 
     def _fetch_torrent_bytes(self, torrent_url: str) -> bytes:
-        parsed = urlparse(torrent_url)
-        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
-            raise TorrentManifestError("Torrent URL must be a valid http:// or https:// URL.")
+        resolve_dns = self._client is None
+        current_url = validate_remote_torrent_url(
+            torrent_url,
+            allow_private_urls=self.allow_private_urls,
+            resolve_dns=resolve_dns,
+        )
 
         headers = {
             "User-Agent": self.user_agent,
@@ -430,35 +508,49 @@ class TorrentManifestInspector:
         own_client = self._client is None
         client = self._client or httpx.Client(
             timeout=self.timeout,
-            follow_redirects=True,
+            follow_redirects=False,
             headers=headers,
         )
+        max_redirects = 5
         try:
-            with client.stream("GET", torrent_url, headers=headers) as resp:
-                resp.raise_for_status()
-                content_len = resp.headers.get("Content-Length") or resp.headers.get("content-length")
-                if content_len and content_len.isdigit() and int(content_len) > self.max_bytes:
-                    raise TorrentManifestError(
-                        f"Remote .torrent file exceeds {self.max_bytes // (1024 * 1024)} MiB safety limit."
-                    )
-                content_type = (resp.headers.get("Content-Type") or "").lower()
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in resp.iter_bytes(chunk_size=16384):
-                    if not chunk:
-                        continue
-                    total += len(chunk)
-                    if total > self.max_bytes:
-                        raise TorrentManifestError(
-                            f"Remote .torrent response exceeded {self.max_bytes // (1024 * 1024)} MiB safety limit."
+            for _hop in range(max_redirects + 1):
+                with client.stream("GET", current_url, headers=headers) as resp:
+                    if resp.status_code in {301, 302, 303, 307, 308}:
+                        location = resp.headers.get("Location") or resp.headers.get("location")
+                        if not location:
+                            raise TorrentManifestError("Redirect response missing Location header.")
+                        next_url = urljoin(current_url, location.strip())
+                        current_url = validate_remote_torrent_url(
+                            next_url,
+                            allow_private_urls=self.allow_private_urls,
+                            resolve_dns=resolve_dns,
                         )
-                    chunks.append(chunk)
-                payload = b"".join(chunks)
-                if "text/html" in content_type or payload.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
-                    raise TorrentManifestError(
-                        "Provider returned an HTML page instead of a .torrent metadata file."
-                    )
-                return payload
+                        continue
+                    resp.raise_for_status()
+                    content_len = resp.headers.get("Content-Length") or resp.headers.get("content-length")
+                    if content_len and content_len.isdigit() and int(content_len) > self.max_bytes:
+                        raise TorrentManifestError(
+                            f"Remote .torrent file exceeds {self.max_bytes // (1024 * 1024)} MiB safety limit."
+                        )
+                    content_type = (resp.headers.get("Content-Type") or "").lower()
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes(chunk_size=16384):
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > self.max_bytes:
+                            raise TorrentManifestError(
+                                f"Remote .torrent response exceeded {self.max_bytes // (1024 * 1024)} MiB safety limit."
+                            )
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
+                    if "text/html" in content_type or payload.lstrip().startswith((b"<!DOCTYPE", b"<html", b"<HTML")):
+                        raise TorrentManifestError(
+                            "Provider returned an HTML page instead of a .torrent metadata file."
+                        )
+                    return payload
+            raise TorrentManifestError("Too many redirects while fetching .torrent metadata file.")
         finally:
             if own_client:
                 client.close()
@@ -470,64 +562,85 @@ class TorrentManifestInspector:
         magnet_uri: str = "",
         info_hash: str = "",
         force_refresh: bool = False,
+        allow_magnet_peers: bool = False,
+        magnet_timeout: float = 15.0,
     ) -> TorrentManifestResult:
-        """Inspect a release's .torrent metadata without initiating downloads or BitTorrent peers."""
+        """Inspect a release's metadata manifest without downloading video payloads."""
         norm_url = (torrent_url or "").strip()
-        norm_hash = normalize_info_hash(info_hash, magnet_uri)
+        norm_magnet = (magnet_uri or "").strip()
+        norm_hash = normalize_info_hash(info_hash, norm_magnet)
 
         if not force_refresh:
             cached = self._get_cached(norm_hash, norm_url)
             if cached is not None:
                 return cached
 
-        if not norm_url:
-            return TorrentManifestResult(
-                status="unavailable",
-                info_hash=norm_hash,
-                source_kind="magnet_only",
-                cached=False,
-                error=None,
-                inspection_note=(
-                    "Unavailable: this release only has a magnet URI with no .torrent metadata URL. "
-                    "Automatic BitTorrent peer discovery is disabled."
-                ),
-            )
+        if norm_url:
+            try:
+                raw_bytes = self._fetch_torrent_bytes(norm_url)
+                result = parse_torrent_manifest_bytes(raw_bytes, expected_info_hash=norm_hash)
+                self._store_cache(result, norm_url)
+                return result
+            except httpx.TimeoutException:
+                url_error = TorrentManifestResult(
+                    status="error",
+                    info_hash=norm_hash,
+                    source_kind="torrent_url",
+                    error="Timed out while fetching .torrent metadata file.",
+                    inspection_note="Torrent file inspection timed out without downloading payload.",
+                )
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else "HTTP"
+                url_error = TorrentManifestResult(
+                    status="error",
+                    info_hash=norm_hash,
+                    source_kind="torrent_url",
+                    error=f"Provider returned status {status_code} for .torrent metadata URL.",
+                    inspection_note="Torrent file inspection failed due to HTTP error.",
+                )
+            except TorrentManifestError as exc:
+                url_error = TorrentManifestResult(
+                    status="error",
+                    info_hash=norm_hash,
+                    source_kind="torrent_url",
+                    error=str(exc),
+                    inspection_note="Torrent metadata failed format or safety validation.",
+                )
+            except Exception as exc:
+                url_error = TorrentManifestResult(
+                    status="error",
+                    info_hash=norm_hash,
+                    source_kind="torrent_url",
+                    error=f"Unable to inspect torrent metadata: {exc}",
+                    inspection_note="Unexpected error during metadata-only torrent inspection.",
+                )
 
-        try:
-            raw_bytes = self._fetch_torrent_bytes(norm_url)
-            result = parse_torrent_manifest_bytes(raw_bytes, expected_info_hash=norm_hash)
-            self._store_cache(result, norm_url)
-            return result
-        except httpx.TimeoutException:
-            return TorrentManifestResult(
-                status="error",
-                info_hash=norm_hash,
-                source_kind="torrent_url",
-                error="Timed out while fetching .torrent metadata file.",
-                inspection_note="Torrent file inspection timed out without downloading payload.",
-            )
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else "HTTP"
-            return TorrentManifestResult(
-                status="error",
-                info_hash=norm_hash,
-                source_kind="torrent_url",
-                error=f"Provider returned status {status_code} for .torrent metadata URL.",
-                inspection_note="Torrent file inspection failed due to HTTP error.",
-            )
-        except TorrentManifestError as exc:
-            return TorrentManifestResult(
-                status="error",
-                info_hash=norm_hash,
-                source_kind="torrent_url",
-                error=str(exc),
-                inspection_note="Torrent metadata failed format or safety validation.",
-            )
-        except Exception as exc:
-            return TorrentManifestResult(
-                status="error",
-                info_hash=norm_hash,
-                source_kind="torrent_url",
-                error=f"Unable to inspect torrent metadata: {exc}",
-                inspection_note="Unexpected error during metadata-only torrent inspection.",
-            )
+            if not (allow_magnet_peers and norm_magnet and self.magnet_metadata_fetcher is not None):
+                return url_error
+
+        if allow_magnet_peers and norm_magnet and self.magnet_metadata_fetcher is not None:
+            try:
+                mag_result = self.magnet_metadata_fetcher(norm_magnet, float(magnet_timeout), norm_hash)
+                if mag_result.status == "verified":
+                    self._store_cache(mag_result, norm_url)
+                return mag_result
+            except Exception as exc:
+                return TorrentManifestResult(
+                    status="error",
+                    info_hash=norm_hash,
+                    source_kind="libtorrent_magnet",
+                    error=f"Magnet metadata retrieval failed: {exc}",
+                    inspection_note="BitTorrent metadata-only retrieval failed without payload download.",
+                )
+
+        return TorrentManifestResult(
+            status="unavailable",
+            info_hash=norm_hash,
+            source_kind="magnet_only",
+            cached=False,
+            error=None,
+            inspection_note=(
+                "Unavailable: this release only has a magnet URI with no .torrent metadata URL. "
+                "Automatic BitTorrent peer discovery is disabled."
+            ),
+        )

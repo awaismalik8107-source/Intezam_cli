@@ -3,6 +3,9 @@ import type {
   DiscoverShowSourcesResponse,
   DiscoverShowsResponse,
   EngineStatus,
+  EpisodeResolutionOptions,
+  EpisodeResolutionResult,
+  LaunchStreamTargetOptions,
   LibraryEntry,
   MediaIdentity,
   PaginatedSearchResponse,
@@ -108,6 +111,56 @@ export async function discoverShowSources(
     total_pages: fallback.total_pages,
     provider_statuses: fallback.provider_statuses ?? [],
   };
+}
+
+export async function resolveEpisode(
+  show: Partial<MediaIdentity> & { canonical_id: string; official_title: string },
+  season: number,
+  episode: number,
+  options?: EpisodeResolutionOptions,
+): Promise<EpisodeResolutionResult> {
+  const api = getApi();
+  if (typeof api.resolve_episode === "function") {
+    return api.resolve_episode(show, season, episode, options);
+  }
+  return {
+    show_id: show.canonical_id,
+    show_title: show.official_title,
+    season,
+    episode,
+    episode_title: `Episode ${episode}`,
+    absolute_episode: null,
+    resolution_stage: "completed",
+    candidates: [],
+    possible_matches: [],
+    unresolved_candidates: [],
+    rejected_count: 0,
+    has_more: false,
+    errors: ["Episode resolution bridge API is unavailable in this runtime."],
+    metrics: {
+      ranking_ms: 0,
+      manifest_fetch_ms: 0,
+      total_ms: 0,
+      cache_hits: 0,
+      cache_misses: 0,
+      manifest_requests: 0,
+      deduplicated_torrents: 0,
+      candidates_considered: 0,
+      candidates_inspected: 0,
+      cancelled: false,
+    },
+    request_id: options?.request_id ?? "",
+  };
+}
+
+export async function cancelEpisodeResolution(
+  requestId = "",
+): Promise<{ ok: boolean; cancelled: boolean; request_id: string }> {
+  const api = window.pywebview?.api;
+  if (!api?.cancel_episode_resolution) {
+    return { ok: true, cancelled: false, request_id: requestId };
+  }
+  return api.cancel_episode_resolution(requestId);
 }
 
 export async function inspectTorrentManifest(
@@ -252,12 +305,22 @@ export async function launchIntezamStream(
   url: string,
   title: string,
   strictCache: boolean,
+  target?: LaunchStreamTargetOptions,
 ): Promise<{ ok: boolean; error?: string; state?: StreamSessionState }> {
   const api = getApi();
   if (!api.launch_intezam_stream) {
     return { ok: false, error: "Intezam stream handoff is unavailable." };
   }
-  return api.launch_intezam_stream(url, title, strictCache, 120);
+  return api.launch_intezam_stream(
+    url,
+    title,
+    strictCache,
+    120,
+    target?.torrent_file_index ?? null,
+    target?.expected_info_hash ?? "",
+    target?.expected_file_path ?? "",
+    target?.expected_file_size ?? null,
+  );
 }
 
 export async function getStreamStatus(): Promise<StreamSessionState | null> {

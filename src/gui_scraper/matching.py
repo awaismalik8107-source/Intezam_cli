@@ -1120,17 +1120,21 @@ def match_release_to_identity(
         resolved_season = alias_season
 
     resolved_ep = parsed.episode_number
+    regular_seasons = sorted(
+        (s for s in identity.seasons if s.season_number >= 1),
+        key=lambda s: s.season_number,
+    )
     if (
         parsed.classification == "episode"
         and resolved_ep is not None
         and (resolved_season is None or resolved_season == 1)
-        and len(identity.seasons) > 1
+        and len(regular_seasons) > 1
     ):
         # Check if episode number exceeds Season 1 count and maps to a subsequent season via absolute numbering
-        s1_count = identity.seasons[0].episode_count
+        s1_count = regular_seasons[0].episode_count
         if s1_count > 0 and resolved_ep > s1_count:
             rem = resolved_ep
-            for s_meta in identity.seasons:
+            for s_meta in regular_seasons:
                 if s_meta.episode_count > 0 and rem > s_meta.episode_count:
                     rem -= s_meta.episode_count
                 else:

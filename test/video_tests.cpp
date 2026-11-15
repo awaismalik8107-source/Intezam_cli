@@ -1,7 +1,10 @@
 #include "video_files.hpp"
 #include "video_selection.hpp"
 
+#include <libtorrent/bencode.hpp>
+#include <libtorrent/entry.hpp>
 #include <libtorrent/file_storage.hpp>
+#include <libtorrent/torrent_info.hpp>
 
 #include <cstdlib>
 #include <iostream>
@@ -147,6 +150,106 @@ void keepsManualChoiceWhenMultipleVideosHaveEnoughBudget()
     require(rejected, "report when no video budget can fit a piece");
 }
 
+void explicitTargetSelectionAndManifestJson()
+{
+    lt::entry torrent;
+    auto& info = torrent["info"];
+    info["name"] = "ShowPack";
+    const std::int64_t piece_length = 2LL * 1024 * 1024;
+    info["piece length"] = piece_length;
+
+    struct Spec {
+        const char* dir;
+        const char* name;
+        std::int64_t size;
+    };
+    const std::vector<Spec> specs{
+        {"", "cover.jpg", 4096},
+        {"Season 1", "Episode 01.mkv", 256LL * 1024 * 1024},
+        {"Season 1", "Episode 07.mkv", 450LL * 1024 * 1024},
+        {"Season 2", "Episode 07.mkv", 480LL * 1024 * 1024},
+    };
+    std::int64_t total_size = 0;
+    for (const auto& s : specs) {
+        lt::entry f;
+        f["length"] = s.size;
+        if (s.dir[0] != '\0') f["path"].list().emplace_back(s.dir);
+        f["path"].list().emplace_back(s.name);
+        info["files"].list().push_back(std::move(f));
+        total_size += s.size;
+    }
+    const std::int64_t num_pieces = (total_size + piece_length - 1) / piece_length;
+    info["pieces"] = std::string(static_cast<std::size_t>(num_pieces) * 20, 'x');
+
+    std::vector<char> encoded;
+    lt::bencode(std::back_inserter(encoded), torrent);
+    lt::torrent_info metadata(encoded.data(), static_cast<int>(encoded.size()));
+    const auto videos = intezam::detectVideoFiles(metadata);
+    const std::string actual_hash = intezam::infoHashHex(metadata);
+    require(actual_hash.size() == 40, "expected 40-char info hash hex");
+    require(videos.size() == 3, "expected 3 detected video files");
+
+    // 1. Exact selection of Season 1/Episode 07 at raw index 2
+    intezam::ExplicitVideoTarget ep7_target;
+    ep7_target.torrent_file_index = 2;
+    ep7_target.expected_info_hash = actual_hash;
+    ep7_target.expected_file_path = "Season 1/Episode 07.mkv";
+    ep7_target.expected_file_size = 450LL * 1024 * 1024;
+    const auto chosen = intezam::resolveExplicitVideoTarget(metadata, videos, ep7_target, true);
+    require(static_cast<int>(chosen.torrent_index) == 2, "must pick Season 1/Episode 07 index 2, never index 1");
+    require(chosen.size_bytes == 450LL * 1024 * 1024, "exact file size preserved");
+
+    // 2. Reject wrong file path instead of falling back to first video
+    bool path_rejected = false;
+    try {
+        auto bad = ep7_target;
+        bad.expected_file_path = "Season 2/Episode 07.mkv";
+        intezam::resolveExplicitVideoTarget(metadata, videos, bad);
+    } catch (const std::runtime_error&) {
+        path_rejected = true;
+    }
+    require(path_rejected, "wrong file path must be rejected");
+
+    // 3. Reject wrong info-hash
+    bool hash_rejected = false;
+    try {
+        auto bad = ep7_target;
+        bad.expected_info_hash = std::string(40, 'f');
+        intezam::resolveExplicitVideoTarget(metadata, videos, bad);
+    } catch (const std::runtime_error&) {
+        hash_rejected = true;
+    }
+    require(hash_rejected, "wrong info-hash must be rejected");
+
+    // 4. Reject non-video file index (0 = cover.jpg)
+    bool non_video_rejected = false;
+    try {
+        intezam::ExplicitVideoTarget cover_target;
+        cover_target.torrent_file_index = 0;
+        intezam::resolveExplicitVideoTarget(metadata, videos, cover_target);
+    } catch (const std::runtime_error&) {
+        non_video_rejected = true;
+    }
+    require(non_video_rejected, "non-video index must be rejected");
+
+    // 5. Reject --select-single on multi-video torrent
+    bool multi_rejected = false;
+    try {
+        intezam::ExplicitVideoTarget single_target;
+        single_target.select_single = true;
+        intezam::resolveExplicitVideoTarget(metadata, videos, single_target);
+    } catch (const std::runtime_error&) {
+        multi_rejected = true;
+    }
+    require(multi_rejected, "select-single must refuse multi-video batch without file index");
+
+    // 6. Verify manifest JSON serialization preserves exact 0-based index & stripped relative path
+    const std::string json = intezam::formatManifestJson(metadata);
+    require(json.find("\"ok\":true") != std::string::npos, "manifest JSON ok flag");
+    require(json.find("\"torrent_file_index\":2,\"relative_path\":\"Season 1/Episode 07.mkv\"") != std::string::npos,
+        "manifest JSON preserves 0-based index and relative path");
+}
+
 } // namespace
 
 int main()
@@ -158,6 +261,7 @@ int main()
         displaysPathsFormatsSizesAndIndexes(videos);
         requiresManualSelectionEvenWhenOnlyOneVideoFits();
         keepsManualChoiceWhenMultipleVideosHaveEnoughBudget();
+        explicitTargetSelectionAndManifestJson();
         std::cout << "Video detection and selection tests passed.\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

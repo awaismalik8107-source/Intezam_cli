@@ -19,17 +19,29 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { inspectTorrentManifest } from "../lib/bridge";
-import { type BatchKind, buildEpisodeCatalog } from "../lib/episodeCatalog";
+import {
+  type BatchKind,
+  buildEpisodeCatalog,
+  buildEpisodeFirstSeasons,
+  formatSeasonLabel,
+} from "../lib/episodeCatalog";
 import { QUALITY_RANK } from "../lib/mediaAdapter";
 import type {
   EngineStatus,
+  EpisodeResolutionOptions,
+  EpisodeResolutionResult,
   MediaEntry,
   MediaSource,
+  ResolvedFileCandidate,
   SourceSearchFilters,
   StreamSessionState,
   TorrentManifestInspectionResult,
 } from "../lib/types";
 import { BatchEpisodeList, type BatchInspectionState } from "./BatchEpisodeList";
+import {
+  EpisodeSourcesPanel,
+  type EpisodeResolutionViewState,
+} from "./EpisodeSourcesPanel";
 import { PosterArtwork } from "./PosterArtwork";
 
 interface MediaDetailsViewProps {
@@ -57,6 +69,20 @@ interface MediaDetailsViewProps {
     source: MediaSource,
     forceRefresh?: boolean,
   ) => Promise<TorrentManifestInspectionResult>;
+  onCopyRawText?: (value: string, label: string) => Promise<boolean>;
+  onResolveEpisode?: (
+    media: MediaEntry,
+    season: number,
+    episode: number,
+    options?: EpisodeResolutionOptions,
+  ) => Promise<EpisodeResolutionResult>;
+  onCancelEpisodeResolution?: (
+    requestId?: string,
+  ) => Promise<{ ok: boolean; cancelled: boolean }>;
+  onLaunchResolvedCandidate?: (
+    candidate: ResolvedFileCandidate,
+    episodeLabel?: string,
+  ) => void;
 }
 
 type EpisodeSourceSort = "seeders" | "quality" | "size";
@@ -110,6 +136,7 @@ function batchBadgeStyle(kind: BatchKind): { label: string; className: string } 
 export function MediaDetailsView({
   media,
   isSaved,
+  engineStatus,
   onBack,
   onToggleLibrary,
   onCopyUri,
@@ -121,16 +148,27 @@ export function MediaDetailsView({
   sourceFilters,
   onChangeSourceFilters,
   onInspectTorrentManifest,
+  onCopyRawText,
+  onResolveEpisode,
+  onCancelEpisodeResolution,
+  onLaunchResolvedCandidate,
 }: MediaDetailsViewProps) {
   const batchSectionRef = useRef<HTMLElement | null>(null);
   const activeMediaKeyRef = useRef(media.key);
   const manifestRequestSeqRef = useRef<Record<string, number>>({});
+  const episodeResSeqRef = useRef(0);
+  const activeResReqIdRef = useRef("");
   const isMovie = media.mediaKind === "movie" || media.metadata?.media_type === "movie";
   const isTv = media.mediaKind === "tv" || media.metadata?.media_type === "tv";
   const catalog = useMemo(
     () => buildEpisodeCatalog(media.sources, media.officialSeasons, media.mediaKind || media.metadata?.media_type),
     [media.sources, media.officialSeasons, media.mediaKind, media.metadata?.media_type],
   );
+  const episodeFirst = useMemo(
+    () => buildEpisodeFirstSeasons(media.officialSeasons, catalog, isMovie),
+    [media.officialSeasons, catalog, isMovie],
+  );
+  const availableSeasons = episodeFirst.seasons;
   const [season, setSeason] = useState<number | null>(null);
   const [episode, setEpisode] = useState<number | null>(null);
   const [sortBy, setSortBy] = useState<EpisodeSourceSort>("seeders");
@@ -141,10 +179,18 @@ export function MediaDetailsView({
   const [batchTabs, setBatchTabs] = useState<Record<string, "official" | "verified">>({});
   const [batchSeasons, setBatchSeasons] = useState<Record<string, number | null>>({});
   const [manifestStates, setManifestStates] = useState<Record<string, BatchInspectionState>>({});
+  const [episodeResolutionStates, setEpisodeResolutionStates] = useState<
+    Record<string, EpisodeResolutionViewState>
+  >({});
 
   useEffect(() => {
     activeMediaKeyRef.current = media.key;
     manifestRequestSeqRef.current = {};
+    episodeResSeqRef.current += 1;
+    if (activeResReqIdRef.current && onCancelEpisodeResolution) {
+      void onCancelEpisodeResolution(activeResReqIdRef.current);
+      activeResReqIdRef.current = "";
+    }
     setSeason(null);
     setEpisode(null);
     setExpandedSource(null);
@@ -154,7 +200,8 @@ export function MediaDetailsView({
     setBatchTabs({});
     setBatchSeasons({});
     setManifestStates({});
-  }, [media.key]);
+    setEpisodeResolutionStates({});
+  }, [media.key, onCancelEpisodeResolution]);
 
   const handleInspectBatchManifest = useCallback(
     (source: MediaSource, forceRefresh = false) => {
@@ -227,22 +274,118 @@ export function MediaDetailsView({
   );
 
   const currentSeason: number | null =
-    season !== null && catalog.seasons.includes(season)
+    season !== null && availableSeasons.includes(season)
       ? season
-      : catalog.seasons.length > 0
-        ? catalog.seasons[0]
-        : null;
+      : availableSeasons.includes(1)
+        ? 1
+        : availableSeasons.length > 0
+          ? availableSeasons[0]
+          : null;
 
   const visibleEpisodes = useMemo(
     () =>
       currentSeason !== null
-        ? catalog.episodes.filter((entry) => entry.season === currentSeason)
+        ? episodeFirst.episodesBySeason.get(currentSeason) ?? []
         : [],
-    [catalog.episodes, currentSeason],
+    [episodeFirst.episodesBySeason, currentSeason],
   );
 
   const selectedEpisode =
     visibleEpisodes.find((entry) => entry.number === episode) ?? visibleEpisodes[0] ?? null;
+
+  const triggerEpisodeResolution = useCallback(
+    (
+      targetSeason: number,
+      targetEpisode: number,
+      options?: EpisodeResolutionOptions,
+    ) => {
+      if (!onResolveEpisode) return;
+      const cacheKey = `${targetSeason}:${targetEpisode}`;
+      const capturedMediaKey = activeMediaKeyRef.current;
+
+      if (!options?.force_refresh && !options?.allow_magnet_peers) {
+        const current = episodeResolutionStates[cacheKey];
+        if (current?.status === "loading" || current?.status === "done") {
+          return;
+        }
+      }
+
+      if (activeResReqIdRef.current && onCancelEpisodeResolution) {
+        void onCancelEpisodeResolution(activeResReqIdRef.current);
+      }
+
+      const nextSeq = (episodeResSeqRef.current += 1);
+      const reqId = `ui-${capturedMediaKey}-${targetSeason}-${targetEpisode}-${nextSeq}`;
+      activeResReqIdRef.current = reqId;
+
+      setEpisodeResolutionStates((prev) => ({
+        ...prev,
+        [cacheKey]: {
+          status: "loading",
+          requestId: reqId,
+          result: prev[cacheKey]?.result,
+        },
+      }));
+
+      void onResolveEpisode(media, targetSeason, targetEpisode, {
+        ...(options || {}),
+        request_id: reqId,
+      })
+        .then((res) => {
+          if (
+            activeMediaKeyRef.current !== capturedMediaKey ||
+            episodeResSeqRef.current !== nextSeq
+          ) {
+            return;
+          }
+          if (activeResReqIdRef.current === reqId) {
+            activeResReqIdRef.current = "";
+          }
+          setEpisodeResolutionStates((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              status: "done",
+              requestId: reqId,
+              result: res,
+            },
+          }));
+        })
+        .catch((err) => {
+          if (
+            activeMediaKeyRef.current !== capturedMediaKey ||
+            episodeResSeqRef.current !== nextSeq
+          ) {
+            return;
+          }
+          if (activeResReqIdRef.current === reqId) {
+            activeResReqIdRef.current = "";
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          setEpisodeResolutionStates((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              status: "error",
+              requestId: reqId,
+              error: msg,
+            },
+          }));
+        });
+    },
+    [episodeResolutionStates, media, onCancelEpisodeResolution, onResolveEpisode],
+  );
+
+  useEffect(() => {
+    if (!onResolveEpisode || !selectedEpisode) return;
+    const key = `${selectedEpisode.season}:${selectedEpisode.number}`;
+    if (!episodeResolutionStates[key]) {
+      triggerEpisodeResolution(selectedEpisode.season, selectedEpisode.number);
+    }
+  }, [
+    episodeResolutionStates,
+    onResolveEpisode,
+    selectedEpisode,
+    triggerEpisodeResolution,
+  ]);
 
   const availableBatches = useMemo(
     () =>
@@ -282,6 +425,9 @@ export function MediaDetailsView({
   const handleSelectEpisode = (number: number) => {
     setEpisode(number);
     setExpandedSource(null);
+    if (onResolveEpisode && currentSeason !== null) {
+      triggerEpisodeResolution(currentSeason, number);
+    }
   };
 
   const handleCopyMagnet = async (source: MediaSource) => {
@@ -724,9 +870,9 @@ export function MediaDetailsView({
         {/* Season Selector & Episode Grid (Series Only) */}
         {!isMovie && (
           <>
-            {catalog.seasons.length > 0 ? (
+            {availableSeasons.length > 0 ? (
               <div role="group" aria-label="Choose season" className="flex flex-wrap items-center gap-2">
-                {catalog.seasons.map((value) => {
+                {availableSeasons.map((value) => {
                   const isSelected = currentSeason === value;
                   return (
                     <button
@@ -744,7 +890,7 @@ export function MediaDetailsView({
                           : "border border-white/10 bg-[#191E2E] text-[#AAB5CA] hover:bg-[#232A40] hover:text-white"
                       }`}
                     >
-                      Season {value}
+                      {formatSeasonLabel(value)}
                     </button>
                   );
                 })}
@@ -822,75 +968,124 @@ export function MediaDetailsView({
         )}
       </section>
 
-      {/* Episode / Movie Magnet Sources Panel */}
-      {(visibleEpisodes.length > 0 || selectedEpisode !== null) && (
-        <section
-          aria-live="polite"
-          className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6"
-        >
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h3 className="text-lg font-semibold text-white">
-                {selectedEpisode
-                  ? isMovie
-                    ? `${media.title} — Feature Film Magnet Sources`
-                    : `Season ${selectedEpisode.season} · Episode ${selectedEpisode.number}${
-                        selectedEpisode.title ? ` — ${selectedEpisode.title}` : ""
-                      } — Magnet sources`
-                  : "Select an episode"}
-              </h3>
-              <p className="mt-1 text-xs text-[#AAB5CA]">
-                {selectedEpisode
-                  ? isMovie
-                    ? `${sortedSources.length} matching movie ${sortedSources.length === 1 ? "release" : "releases"}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
-                    : `${sortedSources.length} matching ${sortedSources.length === 1 ? "release" : "releases"} for Episode ${String(selectedEpisode.number).padStart(2, "0")}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
-                  : "Source links appear here after you choose an episode above."}
-              </p>
+      {/* Episode-First Resolved Sources Panel OR Fallback Magnet Sources Panel */}
+      {selectedEpisode && onResolveEpisode ? (
+        <EpisodeSourcesPanel
+          season={selectedEpisode.season}
+          episodeNumber={selectedEpisode.number}
+          episodeTitle={selectedEpisode.title}
+          isMovie={isMovie}
+          resolutionState={
+            episodeResolutionStates[`${selectedEpisode.season}:${selectedEpisode.number}`] ?? {
+              status: "idle",
+            }
+          }
+          fallbackSources={sortedSources}
+          engineAvailable={Boolean(engineStatus?.intezam_binary_available)}
+          onResolve={(opts) =>
+            triggerEpisodeResolution(selectedEpisode.season, selectedEpisode.number, opts)
+          }
+          onCancelResolution={() => {
+            const reqId = activeResReqIdRef.current;
+            if (reqId && onCancelEpisodeResolution) {
+              void onCancelEpisodeResolution(reqId);
+              activeResReqIdRef.current = "";
+            }
+            const key = `${selectedEpisode.season}:${selectedEpisode.number}`;
+            setEpisodeResolutionStates((prev) => ({
+              ...prev,
+              [key]: { status: "idle", result: prev[key]?.result },
+            }));
+          }}
+          onPlayCandidate={(cand) => {
+            if (onLaunchResolvedCandidate) {
+              const label = isMovie
+                ? media.title
+                : `${media.title} — ${formatSeasonLabel(selectedEpisode.season)} E${String(
+                    selectedEpisode.number,
+                  ).padStart(2, "0")}`;
+              onLaunchResolvedCandidate(cand, label);
+            }
+          }}
+          onCopyMagnetText={async (uri, label = "Magnet URI") => {
+            if (onCopyRawText) return onCopyRawText(uri, label);
+            if (navigator.clipboard?.writeText) {
+              await navigator.clipboard.writeText(uri);
+              return true;
+            }
+            return false;
+          }}
+        />
+      ) : (
+        (visibleEpisodes.length > 0 || selectedEpisode !== null) && (
+          <section
+            aria-live="polite"
+            className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-white">
+                  {selectedEpisode
+                    ? isMovie
+                      ? `${media.title} — Feature Film Magnet Sources`
+                      : `Season ${selectedEpisode.season} · Episode ${selectedEpisode.number}${
+                          selectedEpisode.title ? ` — ${selectedEpisode.title}` : ""
+                        } — Magnet sources`
+                    : "Select an episode"}
+                </h3>
+                <p className="mt-1 text-xs text-[#AAB5CA]">
+                  {selectedEpisode
+                    ? isMovie
+                      ? `${sortedSources.length} matching movie ${sortedSources.length === 1 ? "release" : "releases"}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
+                      : `${sortedSources.length} matching ${sortedSources.length === 1 ? "release" : "releases"} for Episode ${String(selectedEpisode.number).padStart(2, "0")}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
+                    : "Source links appear here after you choose an episode above."}
+                </p>
+              </div>
+
+              {selectedEpisode && sortedSources.length > 1 && (
+                <div className="flex items-center gap-2">
+                  <ArrowUpDown className="h-3.5 w-3.5 text-[#786BFF]" aria-hidden="true" />
+                  <label htmlFor="episode-source-sort" className="text-xs text-[#AAB5CA]">
+                    Sort by
+                  </label>
+                  <select
+                    id="episode-source-sort"
+                    aria-label="Sort episode sources"
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as EpisodeSourceSort)}
+                    className="h-8 rounded-lg border border-white/15 bg-[#090B12] px-2.5 text-xs text-white focus:border-[#786BFF] focus:outline-none"
+                  >
+                    <option value="seeders">Seeders (High → Low)</option>
+                    <option value="quality">Quality / Resolution</option>
+                    <option value="size">File Size</option>
+                  </select>
+                </div>
+              )}
             </div>
 
-            {selectedEpisode && sortedSources.length > 1 && (
-              <div className="flex items-center gap-2">
-                <ArrowUpDown className="h-3.5 w-3.5 text-[#786BFF]" aria-hidden="true" />
-                <label htmlFor="episode-source-sort" className="text-xs text-[#AAB5CA]">
-                  Sort by
-                </label>
-                <select
-                  id="episode-source-sort"
-                  aria-label="Sort episode sources"
-                  value={sortBy}
-                  onChange={(e) => setSortBy(e.target.value as EpisodeSourceSort)}
-                  className="h-8 rounded-lg border border-white/15 bg-[#090B12] px-2.5 text-xs text-white focus:border-[#786BFF] focus:outline-none"
-                >
-                  <option value="seeders">Seeders (High → Low)</option>
-                  <option value="quality">Quality / Resolution</option>
-                  <option value="size">File Size</option>
-                </select>
+            {selectedEpisode && (
+              <div className="space-y-3">
+                {sortedSources.map((source) => (
+                  <article
+                    key={sourceKey(source)}
+                    className="space-y-3 rounded-xl border border-white/[0.08] bg-[#191E2E] p-4"
+                  >
+                    <div className="flex items-start gap-3">
+                      <Magnet className="mt-0.5 h-4 w-4 shrink-0 text-[#AFA6FF]" aria-hidden="true" />
+                      <div className="min-w-0 flex-1">
+                        <p className="break-words text-sm font-semibold leading-snug text-white">
+                          {source.sourceTitle}
+                        </p>
+                        {renderSourceMetadataBadges(source)}
+                      </div>
+                    </div>
+                    {renderMagnet(source, true)}
+                  </article>
+                ))}
               </div>
             )}
-          </div>
-
-          {selectedEpisode && (
-            <div className="space-y-3">
-              {sortedSources.map((source) => (
-                <article
-                  key={sourceKey(source)}
-                  className="space-y-3 rounded-xl border border-white/[0.08] bg-[#191E2E] p-4"
-                >
-                  <div className="flex items-start gap-3">
-                    <Magnet className="mt-0.5 h-4 w-4 shrink-0 text-[#AFA6FF]" aria-hidden="true" />
-                    <div className="min-w-0 flex-1">
-                      <p className="break-words text-sm font-semibold leading-snug text-white">
-                        {source.sourceTitle}
-                      </p>
-                      {renderSourceMetadataBadges(source)}
-                    </div>
-                  </div>
-                  {renderMagnet(source, true)}
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
+          </section>
+        )
       )}
 
       {/* Batch & Season Packs Panel */}

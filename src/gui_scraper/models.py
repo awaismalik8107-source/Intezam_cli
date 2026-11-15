@@ -91,6 +91,12 @@ class EpisodeMetadata:
     air_date: str = ""
     overview: str = ""
     still_url: str = ""
+    absolute_episode: int | None = None
+    is_special: bool = False
+
+    def __post_init__(self) -> None:
+        if self.season_number == 0 and not self.is_special:
+            self.is_special = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -143,6 +149,31 @@ class MediaIdentity:
     match_score: float = 1.0
     confidence_tier: str = "high"  # "high" | "medium" | "low" | "rejected"
     match_reason: str = ""
+
+    def __post_init__(self) -> None:
+        self._populate_episode_numbering()
+
+    def _populate_episode_numbering(self) -> None:
+        """Populate cumulative absolute_episode numbers across regular seasons and mark specials."""
+        cumulative = 0
+        for season in sorted(self.seasons, key=lambda s: s.season_number):
+            if season.season_number == 0:
+                for ep in season.episodes:
+                    ep.is_special = True
+                continue
+            if season.season_number < 0:
+                continue
+            for ep in season.episodes:
+                if ep.season_number == 0:
+                    ep.is_special = True
+                    continue
+                if ep.absolute_episode is None and ep.episode_number >= 1:
+                    ep.absolute_episode = cumulative + ep.episode_number
+            s_span = max(
+                int(season.episode_count or 0),
+                max((ep.episode_number for ep in season.episodes), default=0),
+            )
+            cumulative += s_span
 
     def all_search_titles(self, max_queries: int = 6) -> list[str]:
         """Return prioritized, deduplicated primary, Romaji, alternate, and season titles for torrent queries."""
@@ -356,3 +387,77 @@ class ReleaseMatchResult:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class ResolvedFileCandidate:
+    """Evidence-backed file target tying an official episode to an exact verified torrent file."""
+
+    candidate_id: str
+    info_hash: str
+    magnet_uri: str
+    torrent_url: str = ""
+    release_title: str = ""
+    provider_id: str = ""
+    provider_name: str = ""
+    torrent_file_index: int | None = None
+    file_path: str = ""
+    filename: str = ""
+    file_size_bytes: int = 0
+    file_size_label: str = ""
+    confidence: float = 0.0
+    status: str = "unresolved"  # "confirmed" | "probable" | "possible" | "unresolved" | "rejected"
+    can_auto_play: bool = False
+    source_kind: str = "torrent_url"  # "torrent_url" | "libtorrent_magnet" | "cache" | "magnet_only" | "title_only"
+    is_batch_source: bool = False
+    resolution: str = ""
+    codec: str = ""
+    subtitle_lang: str = ""
+    seeders: int = 0
+    leechers: int = 0
+    score: float = 0.0
+    evidence: list[str] = field(default_factory=list)
+    contradictions: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EpisodeResolutionResult:
+    """Progressive resolution response returned by ScraperBridge.resolve_episode."""
+
+    show_id: str
+    show_title: str
+    season: int
+    episode: int
+    episode_title: str = ""
+    absolute_episode: int | None = None
+    resolution_stage: str = "complete"  # "initial" | "partial" | "complete" | "cancelled" | "error"
+    candidates: list[ResolvedFileCandidate] = field(default_factory=list)
+    possible_matches: list[ResolvedFileCandidate] = field(default_factory=list)
+    unresolved_candidates: list[ResolvedFileCandidate] = field(default_factory=list)
+    rejected_count: int = 0
+    has_more: bool = False
+    errors: list[str] = field(default_factory=list)
+    metrics: dict[str, Any] = field(default_factory=dict)
+    request_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "show_id": self.show_id,
+            "show_title": self.show_title,
+            "season": self.season,
+            "episode": self.episode,
+            "episode_title": self.episode_title,
+            "absolute_episode": self.absolute_episode,
+            "resolution_stage": self.resolution_stage,
+            "candidates": [c.to_dict() for c in self.candidates],
+            "possible_matches": [c.to_dict() for c in self.possible_matches],
+            "unresolved_candidates": [c.to_dict() for c in self.unresolved_candidates],
+            "rejected_count": self.rejected_count,
+            "has_more": self.has_more,
+            "errors": list(self.errors),
+            "metrics": dict(self.metrics),
+            "request_id": self.request_id,
+        }

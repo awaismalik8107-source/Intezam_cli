@@ -548,6 +548,84 @@ export function formatSeasonLabel(seasonNumber: number): string {
   return seasonNumber === 0 ? "Specials" : `Season ${seasonNumber}`;
 }
 
+export function buildEpisodeFirstSeasons(
+  officialSeasons: SeasonMetadata[] | undefined,
+  catalog: { episodes: EpisodeEntry[]; seasons: number[] },
+  isMovie = false,
+): {
+  seasons: number[];
+  episodesBySeason: Map<number, EpisodeEntry[]>;
+  totalEpisodeCount: number;
+} {
+  const seasonSet = new Set<number>(catalog.seasons);
+  const bySeason = new Map<number, Map<number, EpisodeEntry>>();
+
+  const ensureSeason = (sNum: number): Map<number, EpisodeEntry> => {
+    seasonSet.add(sNum);
+    let inner = bySeason.get(sNum);
+    if (!inner) {
+      inner = new Map<number, EpisodeEntry>();
+      bySeason.set(sNum, inner);
+    }
+    return inner;
+  };
+
+  if (!isMovie && officialSeasons && officialSeasons.length > 0) {
+    for (const sm of officialSeasons) {
+      if (!Number.isFinite(sm.season_number) || sm.season_number < 0) continue;
+      const inner = ensureSeason(sm.season_number);
+      for (const ep of sm.episodes || []) {
+        if (!ep || ep.episode_number <= 0) continue;
+        inner.set(ep.episode_number, {
+          season: sm.season_number,
+          number: ep.episode_number,
+          title: (ep.title || "").trim() || undefined,
+          airDate: (ep.air_date || "").trim() || undefined,
+          sources: [],
+        });
+      }
+      const targetCount = Math.max(sm.episode_count || 0, inner.size);
+      for (let epNum = 1; epNum <= targetCount; epNum += 1) {
+        if (!inner.has(epNum)) {
+          inner.set(epNum, {
+            season: sm.season_number,
+            number: epNum,
+            sources: [],
+          });
+        }
+      }
+    }
+  }
+
+  for (const epEntry of catalog.episodes) {
+    const inner = ensureSeason(epEntry.season);
+    const existing = inner.get(epEntry.number);
+    if (existing) {
+      existing.sources = [...epEntry.sources];
+      if (!existing.title && epEntry.title) existing.title = epEntry.title;
+      if (!existing.airDate && epEntry.airDate) existing.airDate = epEntry.airDate;
+    } else {
+      inner.set(epEntry.number, { ...epEntry, sources: [...epEntry.sources] });
+    }
+  }
+
+  const orderedSeasons = [...seasonSet].sort((a, b) => {
+    if (a === 0 && b !== 0) return 1;
+    if (b === 0 && a !== 0) return -1;
+    return a - b;
+  });
+
+  const episodesBySeason = new Map<number, EpisodeEntry[]>();
+  let totalEpisodeCount = 0;
+  for (const sNum of orderedSeasons) {
+    const eps = [...(bySeason.get(sNum)?.values() ?? [])].sort((a, b) => a.number - b.number);
+    episodesBySeason.set(sNum, eps);
+    totalEpisodeCount += eps.length;
+  }
+
+  return { seasons: orderedSeasons, episodesBySeason, totalEpisodeCount };
+}
+
 export function selectDefaultBatchSeason(
   batch: Pick<BatchEntry, "batchKind" | "season">,
   seasonNumbers: number[],

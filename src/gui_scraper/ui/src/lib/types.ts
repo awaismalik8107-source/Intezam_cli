@@ -56,6 +56,8 @@ export interface EpisodeMetadata {
   air_date?: string;
   overview?: string;
   still_url?: string;
+  absolute_episode?: number | null;
+  is_special?: boolean;
 }
 
 export interface SeasonMetadata {
@@ -315,6 +317,7 @@ export interface TorrentManifestFile {
   size_label: string;
   file_type: ManifestFileType | string;
   extension?: string;
+  torrent_file_index?: number;
 }
 
 export interface TorrentManifestInspectionResult {
@@ -347,6 +350,89 @@ export interface DiscoverShowSourcesResponse {
   error?: string | null;
 }
 
+export type EpisodeResolutionStatus =
+  | "confirmed"
+  | "probable"
+  | "possible"
+  | "unresolved"
+  | "rejected";
+
+export interface ResolvedFileCandidate {
+  candidate_id: string;
+  info_hash: string;
+  magnet_uri: string;
+  torrent_url: string;
+  release_title: string;
+  provider_id: string;
+  provider_name: string;
+  torrent_file_index: number | null;
+  file_path: string;
+  filename: string;
+  file_size_bytes: number;
+  file_size_label: string;
+  confidence: number;
+  status: EpisodeResolutionStatus;
+  can_auto_play: boolean;
+  source_kind: string;
+  is_batch_source: boolean;
+  resolution: string;
+  codec: string;
+  subtitle_lang: string;
+  seeders: number;
+  leechers: number;
+  score: number;
+  evidence: string[];
+  contradictions: string[];
+}
+
+export interface EpisodeResolutionMetrics {
+  ranking_ms: number;
+  manifest_fetch_ms: number;
+  total_ms: number;
+  cache_hits: number;
+  cache_misses: number;
+  manifest_requests: number;
+  deduplicated_torrents: number;
+  candidates_considered: number;
+  candidates_inspected: number;
+  cancelled: boolean;
+}
+
+export interface EpisodeResolutionResult {
+  show_id: string;
+  show_title: string;
+  season: number;
+  episode: number;
+  episode_title: string;
+  absolute_episode: number | null;
+  resolution_stage: string;
+  candidates: ResolvedFileCandidate[];
+  possible_matches: ResolvedFileCandidate[];
+  unresolved_candidates: ResolvedFileCandidate[];
+  rejected_count: number;
+  has_more: boolean;
+  errors: string[];
+  metrics: EpisodeResolutionMetrics;
+  request_id: string;
+}
+
+export interface EpisodeResolutionOptions {
+  mode?: ScrapeMode;
+  request_id?: string;
+  max_manifest_fetches?: number;
+  allow_magnet_peers?: boolean;
+  magnet_timeout?: number;
+  force_refresh?: boolean;
+  inspect_possible?: boolean;
+}
+
+export interface LaunchStreamTargetOptions {
+  torrent_file_index?: number | null;
+  expected_info_hash?: string;
+  expected_file_path?: string;
+  expected_file_size?: number | null;
+}
+
 export interface PyWebViewApi {
   search: (query: string, mode?: ScrapeMode, page?: number) => Promise<ScrapedItem[]>;
   search_paginated?: (
@@ -374,6 +460,15 @@ export interface PyWebViewApi {
     infoHash?: string,
     forceRefresh?: boolean,
   ) => Promise<TorrentManifestInspectionResult>;
+  resolve_episode?: (
+    show: Partial<MediaIdentity> & { canonical_id: string; official_title: string },
+    season: number,
+    episode: number,
+    options?: EpisodeResolutionOptions,
+  ) => Promise<EpisodeResolutionResult>;
+  cancel_episode_resolution?: (
+    requestId?: string,
+  ) => Promise<{ ok: boolean; cancelled: boolean; request_id: string }>;
   verify_url: (url: string) => Promise<VerifyUrlResponse>;
   get_config: () => Promise<ScraperConfig>;
   save_config: (newConfig: Partial<ScraperConfig>) => Promise<SaveConfigResponse>;
@@ -396,6 +491,10 @@ export interface PyWebViewApi {
     title?: string,
     strictCache?: boolean,
     timeoutSeconds?: number,
+    torrentFileIndex?: number | null,
+    expectedInfoHash?: string,
+    expectedFilePath?: string,
+    expectedFileSize?: number | null,
   ) => Promise<{ ok: boolean; error?: string; state?: StreamSessionState }>;
   get_stream_status?: () => Promise<StreamSessionState>;
   stop_stream?: () => Promise<StreamSessionState>;

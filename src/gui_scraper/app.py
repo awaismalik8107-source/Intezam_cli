@@ -36,6 +36,7 @@ if __package__ in (None, ""):
         TITLE_SELECTOR,
         ConfigurableTableScraper,
     )
+    from gui_scraper.episode_resolver import EpisodeResolver, make_intezam_magnet_fetcher
     from gui_scraper.metadata import CatalogMetadataService
     from gui_scraper.models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
     from gui_scraper.providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
@@ -58,6 +59,7 @@ else:
         TITLE_SELECTOR,
         ConfigurableTableScraper,
     )
+    from .episode_resolver import EpisodeResolver, make_intezam_magnet_fetcher
     from .metadata import CatalogMetadataService
     from .models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
     from .providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
@@ -93,6 +95,7 @@ class ScraperBridge:
         metadata_service: CatalogMetadataService | None = None,
         discovery_engine: MultiProviderDiscoveryEngine | None = None,
         manifest_inspector: TorrentManifestInspector | None = None,
+        episode_resolver: EpisodeResolver | None = None,
     ) -> None:
         self.scraper = scraper or ConfigurableTableScraper(demo_mode=True)
         self.store = store or LocalMediaStore()
@@ -101,7 +104,12 @@ class ScraperBridge:
             nyaa=NyaaSourceProvider(self.scraper)
         )
         self.manifest_inspector = manifest_inspector or TorrentManifestInspector(
-            user_agent=self.scraper.user_agent
+            user_agent=self.scraper.user_agent,
+            magnet_metadata_fetcher=make_intezam_magnet_fetcher(_find_intezam_binary),
+        )
+        self.episode_resolver = episode_resolver or EpisodeResolver(
+            self.discovery_engine,
+            self.manifest_inspector,
         )
         self._lock = threading.Lock()
         self._stream_lock = threading.Lock()
@@ -204,6 +212,40 @@ class ScraperBridge:
             "error": None,
         }
 
+    def resolve_episode(
+        self,
+        show: dict[str, Any] | str,
+        season: int,
+        episode: int,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an official episode to exact verified torrent file candidates."""
+        identity = self._coerce_media_identity(show)
+        s_num = int(season)
+        ep_num = max(1, int(episode))
+        result = self.episode_resolver.resolve_episode(
+            identity,
+            season=s_num,
+            episode=ep_num,
+            options=options if isinstance(options, dict) else None,
+        )
+        self._log(
+            f"Episode resolve S{s_num:02d}E{ep_num:02d} for {identity.official_title!r} -> "
+            f"{len(result.candidates)} verified candidate(s), {len(result.possible_matches)} possible, "
+            f"{len(result.unresolved_candidates)} unresolved ({result.metrics.get('total_ms', 0):.0f}ms)."
+        )
+        return result.to_dict()
+
+    def cancel_episode_resolution(self, request_id: str = "") -> dict[str, Any]:
+        """Cancel an in-flight episode resolution request cooperatively."""
+        cleaned_id = (request_id or "").strip()
+        cancelled = self.episode_resolver.cancel(cleaned_id)
+        return {
+            "ok": True,
+            "cancelled": cancelled,
+            "request_id": cleaned_id,
+        }
+
     def inspect_torrent_manifest(
         self,
         torrent_url: str = "",
@@ -237,23 +279,27 @@ class ScraperBridge:
         for s_raw in raw_seasons:
             if not isinstance(s_raw, dict):
                 continue
+            raw_s_num = s_raw.get("season_number")
+            s_num = int(raw_s_num) if raw_s_num is not None else 1
             eps = [
                 EpisodeMetadata(
-                    episode_number=int(ep.get("episode_number") or 1),
-                    season_number=int(ep.get("season_number") or s_raw.get("season_number") or 1),
+                    episode_number=int(ep.get("episode_number") if ep.get("episode_number") is not None else 1),
+                    season_number=int(ep.get("season_number") if ep.get("season_number") is not None else s_num),
                     title=str(ep.get("title") or ""),
                     air_date=str(ep.get("air_date") or ""),
                     overview=str(ep.get("overview") or ""),
                     still_url=str(ep.get("still_url") or ""),
+                    absolute_episode=int(ep["absolute_episode"]) if ep.get("absolute_episode") is not None else None,
+                    is_special=bool(ep.get("is_special", False)),
                 )
                 for ep in (s_raw.get("episodes") or [])
                 if isinstance(ep, dict)
             ]
             seasons.append(
                 SeasonMetadata(
-                    season_number=int(s_raw.get("season_number") or 1),
+                    season_number=s_num,
                     title=str(s_raw.get("title") or ""),
-                    episode_count=int(s_raw.get("episode_count") or len(eps)),
+                    episode_count=int(s_raw.get("episode_count") if s_raw.get("episode_count") is not None else len(eps)),
                     air_year=int(s_raw["air_year"]) if s_raw.get("air_year") else None,
                     poster_url=str(s_raw.get("poster_url") or ""),
                     anilist_id=int(s_raw["anilist_id"]) if s_raw.get("anilist_id") else None,
@@ -586,8 +632,12 @@ class ScraperBridge:
         title: str = "",
         strict_cache: bool = False,
         timeout_seconds: int = 120,
+        torrent_file_index: int | None = None,
+        expected_info_hash: str = "",
+        expected_file_path: str = "",
+        expected_file_size: int | None = None,
     ) -> dict[str, Any]:
-        """Launch the standalone Intezam C++ + LibVLC player safely for a Magnet URI."""
+        """Launch the standalone Intezam C++ + LibVLC player safely for a Magnet URI and explicit file target."""
         cleaned = (url or "").strip()
         if not cleaned.lower().startswith("magnet:"):
             return {
@@ -598,6 +648,30 @@ class ScraperBridge:
         is_valid, msg = inspect_magnet_uri(cleaned)
         if not is_valid:
             return {"ok": False, "error": msg}
+
+        if torrent_file_index is not None:
+            try:
+                file_index_val = int(torrent_file_index)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Invalid torrent file index."}
+            if file_index_val < 0:
+                return {"ok": False, "error": "Torrent file index must be non-negative."}
+        else:
+            file_index_val = None
+
+        norm_hash = (expected_info_hash or "").strip().lower()
+        if norm_hash and not all(c in "0123456789abcdef" for c in norm_hash):
+            return {"ok": False, "error": "Invalid expected info hash format."}
+
+        if expected_file_size is not None:
+            try:
+                expected_size_val = int(expected_file_size)
+            except (TypeError, ValueError):
+                return {"ok": False, "error": "Invalid expected file size."}
+            if expected_size_val < 0:
+                return {"ok": False, "error": "Expected file size must be non-negative."}
+        else:
+            expected_size_val = None
 
         binary = _find_intezam_binary()
         if binary is None:
@@ -612,6 +686,17 @@ class ScraperBridge:
         cmd = [str(binary), "--timeout", str(timeout_clamped)]
         if strict_cache:
             cmd.append("--strict-cache")
+        if file_index_val is not None:
+            cmd.extend(["--file-index", str(file_index_val)])
+            if norm_hash:
+                cmd.extend(["--expected-info-hash", norm_hash])
+            cleaned_path = (expected_file_path or "").replace("\\", "/").strip()
+            if cleaned_path:
+                cmd.extend(["--expected-file-path", cleaned_path])
+            if expected_size_val is not None and expected_size_val > 0:
+                cmd.extend(["--expected-file-size", str(expected_size_val)])
+        else:
+            cmd.append("--select-single")
 
         try:
             proc = subprocess.Popen(
@@ -629,8 +714,8 @@ class ScraperBridge:
 
         if proc.stdin is not None:
             try:
-                # Feed magnet URI and default first eligible video index (1) if prompted.
-                proc.stdin.write(f"{cleaned}\n1\n")
+                # Pass only the Magnet URI via stdin; exact file targeting is supplied explicitly via CLI flags.
+                proc.stdin.write(f"{cleaned}\n")
                 proc.stdin.flush()
                 proc.stdin.close()
             except OSError:
