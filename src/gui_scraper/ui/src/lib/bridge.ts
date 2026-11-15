@@ -14,6 +14,7 @@ import type {
   SearchHistoryEntry,
   SourceSearchFilters,
   StreamSessionState,
+  TorrentManifestInspectionResult,
   VerifyUrlResponse,
   WatchHistoryEntry,
 } from "./types";
@@ -107,6 +108,34 @@ export async function discoverShowSources(
     total_pages: fallback.total_pages,
     provider_statuses: fallback.provider_statuses ?? [],
   };
+}
+
+export async function inspectTorrentManifest(
+  torrentUrl = "",
+  magnetUri = "",
+  infoHash = "",
+  forceRefresh = false,
+): Promise<TorrentManifestInspectionResult> {
+  const api = window.pywebview?.api;
+  if (!api?.inspect_torrent_manifest) {
+    return {
+      status: "unavailable",
+      info_hash: infoHash,
+      source_kind: torrentUrl ? "torrent_url" : "magnet_only",
+      cached: false,
+      torrent_name: "",
+      total_files: 0,
+      total_size_bytes: 0,
+      total_size_label: "0 B",
+      video_count: 0,
+      subtitle_count: 0,
+      auxiliary_count: 0,
+      error: null,
+      inspection_note: "Metadata inspection bridge is unavailable in this runtime.",
+      files: [],
+    };
+  }
+  return api.inspect_torrent_manifest(torrentUrl, magnetUri, infoHash, forceRefresh);
 }
 
 export async function verifyUrl(url: string): Promise<VerifyUrlResponse> {

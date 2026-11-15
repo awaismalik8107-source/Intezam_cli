@@ -4,17 +4,21 @@ import {
   ArrowUpDown,
   Bookmark,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Filter,
   Globe,
   HardDrive,
   Layers3,
+  ListOrdered,
   Magnet,
   RefreshCw,
   Search,
   Users,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { inspectTorrentManifest } from "../lib/bridge";
 import { type BatchKind, buildEpisodeCatalog } from "../lib/episodeCatalog";
 import { QUALITY_RANK } from "../lib/mediaAdapter";
 import type {
@@ -23,7 +27,9 @@ import type {
   MediaSource,
   SourceSearchFilters,
   StreamSessionState,
+  TorrentManifestInspectionResult,
 } from "../lib/types";
+import { BatchEpisodeList, type BatchInspectionState } from "./BatchEpisodeList";
 import { PosterArtwork } from "./PosterArtwork";
 
 interface MediaDetailsViewProps {
@@ -47,6 +53,10 @@ interface MediaDetailsViewProps {
   onLoadMoreEpisodes?: () => void;
   sourceFilters?: SourceSearchFilters;
   onChangeSourceFilters?: (filters: SourceSearchFilters) => void;
+  onInspectTorrentManifest?: (
+    source: MediaSource,
+    forceRefresh?: boolean,
+  ) => Promise<TorrentManifestInspectionResult>;
 }
 
 type EpisodeSourceSort = "seeders" | "quality" | "size";
@@ -64,6 +74,18 @@ function sourceKey(source: MediaSource): string {
     source.item.view_url ||
     source.sourceTitle
   );
+}
+
+function manifestCacheKeyOf(source: MediaSource): string {
+  if (source.infoHash && source.infoHash.trim()) {
+    return `btih:${source.infoHash.trim().toLowerCase()}`;
+  }
+  const magnet = magnetOf(source);
+  if (magnet) {
+    const m = magnet.match(/xt=urn:btih:([A-Za-z0-9]{32,40})/i);
+    if (m) return `btih:${m[1].toLowerCase()}`;
+  }
+  return `src:${sourceKey(source)}`;
 }
 
 function batchBadgeStyle(kind: BatchKind): { label: string; className: string } {
@@ -98,8 +120,11 @@ export function MediaDetailsView({
   onLoadMoreEpisodes,
   sourceFilters,
   onChangeSourceFilters,
+  onInspectTorrentManifest,
 }: MediaDetailsViewProps) {
   const batchSectionRef = useRef<HTMLElement | null>(null);
+  const activeMediaKeyRef = useRef(media.key);
+  const manifestRequestSeqRef = useRef<Record<string, number>>({});
   const isMovie = media.mediaKind === "movie" || media.metadata?.media_type === "movie";
   const isTv = media.mediaKind === "tv" || media.metadata?.media_type === "tv";
   const catalog = useMemo(
@@ -111,13 +136,95 @@ export function MediaDetailsView({
   const [sortBy, setSortBy] = useState<EpisodeSourceSort>("seeders");
   const [expandedSource, setExpandedSource] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [expandedBatchMagnets, setExpandedBatchMagnets] = useState<Record<string, boolean>>({});
+  const [expandedBatchLists, setExpandedBatchLists] = useState<Record<string, boolean>>({});
+  const [batchTabs, setBatchTabs] = useState<Record<string, "official" | "verified">>({});
+  const [batchSeasons, setBatchSeasons] = useState<Record<string, number | null>>({});
+  const [manifestStates, setManifestStates] = useState<Record<string, BatchInspectionState>>({});
 
   useEffect(() => {
+    activeMediaKeyRef.current = media.key;
+    manifestRequestSeqRef.current = {};
     setSeason(null);
     setEpisode(null);
     setExpandedSource(null);
     setCopiedKey(null);
+    setExpandedBatchMagnets({});
+    setExpandedBatchLists({});
+    setBatchTabs({});
+    setBatchSeasons({});
+    setManifestStates({});
   }, [media.key]);
+
+  const handleInspectBatchManifest = useCallback(
+    (source: MediaSource, forceRefresh = false) => {
+      const cacheKey = manifestCacheKeyOf(source);
+      const capturedMediaKey = activeMediaKeyRef.current;
+
+      setManifestStates((prev) => {
+        const existing = prev[cacheKey];
+        if (!forceRefresh && existing && (existing.status === "loading" || existing.status === "done")) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [cacheKey]: {
+            status: "loading",
+            result: existing?.result,
+            error: undefined,
+          },
+        };
+      });
+
+      const nextSeq = (manifestRequestSeqRef.current[cacheKey] ?? 0) + 1;
+      manifestRequestSeqRef.current[cacheKey] = nextSeq;
+
+      const promise = onInspectTorrentManifest
+        ? onInspectTorrentManifest(source, forceRefresh)
+        : inspectTorrentManifest(
+            source.item.torrent_link || "",
+            magnetOf(source) || "",
+            source.infoHash || "",
+            forceRefresh,
+          );
+
+      void promise
+        .then((res) => {
+          if (
+            activeMediaKeyRef.current !== capturedMediaKey ||
+            manifestRequestSeqRef.current[cacheKey] !== nextSeq
+          ) {
+            return;
+          }
+          setManifestStates((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              status: "done",
+              result: res,
+              error: res.error || undefined,
+            },
+          }));
+        })
+        .catch((err) => {
+          if (
+            activeMediaKeyRef.current !== capturedMediaKey ||
+            manifestRequestSeqRef.current[cacheKey] !== nextSeq
+          ) {
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          setManifestStates((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              status: "done",
+              result: undefined,
+              error: msg,
+            },
+          }));
+        });
+    },
+    [onInspectTorrentManifest],
+  );
 
   const currentSeason: number | null =
     season !== null && catalog.seasons.includes(season)
@@ -805,11 +912,25 @@ export function MediaDetailsView({
           </div>
 
           <div className="space-y-3">
-            {availableBatches.map((batch) => {
+            {availableBatches.map((batch, batchIdx) => {
               const badge = batchBadgeStyle(batch.batchKind);
+              const bKey = sourceKey(batch.source);
+              const mCacheKey = manifestCacheKeyOf(batch.source);
+              const magnet = magnetOf(batch.source);
+              const isMagnetOpen = Boolean(expandedBatchMagnets[bKey]);
+              const isEpisodeListOpen = Boolean(expandedBatchLists[bKey]);
+              const isCopied = copiedKey === bKey;
+              const activeTab = batchTabs[bKey] ?? "official";
+              const selectedBatchSeason =
+                bKey in batchSeasons ? batchSeasons[bKey] : null;
+              const inspectionState: BatchInspectionState =
+                manifestStates[mCacheKey] ?? { status: "idle" };
+              const panelId = `batch-episode-list-${batchIdx}`;
+
               return (
                 <article
-                  key={sourceKey(batch.source)}
+                  key={bKey}
+                  data-batch-key={bKey}
                   className="space-y-3 rounded-xl border border-white/10 bg-[#191E2E] p-4"
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
@@ -838,7 +959,102 @@ export function MediaDetailsView({
                       {renderSourceMetadataBadges(batch.source)}
                     </div>
                   </div>
-                  {renderMagnet(batch.source, isBatchOnlyShow)}
+
+                  {/* Independent Batch Actions: Show magnet URI + Show Episode List */}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {magnet ? (
+                      <button
+                        type="button"
+                        aria-expanded={isMagnetOpen}
+                        onClick={() =>
+                          setExpandedBatchMagnets((prev) => ({
+                            ...prev,
+                            [bKey]: !prev[bKey],
+                          }))
+                        }
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-[#786BFF]/30 bg-[#786BFF]/10 px-3 py-1.5 text-xs font-medium text-[#CFC9FF] transition-colors hover:bg-[#786BFF]/20 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+                      >
+                        <Magnet className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>{isMagnetOpen ? "Hide magnet URI" : "Show magnet URI"}</span>
+                      </button>
+                    ) : (
+                      <span className="inline-flex items-center gap-1.5 rounded-lg border border-amber-400/25 bg-amber-400/5 px-3 py-1.5 text-xs text-amber-200/90">
+                        <Magnet className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>Magnet unavailable</span>
+                      </span>
+                    )}
+
+                    <button
+                      type="button"
+                      aria-expanded={isEpisodeListOpen}
+                      aria-controls={panelId}
+                      onClick={() =>
+                        setExpandedBatchLists((prev) => ({
+                          ...prev,
+                          [bKey]: !prev[bKey],
+                        }))
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#111522] px-3 py-1.5 text-xs font-medium text-[#E2E8F0] transition-colors hover:border-[#38BDF8]/40 hover:bg-[#1E2538] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+                    >
+                      <ListOrdered className="h-3.5 w-3.5 text-[#38BDF8]" aria-hidden="true" />
+                      <span>
+                        {isEpisodeListOpen ? "Hide Episode List" : "Show Episode List"}
+                      </span>
+                      {isEpisodeListOpen ? (
+                        <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+                      )}
+                    </button>
+                  </div>
+
+                  {magnet && isMagnetOpen && (
+                    <div className="space-y-2.5">
+                      <code className="block max-h-28 overflow-auto break-all rounded-lg border border-white/10 bg-[#090B12] p-3 font-mono text-[11px] leading-relaxed text-[#C8D0E2] select-all">
+                        {magnet}
+                      </code>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleCopyMagnet(batch.source)}
+                          className="inline-flex items-center gap-2 rounded-lg border border-[#786BFF]/40 bg-[#786BFF]/15 px-3.5 py-2 text-xs font-semibold text-[#F8FAFC] transition-colors hover:bg-[#786BFF]/25 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+                        >
+                          {isCopied ? (
+                            <>
+                              <Check className="h-3.5 w-3.5 text-emerald-300" aria-hidden="true" />
+                              <span>Copied magnet link</span>
+                            </>
+                          ) : (
+                            <>
+                              <Copy className="h-3.5 w-3.5 text-[#CFC9FF]" aria-hidden="true" />
+                              <span>Copy magnet link</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {isEpisodeListOpen && (
+                    <BatchEpisodeList
+                      panelId={panelId}
+                      batch={batch}
+                      officialSeasons={media.officialSeasons}
+                      metadataProvider={media.metadataProvider || media.providerName}
+                      activeTab={activeTab}
+                      onChangeTab={(nextTab) =>
+                        setBatchTabs((prev) => ({ ...prev, [bKey]: nextTab }))
+                      }
+                      selectedSeason={selectedBatchSeason}
+                      onSelectSeason={(nextSeason) =>
+                        setBatchSeasons((prev) => ({ ...prev, [bKey]: nextSeason }))
+                      }
+                      inspectionState={inspectionState}
+                      onInspectManifest={(forceRefresh = false) =>
+                        handleInspectBatchManifest(batch.source, forceRefresh)
+                      }
+                    />
+                  )}
                 </article>
               );
             })}

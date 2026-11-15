@@ -306,6 +306,34 @@ export interface DiscoverShowsResponse {
   provider_notes?: string[];
 }
 
+export type ManifestFileType = "video" | "subtitle" | "auxiliary";
+
+export interface TorrentManifestFile {
+  relative_path: string;
+  filename: string;
+  size_bytes: number;
+  size_label: string;
+  file_type: ManifestFileType | string;
+  extension?: string;
+}
+
+export interface TorrentManifestInspectionResult {
+  status: "verified" | "unavailable" | "error";
+  info_hash: string;
+  source_kind: "torrent_url" | "magnet_only" | "cache" | string;
+  cached: boolean;
+  torrent_name: string;
+  total_files: number;
+  total_size_bytes: number;
+  total_size_label: string;
+  video_count: number;
+  subtitle_count: number;
+  auxiliary_count: number;
+  error?: string | null;
+  inspection_note?: string;
+  files: TorrentManifestFile[];
+}
+
 export interface DiscoverShowSourcesResponse {
   canonical_id: string;
   show?: MediaIdentity;
@@ -340,6 +368,12 @@ export interface PyWebViewApi {
     filters?: SourceSearchFilters,
     cursors?: Record<string, Record<string, unknown>>,
   ) => Promise<DiscoverShowSourcesResponse>;
+  inspect_torrent_manifest?: (
+    torrentUrl?: string,
+    magnetUri?: string,
+    infoHash?: string,
+    forceRefresh?: boolean,
+  ) => Promise<TorrentManifestInspectionResult>;
   verify_url: (url: string) => Promise<VerifyUrlResponse>;
   get_config: () => Promise<ScraperConfig>;
   save_config: (newConfig: Partial<ScraperConfig>) => Promise<SaveConfigResponse>;

@@ -40,6 +40,7 @@ if __package__ in (None, ""):
     from gui_scraper.models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
     from gui_scraper.providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
     from gui_scraper.storage import LocalMediaStore
+    from gui_scraper.torrent_manifest import TorrentManifestInspector
     from gui_scraper.validator import inspect_magnet_uri, verify_http_status
 else:
     from .engine import (
@@ -61,6 +62,7 @@ else:
     from .models import EpisodeMetadata, MediaIdentity, SeasonMetadata, SourceSearchFilters
     from .providers import MultiProviderDiscoveryEngine, NyaaSourceProvider
     from .storage import LocalMediaStore
+    from .torrent_manifest import TorrentManifestInspector
     from .validator import inspect_magnet_uri, verify_http_status
 
 UI_INDEX_PATH = Path(__file__).resolve().parent / "ui" / "dist" / "index.html"
@@ -90,12 +92,16 @@ class ScraperBridge:
         store: LocalMediaStore | None = None,
         metadata_service: CatalogMetadataService | None = None,
         discovery_engine: MultiProviderDiscoveryEngine | None = None,
+        manifest_inspector: TorrentManifestInspector | None = None,
     ) -> None:
         self.scraper = scraper or ConfigurableTableScraper(demo_mode=True)
         self.store = store or LocalMediaStore()
         self.metadata_service = metadata_service or CatalogMetadataService()
         self.discovery_engine = discovery_engine or MultiProviderDiscoveryEngine(
             nyaa=NyaaSourceProvider(self.scraper)
+        )
+        self.manifest_inspector = manifest_inspector or TorrentManifestInspector(
+            user_agent=self.scraper.user_agent
         )
         self._lock = threading.Lock()
         self._stream_lock = threading.Lock()
@@ -197,6 +203,26 @@ class ScraperBridge:
             "rejected_count": rejected_count,
             "error": None,
         }
+
+    def inspect_torrent_manifest(
+        self,
+        torrent_url: str = "",
+        magnet_uri: str = "",
+        info_hash: str = "",
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """Metadata-only .torrent manifest inspection without initiating downloads or peer connections."""
+        result = self.manifest_inspector.inspect(
+            torrent_url=torrent_url,
+            magnet_uri=magnet_uri,
+            info_hash=info_hash,
+            force_refresh=bool(force_refresh),
+        )
+        self._log(
+            f"Torrent manifest inspect (status={result.status}, cached={result.cached}, files={result.total_files}) "
+            f"hash={result.info_hash[:12] or 'none'}."
+        )
+        return result.to_dict()
 
     @staticmethod
     def _coerce_media_identity(show: dict[str, Any] | str) -> MediaIdentity:

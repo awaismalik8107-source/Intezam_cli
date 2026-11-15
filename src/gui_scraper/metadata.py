@@ -658,8 +658,8 @@ class TMDBMetadataProvider:
         for s_raw in details.get("seasons") or []:
             if not isinstance(s_raw, dict):
                 continue
-            s_num = int(s_raw.get("season_number") or 0)
-            if s_num <= 0:
+            s_num = int(s_raw.get("season_number") if s_raw.get("season_number") is not None else -1)
+            if s_num < 0:
                 continue
             ep_count = int(s_raw.get("episode_count") or 0)
             s_air = (s_raw.get("air_date") or "").strip()
@@ -682,7 +682,7 @@ class TMDBMetadataProvider:
                         EpisodeMetadata(
                             episode_number=ep_num,
                             season_number=s_num,
-                            title=str(ep_raw.get("name") or f"Episode {ep_num}"),
+                            title=str(ep_raw.get("name") or "").strip(),
                             air_date=str(ep_raw.get("air_date") or ""),
                             overview=strip_html_tags(ep_raw.get("overview")),
                             still_url=f"{TMDB_IMAGE_BASE_URL}/w500{still_path}" if still_path else "",
@@ -694,18 +694,18 @@ class TMDBMetadataProvider:
                         EpisodeMetadata(
                             episode_number=ep_num,
                             season_number=s_num,
-                            title=f"Episode {ep_num}",
+                            title="",
                         )
                     )
 
             seasons.append(
                 SeasonMetadata(
                     season_number=s_num,
-                    title=str(s_raw.get("name") or f"Season {s_num}"),
+                    title="Specials" if s_num == 0 else str(s_raw.get("name") or f"Season {s_num}"),
                     episode_count=len(episodes) or ep_count,
                     air_year=s_year,
                     poster_url=s_poster,
-                    season_aliases=[f"{name} Season {s_num}", f"{name} S{s_num:02d}"],
+                    season_aliases=[f"{name} Season {s_num}", f"{name} S{s_num:02d}"] if s_num > 0 else [f"{name} Specials"],
                     episodes=episodes,
                 )
             )
@@ -832,16 +832,16 @@ class TVMazeMetadataProvider:
         for ep in embedded.get("episodes") or []:
             if not isinstance(ep, dict):
                 continue
-            s_num = int(ep.get("season") or 0)
+            s_num = int(ep.get("season") if ep.get("season") is not None else -1)
             ep_num = int(ep.get("number") or 0)
-            if s_num <= 0 or ep_num <= 0:
+            if s_num < 0 or ep_num <= 0:
                 continue
             ep_img = (ep.get("image") or {}) if isinstance(ep.get("image"), dict) else {}
             eps_by_season.setdefault(s_num, []).append(
                 EpisodeMetadata(
                     episode_number=ep_num,
                     season_number=s_num,
-                    title=str(ep.get("name") or f"Episode {ep_num}"),
+                    title=str(ep.get("name") or "").strip(),
                     air_date=str(ep.get("airdate") or ""),
                     overview=strip_html_tags(ep.get("summary")),
                     still_url=str(ep_img.get("original") or ep_img.get("medium") or ""),
@@ -854,14 +854,14 @@ class TVMazeMetadataProvider:
             for s_raw in raw_seasons:
                 if not isinstance(s_raw, dict):
                     continue
-                s_num = int(s_raw.get("number") or 0)
-                if s_num <= 0:
+                s_num = int(s_raw.get("number") if s_raw.get("number") is not None else -1)
+                if s_num < 0:
                     continue
                 s_eps = sorted(eps_by_season.get(s_num, []), key=lambda e: e.episode_number)
                 ep_order = int(s_raw.get("episodeOrder") or len(s_eps) or 0)
                 if not s_eps and ep_order > 0:
                     s_eps = [
-                        EpisodeMetadata(episode_number=i, season_number=s_num, title=f"Episode {i}")
+                        EpisodeMetadata(episode_number=i, season_number=s_num, title="")
                         for i in range(1, ep_order + 1)
                     ]
                 s_prem = str(s_raw.get("premiereDate") or "").strip()
@@ -870,11 +870,11 @@ class TVMazeMetadataProvider:
                 seasons.append(
                     SeasonMetadata(
                         season_number=s_num,
-                        title=str(s_raw.get("name") or f"Season {s_num}"),
+                        title="Specials" if s_num == 0 else str(s_raw.get("name") or f"Season {s_num}"),
                         episode_count=len(s_eps) or ep_order,
                         air_year=s_year,
                         poster_url=str(s_img.get("original") or s_img.get("medium") or poster_url),
-                        season_aliases=[f"{name} Season {s_num}", f"{name} S{s_num:02d}"],
+                        season_aliases=[f"{name} Season {s_num}", f"{name} S{s_num:02d}"] if s_num > 0 else [f"{name} Specials"],
                         episodes=s_eps,
                     )
                 )
@@ -883,7 +883,7 @@ class TVMazeMetadataProvider:
                 seasons.append(
                     SeasonMetadata(
                         season_number=s_num,
-                        title=f"Season {s_num}",
+                        title="Specials" if s_num == 0 else f"Season {s_num}",
                         episode_count=len(s_eps),
                         poster_url=poster_url,
                         episodes=sorted(s_eps, key=lambda e: e.episode_number),
