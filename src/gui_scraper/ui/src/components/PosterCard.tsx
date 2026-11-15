@@ -24,33 +24,42 @@ export function PosterCard({
   compactWidth = false,
 }: PosterCardProps) {
   const catalog = useMemo(
-    () => buildEpisodeCatalog(media.sources, media.officialSeasons),
-    [media.sources, media.officialSeasons],
+    () => buildEpisodeCatalog(media.sources, media.officialSeasons, media.mediaKind),
+    [media.sources, media.officialSeasons, media.mediaKind],
   );
+  const isMovie = media.mediaKind === "movie" || media.metadata?.media_type === "movie";
+  const isTv = media.mediaKind === "tv" || media.metadata?.media_type === "tv";
+  const mediaKindBadge = isMovie ? "Movie" : isTv ? "TV Series" : "Anime";
+  const countryCode = media.country || media.metadata?.country || "";
   const officialSeasonCount = media.officialSeasons?.length ?? 0;
   const officialEpisodeTotal = useMemo(
     () =>
+      media.metadata?.episode_count ||
       (media.officialSeasons ?? []).reduce(
         (acc, s) => acc + (s.episode_count || s.episodes?.length || 0),
         0,
       ),
-    [media.officialSeasons],
+    [media.officialSeasons, media.metadata?.episode_count],
   );
-  const seasonCount = catalog.seasons.length || officialSeasonCount;
-  const episodeCount = catalog.episodes.length || officialEpisodeTotal;
+  const seasonCount = isMovie ? 0 : catalog.seasons.length || officialSeasonCount;
+  const episodeCount = isMovie ? 0 : catalog.episodes.length || officialEpisodeTotal;
   const batchCount = catalog.batches.length;
 
-  const seasonSummary =
-    seasonCount > 1
+  const seasonSummary = isMovie
+    ? "Feature Film"
+    : seasonCount > 1
       ? `${seasonCount} Seasons`
       : seasonCount === 1
         ? `Season ${catalog.seasons[0] ?? media.officialSeasons?.[0]?.season_number ?? 1}`
         : batchCount > 0
           ? "Batch Pack"
-          : "Series";
+          : mediaKindBadge;
 
-  const episodeSummary =
-    episodeCount > 0
+  const episodeSummary = isMovie
+    ? media.sources.length > 0
+      ? `${media.sources.length} ${media.sources.length === 1 ? "Release" : "Releases"}`
+      : media.metadataProvider || "Movie"
+    : episodeCount > 0
       ? `${episodeCount} ${episodeCount === 1 ? "Episode" : "Episodes"}`
       : batchCount > 0
         ? `${batchCount} ${batchCount === 1 ? "Batch" : "Batches"}`
@@ -135,6 +144,25 @@ export function PosterCard({
           </h3>
 
           <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#AAB5CA]">
+            {media.year && (
+              <span className="inline-flex items-center rounded-md border border-white/10 bg-[#0B0D16] px-1.5 py-0.5 font-mono text-[10.5px] font-semibold text-[#F8FAFC]">
+                {media.year}
+              </span>
+            )}
+            <span
+              className={`inline-flex items-center rounded-md border px-1.5 py-0.5 text-[10.5px] font-medium ${
+                isMovie
+                  ? "border-amber-400/30 bg-amber-400/10 text-amber-200"
+                  : isTv
+                    ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+                    : "border-[#786BFF]/35 bg-[#786BFF]/15 text-[#D6DDF0]"
+              }`}
+            >
+              {countryCode && isTv ? `${mediaKindBadge} · ${countryCode}` : mediaKindBadge}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[#AAB5CA]">
             <span className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#191E2E] px-1.5 py-0.5 font-medium text-[#D6DDF0]">
               <Tv className="h-3 w-3 text-[#786BFF]" aria-hidden="true" />
               {seasonSummary}
@@ -151,7 +179,7 @@ export function PosterCard({
           onClick={() => onSelect(media)}
           className="inline-flex w-full items-center justify-between rounded-xl border border-white/[0.08] bg-[#191E2E]/85 px-3 py-1.5 text-xs font-medium text-[#E2E8F0] transition-colors hover:border-[#786BFF]/50 hover:bg-[#232A40] hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
         >
-          <span>Browse Episodes</span>
+          <span>{isMovie ? "Browse Releases" : "Browse Episodes"}</span>
           <ArrowRight className="h-3.5 w-3.5 text-[#AFA6FF]" aria-hidden="true" />
         </button>
       </div>

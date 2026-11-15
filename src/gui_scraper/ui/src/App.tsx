@@ -55,6 +55,7 @@ import type {
   ScrapedItem,
   ScraperConfig,
   SearchHistoryEntry,
+  SearchStatusKind,
   SourceSearchFilters,
   StreamSessionState,
   ToastMessage,
@@ -120,7 +121,18 @@ export function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const activeSearchIdRef = useRef(0);
   const activeDetailIdRef = useRef(0);
-  const detailsCacheRef = useRef(new Map<string, { entry: MediaEntry; expires: number; hasMore: boolean; nextPage: number }>());
+  const detailsCacheRef = useRef(
+    new Map<
+      string,
+      {
+        entry: MediaEntry;
+        expires: number;
+        hasMore: boolean;
+        nextPage: number;
+        cursors?: Record<string, Record<string, unknown>>;
+      }
+    >(),
+  );
 
   const [preferences, setPreferences] = useState<UiPreferences>(loadInitialPreferences);
   const [activeSection, setActiveSection] = useState<NavSection>("home");
@@ -130,12 +142,18 @@ export function App() {
   const [detailsError, setDetailsError] = useState<string | null>(null);
   const [detailsHasMore, setDetailsHasMore] = useState(false);
   const [detailsNextPage, setDetailsNextPage] = useState(1);
+  const [detailsCursors, setDetailsCursors] = useState<
+    Record<string, Record<string, unknown>> | undefined
+  >(undefined);
   const [inspectedRow, setInspectedRow] = useState<ScrapedItem | null>(null);
 
   const [mode, setMode] = useState<ScrapeMode>(() => preferences.defaultMode);
   const [query, setQuery] = useState("");
   const [items, setItems] = useState<ScrapedItem[]>([]);
   const [metadataEntries, setMetadataEntries] = useState<MediaEntry[]>([]);
+  const [searchModeKind, setSearchModeKind] = useState<"metadata" | "raw">("metadata");
+  const [searchStatus, setSearchStatus] = useState<SearchStatusKind>("idle");
+  const [providerNotes, setProviderNotes] = useState<string[]>([]);
   const [sourceFilters, setSourceFilters] = useState<SourceSearchFilters>({
     category: "1_0",
     filter_mode: "0",
@@ -234,17 +252,11 @@ export function App() {
   }, [bridgeReady, pushToast, streamState?.active]);
 
   const discoveredMedia = useMemo(() => {
-    const groupedFromItems = groupItemsToMedia(items, config.provider_name);
-    if (metadataEntries.length === 0) {
-      return groupedFromItems;
+    if (searchModeKind === "raw") {
+      return groupItemsToMedia(items, config.provider_name);
     }
-    const existingKeys = new Set(metadataEntries.map((m) => m.key));
-    const existingTitles = new Set(metadataEntries.map((m) => m.title.toLowerCase()));
-    const extras = groupedFromItems.filter(
-      (g) => !existingKeys.has(g.key) && !existingTitles.has(g.title.toLowerCase()),
-    );
-    return [...metadataEntries, ...extras];
-  }, [items, metadataEntries, config.provider_name]);
+    return metadataEntries;
+  }, [searchModeKind, items, metadataEntries, config.provider_name]);
 
   const libraryMedia = useMemo<MediaEntry[]>(
     () =>
@@ -294,14 +306,19 @@ export function App() {
       navigateToSearch = false,
       page = 1,
       append = false,
+      forceRaw = false,
     ) => {
       const targetQuery = (explicitQuery ?? query).trim();
       const targetMode = explicitMode ?? mode;
       const safePage = Math.max(1, page);
+      const useRawMode = forceRaw || activeSection === "extensions" || safePage > 1 || append;
 
       if (explicitQuery !== undefined) setQuery(explicitQuery);
       if (!append) {
         setInspectedRow(null);
+        setMetadataEntries([]);
+        setItems([]);
+        setProviderNotes([]);
       }
       if (navigateToSearch) {
         setSelectedMediaKey(null);
@@ -316,35 +333,59 @@ export function App() {
       }
       setHasSearched(true);
       setSearchError(null);
+      setSearchModeKind(useRawMode ? "raw" : "metadata");
 
       try {
-        // Stage 9: Metadata-first show discovery (no torrent scraping per card)
-        let metaShows: MediaEntry[] = [];
-        if (safePage === 1 && !append && activeSection !== "extensions") {
+        // Metadata-first show discovery (no automatic raw fallback masking no_matches)
+        if (!useRawMode && safePage === 1 && !append) {
           const discoverRes = await discoverShows(targetQuery, targetMode);
           if (requestId !== activeSearchIdRef.current) return;
+
+          const statusKind: SearchStatusKind =
+            discoverRes.search_status ||
+            (discoverRes.shows && discoverRes.shows.length > 0
+              ? targetMode === "mock"
+                ? "mock"
+                : "ok"
+              : "no_matches");
+          setSearchStatus(statusKind);
+          setProviderNotes(discoverRes.provider_notes || []);
+          setCurrentPage(1);
+          setTotalPages(1);
+          setHasNextPage(false);
+
           if (discoverRes.shows && discoverRes.shows.length > 0) {
-            metaShows = discoverRes.shows.map((identity: MediaIdentity) =>
+            const metaShows = discoverRes.shows.map((identity: MediaIdentity) =>
               adaptMetadataToMediaEntry(identity, [], config.provider_name),
             );
             setMetadataEntries(metaShows);
-            setItems([]);
-            setCurrentPage(1);
-            setTotalPages(1);
-            setHasNextPage(false);
             setDiscoveryCatalog((prev) => {
               const incomingKeys = new Set(metaShows.map((g) => g.key));
               return [...metaShows, ...prev.filter((g) => !incomingKeys.has(g.key))].slice(0, 36);
             });
-            const hist = await getSearchHistory();
-            setSearchHistory(hist);
-            return;
+          } else {
+            setMetadataEntries([]);
           }
-          setMetadataEntries([]);
+
+          // Optional history refresh must never wipe out search results on transient failure
+          try {
+            const hist = await getSearchHistory();
+            if (requestId === activeSearchIdRef.current) {
+              setSearchHistory(hist);
+            }
+          } catch {
+            // Non-fatal history read error
+          }
+          return;
         }
 
-        // Raw / paginated torrent search for Extensions view or when no metadata match exists
-        const res = await searchPaginated(targetQuery, targetMode, safePage, false, sourceFilters);
+        // Explicit raw / paginated torrent search (Extensions view or user-requested raw Nyaa fallback)
+        const rawCategory =
+          activeSection === "extensions" ? sourceFilters.category || "0_0" : "0_0";
+        const res = await searchPaginated(targetQuery, targetMode, safePage, false, {
+          ...sourceFilters,
+          category: rawCategory,
+        });
         if (requestId !== activeSearchIdRef.current) return;
 
         const incomingRows = res.items;
@@ -363,6 +404,7 @@ export function App() {
           setItems(incomingRows);
         }
 
+        setSearchStatus(incomingRows.length > 0 ? "ok" : "no_matches");
         setCurrentPage(res.page || safePage);
         setTotalPages(Math.max(res.total_pages || 1, res.page || safePage));
         setHasNextPage(Boolean(res.has_next_page));
@@ -375,14 +417,22 @@ export function App() {
           });
         }
         if (safePage === 1 && !append) {
-          const hist = await getSearchHistory();
-          setSearchHistory(hist);
+          try {
+            const hist = await getSearchHistory();
+            if (requestId === activeSearchIdRef.current) {
+              setSearchHistory(hist);
+            }
+          } catch {
+            // Non-fatal history read error
+          }
         }
       } catch (err) {
         if (requestId !== activeSearchIdRef.current) return;
         const msg = err instanceof Error ? err.message : String(err);
         if (!append) {
+          setMetadataEntries([]);
           setItems([]);
+          setSearchStatus("provider_unavailable");
           setSearchError(msg);
         }
         pushToast(msg, "error");
@@ -404,15 +454,24 @@ export function App() {
       force = false,
       startPage = 1,
       overrideFilters?: SourceSearchFilters,
+      cursorsOverride?: Record<string, Record<string, unknown>>,
     ) => {
-      const effectiveFilters = overrideFilters ?? sourceFilters;
-      const filterSig = `${effectiveFilters.category || "1_0"}:${effectiveFilters.sort_by || "seeders"}`;
+      const defaultCategory = media.mediaKind === "anime" || !media.mediaKind ? "1_0" : "0_0";
+      const effectiveFilters: SourceSearchFilters = overrideFilters ?? {
+        ...sourceFilters,
+        category:
+          media.mediaKind && media.mediaKind !== "anime" && sourceFilters.category === "1_0"
+            ? defaultCategory
+            : sourceFilters.category,
+      };
+      const filterSig = `${effectiveFilters.category || defaultCategory}:${effectiveFilters.sort_by || "seeders"}`;
       const cacheKey = `${mode}:${filterSig}:${media.key}`;
       const cached = detailsCacheRef.current.get(cacheKey);
       if (startPage === 1 && !force && cached && cached.expires > Date.now()) {
         setDetailedMedia(cached.entry);
         setDetailsHasMore(cached.hasMore);
         setDetailsNextPage(cached.nextPage);
+        setDetailsCursors(cached.cursors);
         setDetailsError(null);
         setDetailsLoading(false);
         return;
@@ -426,6 +485,7 @@ export function App() {
       let hasMore = false;
       let nextPage = startPage;
       let providerStatuses: ProviderRetrievalStatus[] | undefined = media.providerStatuses;
+      let nextCursors: Record<string, Record<string, unknown>> | undefined = cursorsOverride;
       try {
         const identityPayload: Partial<MediaIdentity> & {
           canonical_id: string;
@@ -433,7 +493,7 @@ export function App() {
         } = media.metadata ?? {
           canonical_id: media.key,
           official_title: media.title,
-          media_type: "anime",
+          media_type: media.mediaKind || "anime",
           release_year: media.year ? Number(media.year) : null,
           alternate_titles: media.alternateTitles ?? [],
           genres: media.genres ?? [],
@@ -446,15 +506,23 @@ export function App() {
           startPage,
           force,
           effectiveFilters,
+          startPage > 1 ? (cursorsOverride ?? detailsCursors) : undefined,
         );
         if (requestId !== activeDetailIdRef.current) return;
         collected.push(...response.items);
         hasMore = response.has_next_page;
         nextPage = startPage + 1;
         providerStatuses = response.provider_statuses;
+        nextCursors = response.pagination_cursors ?? undefined;
 
         const baseEntry = response.show
-          ? adaptMetadataToMediaEntry(response.show, [], config.provider_name, providerStatuses)
+          ? adaptMetadataToMediaEntry(
+              response.show,
+              [],
+              config.provider_name,
+              providerStatuses,
+              nextCursors,
+            )
           : media;
         const entry = mergeSourcesIntoMediaEntry(
           {
@@ -470,6 +538,7 @@ export function App() {
           collected,
           config.provider_name,
           providerStatuses,
+          nextCursors,
         );
 
         if (requestId !== activeDetailIdRef.current) return;
@@ -477,11 +546,13 @@ export function App() {
           entry,
           hasMore,
           nextPage,
+          cursors: nextCursors,
           expires: Date.now() + 90_000,
         });
         setDetailedMedia(entry);
         setDetailsHasMore(hasMore);
         setDetailsNextPage(nextPage);
+        setDetailsCursors(nextCursors);
       } catch (err) {
         if (requestId !== activeDetailIdRef.current) return;
         setDetailsError(err instanceof Error ? err.message : String(err));
@@ -490,6 +561,7 @@ export function App() {
           collected,
           config.provider_name,
           providerStatuses,
+          nextCursors,
         );
         setDetailedMedia((previous) =>
           collected.length > 0
@@ -502,7 +574,7 @@ export function App() {
         if (requestId === activeDetailIdRef.current) setDetailsLoading(false);
       }
     },
-    [mode, config.provider_name, sourceFilters],
+    [mode, config.provider_name, sourceFilters, detailsCursors],
   );
 
   const handleSelectMedia = useCallback((media: MediaEntry) => {
@@ -511,9 +583,31 @@ export function App() {
     setDetailedMedia(media);
     setDetailsHasMore(false);
     setDetailsNextPage(1);
+    setDetailsCursors(undefined);
     setDetailsError(null);
     void loadTitleEpisodes(media);
   }, [loadTitleEpisodes]);
+
+  const handleModeChange = useCallback(
+    (nextMode: ScrapeMode) => {
+      if (nextMode === mode) return;
+      activeSearchIdRef.current += 1;
+      activeDetailIdRef.current += 1;
+      detailsCacheRef.current.clear();
+      setMode(nextMode);
+      setMetadataEntries([]);
+      setItems([]);
+      setSearchStatus("idle");
+      setProviderNotes([]);
+      setDetailsCursors(undefined);
+      setSelectedMediaKey(null);
+      setDetailedMedia(null);
+      if (query.trim()) {
+        void executeSearch(query, nextMode, activeSection !== "extensions", 1, false);
+      }
+    },
+    [mode, query, activeSection, executeSearch],
+  );
 
   const handleToggleLibrary = useCallback(
     async (media: MediaEntry) => {
@@ -854,7 +948,7 @@ export function App() {
               isLoading={isLoading}
               bridgeReady={bridgeReady}
               onQueryChange={setQuery}
-              onModeChange={setMode}
+              onModeChange={handleModeChange}
               onSearch={() =>
                 executeSearch(undefined, undefined, activeSection !== "extensions")
               }
@@ -884,11 +978,20 @@ export function App() {
                   loadingEpisodes={detailsLoading}
                   episodeError={detailsError}
                   moreEpisodesAvailable={detailsHasMore}
-                  onLoadEpisodes={() => void loadTitleEpisodes(selectedMedia, true)}
-                  onLoadMoreEpisodes={() => void loadTitleEpisodes(selectedMedia, true, detailsNextPage)}
+                  onLoadEpisodes={() => void loadTitleEpisodes(selectedMedia, true, 1)}
+                  onLoadMoreEpisodes={() =>
+                    void loadTitleEpisodes(
+                      selectedMedia,
+                      true,
+                      detailsNextPage,
+                      undefined,
+                      detailsCursors,
+                    )
+                  }
                   sourceFilters={sourceFilters}
                   onChangeSourceFilters={(nextFilters) => {
                     setSourceFilters(nextFilters);
+                    setDetailsCursors(undefined);
                     void loadTitleEpisodes(selectedMedia, true, 1, nextFilters);
                   }}
                 />
@@ -960,6 +1063,8 @@ export function App() {
                   totalPages={totalPages}
                   hasNextPage={hasNextPage}
                   errorMessage={searchError}
+                  searchStatus={searchStatus}
+                  providerNotes={providerNotes}
                   libraryKeys={libraryKeys}
                   searchHistory={searchHistory}
                   selectedRowId={inspectedRow?.id ?? null}
@@ -974,18 +1079,30 @@ export function App() {
                   onToggleLibrary={handleToggleLibrary}
                   onQuickSearch={(q) => executeSearch(q, undefined, false, 1, false)}
                   onBrowseDefault={() => executeSearch("", undefined, false, 1, false)}
-                  onRetry={() => executeSearch(undefined, undefined, false, currentPage, false)}
+                  onRetry={() =>
+                    executeSearch(
+                      undefined,
+                      undefined,
+                      false,
+                      currentPage,
+                      false,
+                      searchModeKind === "raw",
+                    )
+                  }
                   onSelectPage={(nextPage) =>
-                    executeSearch(undefined, undefined, false, nextPage, false)
+                    executeSearch(undefined, undefined, false, nextPage, false, true)
                   }
                   onLoadMore={() =>
-                    executeSearch(undefined, undefined, false, currentPage + 1, true)
+                    executeSearch(undefined, undefined, false, currentPage + 1, true, true)
                   }
                   onOpenSettings={() => setActiveSection("settings")}
                   onOpenAdvancedBrowser={() => {
                     setSelectedMediaKey(null);
                     setActiveSection("extensions");
                   }}
+                  onSearchRawFallback={() =>
+                    executeSearch(query, undefined, false, 1, false, true)
+                  }
                 />
               ) : activeSection === "library" ? (
                 <LibraryView

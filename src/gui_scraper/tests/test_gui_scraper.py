@@ -1234,5 +1234,401 @@ def test_malformed_row_is_handled_safely() -> None:
     assert valid_row.downloads == 25
 
 
+def test_stage3_query_normalization_and_alias_clusters() -> None:
+    """Verify Stage 3 query normalization handles Unicode, punctuation, compact spacing, Romaji aliases, years, and countries."""
+    from gui_scraper.matching import compact_alnum_key, preprocess_search_query
+
+    q_dandadan = preprocess_search_query("DAN DA DAN")
+    assert q_dandadan.compact_key == compact_alnum_key("Dandadan")
+    assert "dandadan" in [compact_alnum_key(a) for a in q_dandadan.expanded_aliases]
+
+    q_frieren = preprocess_search_query("Sousou no Frieren")
+    assert any("frieren" in a.lower() for a in q_frieren.expanded_aliases)
+
+    q_office = preprocess_search_query("The Office 2005")
+    assert q_office.explicit_year == 2005
+    assert q_office.normalized_text == "the office"
+
+    q_one_piece = preprocess_search_query("One Piece (Live Action)")
+    assert q_one_piece.media_qualifier == "live_action"
+    assert q_one_piece.normalized_text == "one piece"
+
+    q_office_uk = preprocess_search_query("The Office UK")
+    assert q_office_uk.country_qualifier == "GB"
+
+
+def test_stage2_and_stage4_ranking_and_identity_separation() -> None:
+    """
+    Verify Stage 2 identity separation and Stage 4 deterministic ranking:
+    - Remakes/adaptations/countries never merge solely on title equality
+    - Movies never receive fabricated seasons
+    - Commercial/promotional noise and non-matching short titles are suppressed
+    - Unknown Live queries do NOT fall back to fake demo shows
+    """
+    from gui_scraper.matching import preprocess_search_query, rank_and_filter_candidates
+    from gui_scraper.metadata import CatalogMetadataService
+    from gui_scraper.models import MediaIdentity, SeasonMetadata
+
+    svc = CatalogMetadataService()
+
+    # 1. Identity separation: Anime One Piece (1999) vs Live-Action One Piece (2023)
+    op_anime = MediaIdentity(
+        canonical_id="anilist:21",
+        official_title="ONE PIECE",
+        media_type="anime",
+        release_year=1999,
+        country="JP",
+    )
+    op_live = MediaIdentity(
+        canonical_id="tvmaze:56117",
+        official_title="One Piece",
+        media_type="tv",
+        release_year=2023,
+        country="US",
+    )
+    merged_op = svc._merge_identities([op_anime], [op_live])
+    assert len(merged_op) == 2
+
+    # 2. Country separation: The Office (US 2005) vs The Office (UK 2001)
+    office_us = MediaIdentity(
+        canonical_id="tvmaze:526",
+        official_title="The Office",
+        media_type="tv",
+        release_year=2005,
+        country="US",
+    )
+    office_uk = MediaIdentity(
+        canonical_id="tvmaze:1221",
+        official_title="The Office",
+        media_type="tv",
+        release_year=2001,
+        country="GB",
+    )
+    merged_office = svc._merge_identities([office_us], [office_uk])
+    assert len(merged_office) == 2
+
+    # 3. Ranking removes promotional CM noise for Your Name
+    yn_movie = MediaIdentity(
+        canonical_id="anilist:21519",
+        official_title="Your Name.",
+        romaji_title="Kimi no Na wa.",
+        media_type="movie",
+        release_year=2016,
+    )
+    yn_cm = MediaIdentity(
+        canonical_id="anilist:98765",
+        official_title="Suntory Minami Alps no Tennen Mizu x Kimi no Na wa. CM",
+        romaji_title="Suntory Minami Alps no Tennen Mizu",
+        alternate_titles=["Kimi no Na wa."],
+        media_type="anime",
+        release_year=2016,
+        seasons=[SeasonMetadata(season_number=1, title="Season 1", episode_count=1)],
+    )
+    ranked_yn = rank_and_filter_candidates(preprocess_search_query("Your Name"), [yn_cm, yn_movie])
+    assert len(ranked_yn) >= 1
+    assert ranked_yn[0].canonical_id == "anilist:21519"
+    assert ranked_yn[0].media_type == "movie"
+
+    # 3b. Contained phrase matches (e.g. "Call Me by Your Name", "What Is Your Name?") never beat exact canonical "Your Name."
+    call_me_yn = MediaIdentity(
+        canonical_id="imdb:tt5726616",
+        official_title="Call Me by Your Name",
+        media_type="movie",
+        release_year=2017,
+        imdb_id="tt5726616",
+        poster_url="https://example.com/cmbyn.jpg",
+    )
+    what_is_yn = MediaIdentity(
+        canonical_id="imdb:tt1954577",
+        official_title="What Is Your Name?",
+        media_type="movie",
+        release_year=1953,
+        imdb_id="tt1954577",
+        poster_url="https://example.com/wiyn.jpg",
+    )
+    ranked_yn_exact = rank_and_filter_candidates(
+        preprocess_search_query("Your Name"), [call_me_yn, yn_movie]
+    )
+    assert ranked_yn_exact[0].canonical_id == "anilist:21519"
+    assert ranked_yn_exact[0].match_score > ranked_yn_exact[1].match_score
+
+    ranked_knw_exact = rank_and_filter_candidates(
+        preprocess_search_query("Kimi no Na wa"), [what_is_yn, yn_movie]
+    )
+    assert ranked_knw_exact[0].canonical_id == "anilist:21519"
+    assert ranked_knw_exact[0].match_score > ranked_knw_exact[1].match_score
+
+    # Sparse unenriched TV stub ("Kimi no na wa", 1991) must not outrank full-metadata "Your Name." (2016)
+    knw_1991_stub = MediaIdentity(
+        canonical_id="imdb:tt0161157",
+        official_title="Kimi no na wa",
+        media_type="tv",
+        release_year=1991,
+        imdb_id="tt0161157",
+        poster_url="https://example.com/1991.jpg",
+    )
+    yn_movie_rich = MediaIdentity(
+        canonical_id="anilist:21519",
+        official_title="Your Name.",
+        romaji_title="Kimi no Na wa.",
+        media_type="movie",
+        release_year=2016,
+        synopsis="Two strangers find themselves linked in a bizarre way.",
+        poster_url="https://example.com/yn.jpg",
+    )
+    ranked_knw_rich = rank_and_filter_candidates(
+        preprocess_search_query("Kimi no Na wa"), [knw_1991_stub, yn_movie_rich]
+    )
+    assert ranked_knw_rich[0].canonical_id == "anilist:21519"
+    assert ranked_knw_rich[0].match_score > ranked_knw_rich[1].match_score
+
+    # 4. Short title "The Office" ranks TV series #1 and rejects partial-token anime noise
+    apothecary = MediaIdentity(
+        canonical_id="anilist:161645",
+        official_title="The Apothecary Diaries",
+        media_type="anime",
+        release_year=2023,
+    )
+    ranked_office = rank_and_filter_candidates(
+        preprocess_search_query("The Office"), [apothecary, office_us, office_uk]
+    )
+    assert len(ranked_office) == 2
+    assert {r.canonical_id for r in ranked_office} == {"tvmaze:526", "tvmaze:1221"}
+
+    # 5. Live unknown query never returns demo data
+    class EmptyAniList:
+        def search(self, query: str, limit: int = 8):
+            return []
+
+    class EmptyTVMaze:
+        def search(self, query: str, limit: int = 8):
+            return []
+
+    class EmptyTMDB:
+        is_configured = False
+
+        def search(self, query: str, limit: int = 8):
+            return []
+
+    class EmptyIMDb:
+        def search(self, query: str, limit: int = 6):
+            return []
+
+    live_empty_svc = CatalogMetadataService(
+        anilist=EmptyAniList(),
+        tmdb=EmptyTMDB(),
+        tvmaze=EmptyTVMaze(),
+        imdb_suggest=EmptyIMDb(),
+    )
+    shows, notes, status = live_empty_svc.search_shows_detailed("NonexistentShowXYZ123", demo_mode=False)
+    assert shows == []
+    assert status == "no_matches"
+
+
+def test_stage5_and_stage6_query_plan_buckets_and_independent_pagination() -> None:
+    """
+    Verify Stage 5 & 6:
+    - build_show_query_plan expands up to 5 prioritized non-redundant aliases
+    - Releases match pipe-separated bilingual movie titles into confirmed/possible buckets
+    - Independent per-(provider, query) cursors stop re-fetching exhausted queries while
+      advancing queries that still have more pages
+    """
+    from gui_scraper.models import (
+        MediaIdentity,
+        SourceSearchFilters,
+        TorrentRelease,
+    )
+    from gui_scraper.providers import (
+        MultiProviderDiscoveryEngine,
+        ProviderSearchPage,
+        SourceProvider,
+        build_show_query_plan,
+    )
+
+    yn = MediaIdentity(
+        canonical_id="anilist:21519",
+        official_title="Your Name.",
+        romaji_title="Kimi no Na wa.",
+        alternate_titles=["君の名は。", "Your Name (2016)"],
+        media_type="movie",
+        release_year=2016,
+    )
+    plan = build_show_query_plan(yn, max_queries=5)
+    assert "Your Name." in plan
+    assert "Kimi no Na wa." in plan
+    assert len(plan) <= 5
+
+    # Mock Nyaa + SubsPlease to test independent per-(provider, query) cursor pagination
+    calls: list[tuple[str, str, int]] = []
+
+    class FakeNyaa(SourceProvider):
+        provider_id = "nyaa"
+        provider_name = "Nyaa"
+
+        def search(self, query, page=1, filters=None, demo_mode=False, force_refresh=False):
+            calls.append(("nyaa", query, page))
+            if query == "Frieren":
+                # Query A has 2 pages
+                title = f"[SubsPlease] Frieren - 0{page} (1080p).mkv"
+                ih = f"{page:040d}"
+                return ProviderSearchPage(
+                    provider_id="nyaa",
+                    provider_name="Nyaa",
+                    releases=[
+                        TorrentRelease(
+                            release_id=f"n:{page}",
+                            provider_id="nyaa",
+                            provider_name="Nyaa",
+                            title=title,
+                            magnet_uri=f"magnet:?xt=urn:btih:{ih}",
+                            info_hash=ih,
+                            size="1.4 GiB",
+                            seeders=100,
+                            is_valid=True,
+                        )
+                    ],
+                    page=page,
+                    total_pages=2,
+                    has_next_page=(page < 2),
+                )
+            # Secondary query is exhausted on page 1
+            ih = "a" * 40
+            return ProviderSearchPage(
+                provider_id="nyaa",
+                provider_name="Nyaa",
+                releases=[
+                    TorrentRelease(
+                        release_id="n:alt1",
+                        provider_id="nyaa",
+                        provider_name="Nyaa",
+                        title="[SubsPlease] Sousou no Frieren - 03 (1080p).mkv",
+                        magnet_uri=f"magnet:?xt=urn:btih:{ih}",
+                        info_hash=ih,
+                        size="1.4 GiB",
+                        seeders=80,
+                        is_valid=True,
+                    )
+                ],
+                page=page,
+                total_pages=1,
+                has_next_page=False,
+            )
+
+        def get_details(self, result_id):
+            return {}
+
+        def normalize_result(self, raw):
+            raise NotImplementedError
+
+    class FakeSubsPlease(SourceProvider):
+        provider_id = "subsplease"
+        provider_name = "SubsPlease"
+
+        def search(self, query, page=1, filters=None, demo_mode=False, force_refresh=False):
+            calls.append(("subsplease", query, page))
+            return ProviderSearchPage(
+                provider_id="subsplease",
+                provider_name="SubsPlease",
+                releases=[],
+                page=page,
+                total_pages=1,
+                has_next_page=False,
+            )
+
+        def get_details(self, result_id):
+            return {}
+
+        def normalize_result(self, raw):
+            raise NotImplementedError
+
+    frieren = MediaIdentity(
+        canonical_id="anilist:154587",
+        official_title="Frieren",
+        romaji_title="Sousou no Frieren",
+        media_type="anime",
+        release_year=2023,
+    )
+    engine = MultiProviderDiscoveryEngine(
+        nyaa=FakeNyaa(),  # type: ignore[arg-type]
+        subsplease=FakeSubsPlease(),  # type: ignore[arg-type]
+        eztv=FakeSubsPlease(),  # type: ignore[arg-type]
+    )
+    items_p1, statuses_p1, has_next_p1, _ = engine.discover_for_show(
+        frieren, page=1, demo_mode=False, filters=SourceSearchFilters(providers=["nyaa", "subsplease"])
+    )
+    assert has_next_p1 is True
+    assert len(items_p1) == 2
+
+    calls_before_p2 = len(calls)
+    items_p2, statuses_p2, has_next_p2, _ = engine.discover_for_show(
+        frieren,
+        page=2,
+        demo_mode=False,
+        filters=SourceSearchFilters(providers=["nyaa", "subsplease"]),
+        cursors=engine.last_pagination_cursors,
+    )
+    p2_calls = calls[calls_before_p2:]
+    # Only ("nyaa", "Frieren", 2) should have been fetched on page 2!
+    assert p2_calls == [("nyaa", "Frieren", 2)]
+    assert has_next_p2 is False
+    assert any(st.status == "exhausted" for st in statuses_p2)
+
+
+def test_stage8_required_18_title_matrix_deterministic() -> None:
+    """
+    Stage 8 Deterministic Multi-Title Matrix Verification across all 18 required test queries
+    covering English/Romaji/spacing variants, movies, TV series, remakes, short titles, and
+    nonexistent queries in Mock catalog mode.
+    """
+    from gui_scraper.metadata import CatalogMetadataService
+    from gui_scraper.providers import MultiProviderDiscoveryEngine
+
+    svc = CatalogMetadataService()
+    engine = MultiProviderDiscoveryEngine()
+
+    matrix = [
+        ("Frieren", "anime", "Frieren"),
+        ("Sousou no Frieren", "anime", "Frieren"),
+        ("Dandadan", "anime", "DAN DA DAN"),
+        ("Dan Da Dan", "anime", "DAN DA DAN"),
+        ("Your Name", "movie", "Your Name"),
+        ("Kimi no Na wa", "movie", "Your Name"),
+        ("One Piece", "anime", "ONE PIECE"),
+        ("Naruto", "anime", "Naruto"),
+        ("Bleach", "anime", "Bleach"),
+        ("Delicious in Dungeon", "anime", "Delicious in Dungeon"),
+        ("Solo Leveling", "anime", "Solo Leveling"),
+        ("Breaking Bad", "tv", "Breaking Bad"),
+        ("The Office 2005", "tv", "The Office"),
+        ("The Office UK", "tv", "The Office"),
+        ("Dark", "tv", "Dark"),
+        ("You", "tv", "You"),
+        ("IT", "movie", "IT"),
+        ("NonexistentShowXYZ123", "none", None),
+    ]
+
+    for query_text, expected_type, expected_title_substr in matrix:
+        shows, _, status = svc.search_shows_detailed(query_text, demo_mode=True, limit=8)
+        if expected_title_substr is None:
+            assert shows == [], f"{query_text} should return 0 shows, got {shows}"
+            assert status == "no_matches"
+            continue
+
+        assert len(shows) >= 1, f"{query_text} returned no shows in demo mode"
+        top = shows[0]
+        assert expected_title_substr.lower() in top.official_title.lower(), (
+            f"Query {query_text!r}: expected {expected_title_substr!r} in {top.official_title!r}"
+        )
+        assert top.media_type == expected_type, (
+            f"Query {query_text!r}: expected media_type={expected_type!r}, got {top.media_type!r}"
+        )
+        if expected_type == "movie":
+            assert top.seasons == [], f"Movie {top.official_title!r} should not have seasons"
+
+        items, _, _, _ = engine.discover_for_show(top, page=1, demo_mode=True)
+        assert len(items) >= 1, f"Query {query_text!r}: expected >=1 demo source for {top.official_title!r}"
+
+
+
 
 

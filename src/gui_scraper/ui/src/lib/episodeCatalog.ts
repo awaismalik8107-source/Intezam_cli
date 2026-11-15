@@ -334,10 +334,12 @@ function resolveOfficialSeasonAndEpisode(
 export function buildEpisodeCatalog(
   sources: MediaSource[],
   officialSeasons?: SeasonMetadata[],
+  mediaKind?: string,
 ): {
   episodes: EpisodeEntry[];
   batches: BatchEntry[];
   other: MediaSource[];
+  possibleMatches: MediaSource[];
   seasons: number[];
 } {
   const episodeMap = new Map<string, { entry: EpisodeEntry; seen: Set<string> }>();
@@ -345,6 +347,9 @@ export function buildEpisodeCatalog(
   const batchSeen = new Set<string>();
   const other: MediaSource[] = [];
   const otherSeen = new Set<string>();
+  const possibleMatches: MediaSource[] = [];
+  const possibleSeen = new Set<string>();
+  const isMovieShow = mediaKind === "movie";
 
   const officialEpLookup = new Map<string, { title?: string; airDate?: string }>();
   if (officialSeasons) {
@@ -359,14 +364,52 @@ export function buildEpisodeCatalog(
   }
 
   for (const source of sources) {
-    const parsed = parseReleaseTitle(source.sourceTitle);
     const dedupKey = sourceDedupKey(source);
+    const bucket = source.matchBucket || source.item.match_bucket;
+    if (bucket === "possible") {
+      if (!possibleSeen.has(dedupKey)) {
+        possibleSeen.add(dedupKey);
+        possibleMatches.push(source);
+      }
+      continue;
+    }
 
-    if (parsed.classification === "episode" && parsed.firstEpisode !== null) {
-      const resolved = resolveOfficialSeasonAndEpisode(parsed, officialSeasons) ?? {
-        season: parsed.season ?? 1,
-        episode: parsed.firstEpisode,
+    const backendClass = source.item.classification;
+    if (isMovieShow || backendClass === "movie") {
+      const key = "1:1";
+      const record = episodeMap.get(key) ?? {
+        entry: {
+          season: 1,
+          number: 1,
+          title: "Feature Film Releases",
+          sources: [],
+        },
+        seen: new Set<string>(),
       };
+      if (!record.seen.has(dedupKey)) {
+        record.entry.sources.push(source);
+        record.seen.add(dedupKey);
+      }
+      episodeMap.set(key, record);
+      continue;
+    }
+
+    const parsed = parseReleaseTitle(source.sourceTitle);
+    const effectiveIsEpisode =
+      backendClass === "episode" || parsed.classification === "episode";
+    const backendSeason =
+      typeof source.item.season_number === "number" ? source.item.season_number : null;
+    const backendEpisode =
+      typeof source.item.episode_number === "number" ? source.item.episode_number : null;
+
+    if (effectiveIsEpisode && (backendEpisode !== null || parsed.firstEpisode !== null)) {
+      const resolved =
+        backendSeason !== null && backendEpisode !== null
+          ? { season: backendSeason, episode: backendEpisode }
+          : (resolveOfficialSeasonAndEpisode(parsed, officialSeasons) ?? {
+              season: parsed.season ?? 1,
+              episode: parsed.firstEpisode ?? 1,
+            });
       const season = resolved.season;
       const epNum = resolved.episode;
       const key = `${season}:${epNum}`;
@@ -386,16 +429,39 @@ export function buildEpisodeCatalog(
         record.seen.add(dedupKey);
       }
       episodeMap.set(key, record);
-    } else if (parsed.classification === "batch") {
+    } else if (
+      backendClass === "season_pack" ||
+      backendClass === "multi_episode" ||
+      backendClass === "complete_series" ||
+      parsed.classification === "batch"
+    ) {
       if (!batchSeen.has(dedupKey)) {
         batchSeen.add(dedupKey);
-        const batchKind: BatchKind = parsed.batchKind ?? (parsed.season !== null ? "season-pack" : "complete-series");
+        const effSeason = backendSeason ?? parsed.season;
+        const effFirst =
+          typeof source.item.first_episode === "number"
+            ? source.item.first_episode
+            : parsed.firstEpisode;
+        const effLast =
+          typeof source.item.last_episode === "number"
+            ? source.item.last_episode
+            : parsed.lastEpisode;
+        const batchKind: BatchKind =
+          backendClass === "complete_series"
+            ? "complete-series"
+            : backendClass === "multi_episode"
+              ? "multi-episode"
+              : backendClass === "season_pack"
+                ? "season-pack"
+                : (parsed.batchKind ?? (effSeason !== null ? "season-pack" : "complete-series"));
         batches.push({
-          season: parsed.season,
-          firstEpisode: parsed.firstEpisode,
-          lastEpisode: parsed.lastEpisode,
+          season: effSeason,
+          firstEpisode: effFirst,
+          lastEpisode: effLast,
           batchKind,
-          batchLabel: formatBatchLabel(batchKind, parsed.season, parsed.firstEpisode, parsed.lastEpisode),
+          batchLabel:
+            source.item.batch_label ||
+            formatBatchLabel(batchKind, effSeason, effFirst, effLast),
           source,
         });
       }
@@ -423,5 +489,5 @@ export function buildEpisodeCatalog(
     ]),
   ].sort((a, b) => a - b);
 
-  return { episodes, batches, other, seasons };
+  return { episodes, batches, other, possibleMatches, seasons };
 }

@@ -26,7 +26,7 @@ _TRAILING_TECH_TAG_RE = re.compile(
     re.IGNORECASE,
 )
 _BARE_TECH_TAIL_RE = re.compile(
-    r"\s+\b(?:2160p|1080p|720p|480p|4k|web[- ]?dl|webrip|bdrip|bluray|blu-ray|x26[45]|h\.?26[45]|hevc|avc|av1|10bit|aac|flac|dual[- ]?audio|multi[- ]?subs?)\b.*$",
+    r"\s+\b(?:2160p|1080p|720p|480p|4k|web[- ]?dl|webrip|bdrip|brrip|bluray|blu-ray|dvdrip|hdrip|hdtv|remux|x26[45]|h\.?26[45]|hevc|avc|av1|10bit|aac|flac|dual[- ]?audio|multi[- ]?subs?)\b.*$",
     re.IGNORECASE,
 )
 _SPECIAL_RE = re.compile(
@@ -80,13 +80,14 @@ class ParsedRelease:
     raw_title: str
     show_title: str
     season_qualified_title: str
+    alternative_title: str = ""
     release_group: str = ""
     release_year: int | None = None
     season_number: int | None = None
     episode_number: int | None = None
     first_episode: int | None = None
     last_episode: int | None = None
-    classification: str = "unclassified"  # "episode" | "multi_episode" | "season_pack" | "complete_series" | "special" | "unclassified"
+    classification: str = "unclassified"  # "episode" | "multi_episode" | "season_pack" | "complete_series" | "movie" | "special" | "unclassified"
     batch_label: str = ""
     resolution: str = ""
     codec: str = ""
@@ -152,8 +153,17 @@ def _strip_trailing_tech_tags(value: str) -> str:
 
 
 def _clean_prefix(value: str) -> str:
-    cleaned = _strip_trailing_tech_tags(value)
+    normalized = value
+    if " " not in normalized.strip() and normalized.count(".") >= 2:
+        normalized = normalized.replace(".", " ").replace("_", " ")
+    cleaned = _strip_trailing_tech_tags(normalized)
+    had_tech_strip = cleaned != normalized.strip()
     cleaned = _YEAR_PARENS_RE.sub("", cleaned)
+    if had_tech_strip:
+        # Strip scene release year only when scene tech tags followed it (e.g. "It.2017.1080p.BRRip")
+        m_yr = re.match(r"^(.{2,}?)\s+\b(?:19\d{2}|20\d{2})\s*$", cleaned)
+        if m_yr:
+            cleaned = m_yr.group(1)
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     cleaned = re.sub(r"[\s\-–—:]+$", "", cleaned)
     return cleaned.strip()
@@ -197,10 +207,18 @@ def parse_release_title(raw_title: str) -> ParsedRelease:
     release_group = group_m.group(1).strip() if group_m else ""
     tech = infer_technical_metadata(raw)
 
-    year_m = _YEAR_PARENS_RE.search(raw)
+    alternative_title = ""
+    working_raw = raw
+    if "|" in raw:
+        pipe_parts = [p.strip() for p in raw.split("|") if p.strip()]
+        if len(pipe_parts) >= 2:
+            working_raw = pipe_parts[0]
+            alternative_title = " | ".join(pipe_parts[1:])
+
+    year_m = _YEAR_PARENS_RE.search(working_raw)
     release_year: int | None = int(year_m.group(1)) if year_m else None
 
-    cleaned = _FILE_EXT_RE.sub("", raw)
+    cleaned = _FILE_EXT_RE.sub("", working_raw)
     cleaned = _LEADING_GROUPS_RE.sub("", cleaned)
     cleaned = _CRC32_TAG_RE.sub("", cleaned)
     cleaned = cleaned.replace("_", " ")
@@ -212,8 +230,28 @@ def parse_release_title(raw_title: str) -> ParsedRelease:
         scene_year = re.search(r"\b(19\d{2}|20\d{2})\s+S\d{1,2}E\d{1,3}\b", cleaned, re.IGNORECASE)
         if scene_year and int(scene_year.group(1)) != 2099:
             release_year = int(scene_year.group(1))
+        else:
+            tech_year = re.search(
+                r"\b(19\d{2}|20\d{2})\s+(?:2160p|1080p|720p|480p|4k|web[- ]?dl|webrip|bdrip|brrip|bluray|blu-ray|dvdrip|hdrip|hdtv|remux|x26[45]|h\.?26[45])\b",
+                cleaned,
+                re.IGNORECASE,
+            )
+            if tech_year and int(tech_year.group(1)) != 2099:
+                release_year = int(tech_year.group(1))
+
+    # Strip parenthesized language/audio/technical tags that are not episode/season/batch indicators
+    cleaned = re.sub(
+        r"\((?![^()]*\b(?:Season|S\d{1,2}|Ep(?:isode)?|Batch|Complete|Part|Cour)\b)[^()]*(?:Multi[- ]?Audio|Dual[- ]?Audio|German|Deutsch|English|Japanese|French|Spanish|Italian|Portuguese|Russian|1080p|720p|2160p|480p|AV1|HEVC|x26[45]|Opus|FLAC|AAC|BD|BluRay|WEB)[^()]*\)",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
 
     cleaned = _strip_trailing_tech_tags(cleaned)
+    if release_year is not None:
+        m_trailing_yr = re.match(rf"^(.{{2,}}?)\s+{release_year}\s*$", cleaned)
+        if m_trailing_yr:
+            cleaned = m_trailing_yr.group(1)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
 
     # 1. Explicit SxxExx or "Season X Episode Y"
@@ -356,6 +394,7 @@ def parse_release_title(raw_title: str) -> ParsedRelease:
         raw_title=raw,
         show_title=base_title or _clean_prefix(cleaned) or raw,
         season_qualified_title=qual_title or base_title or raw,
+        alternative_title=alternative_title,
         release_group=release_group,
         release_year=release_year,
         season_number=season,
@@ -382,18 +421,489 @@ _CONFLICT_SPINOFF_TOKENS = {
     "shippuden",
     "chibi",
     "junior",
+    "spin",
+    "spinoff",
+    "rock",
+    "sd",
+    "sennen",
+    "kessen",
+    "thousand",
+    "blood",
 }
+
+_CANONICAL_ALIAS_CLUSTERS: tuple[tuple[str, ...], ...] = (
+    ("dandadan", "dan da dan", "ダンダダン"),
+    ("frieren", "sousou no frieren", "frieren beyond journeys end", "葬送のフリーレン"),
+    ("your name", "kimi no na wa", "君の名は"),
+    ("attack on titan", "shingeki no kyojin", "aot", "snk", "進撃の巨人"),
+    ("one piece", "ワンピース"),
+    ("naruto", "ナルト"),
+    ("naruto shippuden", "naruto shippuuden", "ナルト 疾風伝"),
+    ("bleach", "ブリーチ"),
+    (
+        "bleach thousand year blood war",
+        "bleach sennen kessen hen",
+        "bleach tybw",
+        "千年血戦篇",
+    ),
+    ("delicious in dungeon", "dungeon meshi", "ダンジョン飯"),
+    ("solo leveling", "ore dake level up na ken", "俺だけレベルアップな件"),
+    ("the apothecary diaries", "kusuriya no hitorigoto", "薬屋のひとりごと"),
+    ("orb on the movements of the earth", "chi chikyuu no undou ni tsuite", "チ 地球の運動について"),
+    ("jujutsu kaisen", "jjk", "呪術廻戦"),
+    ("demon slayer", "kimetsu no yaiba", "kny", "鬼滅の刃"),
+    ("my hero academia", "boku no hero academia", "mha", "bnha", "僕のヒーローアカデミア"),
+    ("fullmetal alchemist brotherhood", "fmab", "hagane no renkinjutsushi"),
+    ("chainsaw man", "csm", "チェンソーマン"),
+    ("one punch man", "opm", "ワンパンマン"),
+)
+
+
+def compact_alnum_key(text: str) -> str:
+    """Return a lowercase, whitespace-free, punctuation-free key preserving Latin and CJK/Kana characters."""
+    norm = unicodedata.normalize("NFKC", text or "").lower()
+    norm = norm.replace("’", "").replace("‘", "").replace("'", "")
+    return re.sub(r"[^\w]|_", "", norm)
 
 
 def normalize_title_tokens(title: str) -> tuple[str, list[str]]:
     """Normalize a show title into a canonical string and significant token list."""
     text = unicodedata.normalize("NFKC", title or "").lower()
     text = text.replace("’", "'").replace("‘", "'").replace("'", "")
-    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"[^\w\s]|_", " ", text)
     tokens = [tok for tok in text.split() if tok]
     norm_str = " ".join(tokens)
     sig_tokens = [tok for tok in tokens if tok not in _STOPWORDS] or tokens
     return (norm_str, sig_tokens)
+
+
+@dataclass(slots=True)
+class NormalizedQuery:
+    """Stage 3: Structured representation of a user search query with qualifiers and alias expansions."""
+
+    raw_query: str
+    core_query: str
+    normalized_text: str
+    compact_key: str
+    tokens: list[str]
+    significant_tokens: list[str]
+    explicit_year: int | None = None
+    media_qualifier: str | None = None  # "anime" | "live_action" | "movie" | "tv" | None
+    country_qualifier: str | None = None  # "US" | "GB" | "JP" | "DE" | None
+    is_short_ambiguous: bool = False
+    expanded_aliases: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.expanded_aliases is None:
+            self.expanded_aliases = []
+
+
+def preprocess_search_query(raw_query: str) -> NormalizedQuery:
+    """
+    Stage 3 Query-Processing Pipeline:
+    Normalizes Unicode/punctuation, extracts year/adaptation/country qualifiers,
+    strips accidental release-group/tech tags, and expands known multilingual/spacing aliases.
+    """
+    raw = (raw_query or "").strip()
+    if not raw:
+        return NormalizedQuery(
+            raw_query="",
+            core_query="",
+            normalized_text="",
+            compact_key="",
+            tokens=[],
+            significant_tokens=[],
+            is_short_ambiguous=False,
+            expanded_aliases=[],
+        )
+
+    working = unicodedata.normalize("NFKC", raw).strip()
+    # Strip leading [Group] or trailing file extension if user pasted a release name
+    working = _FILE_EXT_RE.sub("", working)
+    working = _LEADING_GROUPS_RE.sub("", working)
+    working = _CRC32_TAG_RE.sub("", working).strip()
+
+    media_qualifier: str | None = None
+    country_qualifier: str | None = None
+    explicit_year: int | None = None
+
+    # 1. Extract media-type / adaptation qualifiers: (Live Action), [Anime], (Movie), (TV)
+    if re.search(r"[\[(]?\blive[\s-]*action\b[\])]?", working, re.IGNORECASE):
+        media_qualifier = "live_action"
+        working = re.sub(r"[\[(]?\blive[\s-]*action(?:\s+series|\s+tv)?\b[\])]?", " ", working, flags=re.IGNORECASE).strip()
+    elif re.search(r"[\[(]\s*anime\s*[\])]|(?<=\s)\banime\s*$", working, re.IGNORECASE):
+        media_qualifier = "anime"
+        working = re.sub(r"[\[(]\s*anime\s*[\])]|(?<=\s)\banime\s*$", " ", working, flags=re.IGNORECASE).strip()
+    elif re.search(r"[\[(]\s*movie\s*[\])]", working, re.IGNORECASE):
+        media_qualifier = "movie"
+        working = re.sub(r"[\[(]\s*movie\s*[\])]", " ", working, flags=re.IGNORECASE).strip()
+
+    # 2. Extract country qualifiers: (US), (UK), US, UK at end of query
+    country_m = re.search(r"(?:[\[(]\s*(US|USA|UK|GB|JP)\s*[\])]|(?<=\s)(US|UK)\s*$)", working, re.IGNORECASE)
+    if country_m:
+        raw_c = (country_m.group(1) or country_m.group(2) or "").upper()
+        country_qualifier = "GB" if raw_c in {"UK", "GB"} else ("US" if raw_c in {"US", "USA"} else raw_c)
+        working = (working[: country_m.start()] + " " + working[country_m.end() :]).strip()
+
+    # 3. Extract explicit release year (only when accompanied by another title token so "1984" stays intact)
+    year_m = re.search(r"(?:[\[(]\s*(19\d{2}|20\d{2})\s*[\])]|(?<=\s)(19\d{2}|20\d{2})\s*$)", working)
+    if year_m:
+        candidate_year = int(year_m.group(1) or year_m.group(2))
+        remainder = (working[: year_m.start()] + " " + working[year_m.end() :]).strip(" -–—:()")
+        if len(remainder) >= 2:
+            explicit_year = candidate_year
+            working = remainder
+
+    working = _strip_trailing_tech_tags(working)
+    core_query = re.sub(r"\s{2,}", " ", working).strip(" -–—:") or raw
+
+    norm_str, sig_tokens = normalize_title_tokens(core_query)
+    all_tokens = [tok for tok in norm_str.split() if tok]
+    c_key = compact_alnum_key(core_query)
+
+    is_short = bool(
+        c_key
+        and (
+            len(c_key) <= 4
+            or (len(all_tokens) == 1 and len(all_tokens[0]) <= 4)
+        )
+        and not any(ord(ch) > 0x3000 for ch in c_key)
+    )
+
+    expanded: list[str] = []
+    seen_exp_norm: set[str] = {norm_str}
+    for cluster in _CANONICAL_ALIAS_CLUSTERS:
+        cluster_keys = {compact_alnum_key(alias) for alias in cluster}
+        if c_key in cluster_keys or norm_str in cluster:
+            for alias in cluster:
+                a_norm, _ = normalize_title_tokens(alias)
+                if a_norm and a_norm not in seen_exp_norm:
+                    seen_exp_norm.add(a_norm)
+                    expanded.append(alias)
+
+    return NormalizedQuery(
+        raw_query=raw,
+        core_query=core_query,
+        normalized_text=norm_str,
+        compact_key=c_key,
+        tokens=all_tokens,
+        significant_tokens=sig_tokens,
+        explicit_year=explicit_year,
+        media_qualifier=media_qualifier,
+        country_qualifier=country_qualifier,
+        is_short_ambiguous=is_short,
+        expanded_aliases=expanded,
+    )
+
+
+@dataclass(slots=True)
+class CandidateRankResult:
+    """Stage 4: Explainable ranking evaluation for a candidate MediaIdentity."""
+
+    score: float
+    confidence_tier: str  # "high" | "medium" | "low" | "rejected"
+    reason: str
+    matched_title: str = ""
+
+
+_PROMO_NOISE_RE = re.compile(
+    r"(?:×|\bcm\b|\bcommercial\b|\btrailer\b|\banniversary\b|\bpv\b|\brecap\b|\bmusic\s+video\b|●●|\bminami\s+alps\b|\bsuntory\b)",
+    re.IGNORECASE,
+)
+
+
+def rank_media_candidate(
+    query: str | NormalizedQuery,
+    candidate: MediaIdentity,
+) -> CandidateRankResult:
+    """
+    Stage 4 Deterministic, Explainable Ranking Algorithm:
+    Evaluates a candidate MediaIdentity against a query using:
+      1. Exact canonical title
+      2. Exact alternative / Romaji / native title
+      3. External metadata identity
+      4. Normalized / compact spacing title equality
+      5. Release year agreement
+      6. Media-type & country agreement
+      7. Token similarity & prefix containment
+      8. Fuzzy bigram similarity (never used alone for high confidence)
+      9. Conflicting sequel / remake / promotional noise qualifiers
+    """
+    nq = preprocess_search_query(query) if isinstance(query, str) else query
+    if not nq.compact_key:
+        return CandidateRankResult(score=1.0, confidence_tier="high", reason="Default browse catalog")
+
+    probe_variants: list[tuple[str, str, list[str], bool]] = [
+        (nq.normalized_text, nq.compact_key, nq.significant_tokens, True)
+    ]
+    for alias in nq.expanded_aliases:
+        a_norm, a_sig = normalize_title_tokens(alias)
+        a_comp = compact_alnum_key(alias)
+        if a_comp:
+            probe_variants.append((a_norm, a_comp, a_sig, False))
+
+    canonical_titles = [
+        t.strip()
+        for t in [
+            candidate.official_title,
+            getattr(candidate, "english_title", ""),
+            candidate.romaji_title,
+        ]
+        if t and t.strip()
+    ]
+    alt_titles = [
+        t.strip()
+        for t in [
+            candidate.original_title,
+            *(candidate.alternate_titles or []),
+        ]
+        if t and t.strip()
+    ]
+    for s_meta in candidate.seasons or []:
+        for s_alias in s_meta.season_aliases or []:
+            if s_alias and s_alias.strip():
+                alt_titles.append(s_alias.strip())
+
+    best_base_score = 0.0
+    best_reason = "No title match"
+    best_matched_title = candidate.official_title
+    has_token_or_exact_hit = False
+
+    all_title_entries: list[tuple[str, bool]] = [
+        *((t, True) for t in canonical_titles),
+        *((t, False) for t in alt_titles),
+    ]
+
+    for cand_raw, is_canonical in all_title_entries:
+        cand_norm, cand_sig = normalize_title_tokens(cand_raw)
+        cand_comp = compact_alnum_key(cand_raw)
+        if not cand_comp:
+            continue
+        cand_all_tokens = cand_norm.split()
+        cand_set = set(cand_sig)
+        cand_all_set = set(cand_all_tokens)
+
+        for probe_norm, probe_comp, probe_sig, is_primary_probe in probe_variants:
+            probe_set = set(probe_sig)
+            probe_all_set = set(probe_norm.split())
+
+            # 1 & 2. Exact normalized title match
+            if cand_norm == probe_norm:
+                has_token_or_exact_hit = True
+                sc = 1.00 if (is_canonical and is_primary_probe) else 0.97
+                rsn = (
+                    "Exact canonical title match"
+                    if (is_canonical and is_primary_probe)
+                    else "Exact alternative/Romaji title match"
+                )
+                if sc > best_base_score:
+                    best_base_score, best_reason, best_matched_title = sc, rsn, cand_raw
+                continue
+
+            # 4. Compact title equality (e.g. "Dandadan" == "DAN DA DAN" == "Dan Da Dan")
+            if cand_comp == probe_comp:
+                has_token_or_exact_hit = True
+                sc = 0.96 if is_primary_probe else 0.94
+                rsn = "Normalized compact title equality"
+                if sc > best_base_score:
+                    best_base_score, best_reason, best_matched_title = sc, rsn, cand_raw
+                continue
+
+            # Short-title conservative rule ("IT", "You", "Dark")
+            if nq.is_short_ambiguous and is_primary_probe:
+                if probe_norm in cand_all_set:
+                    has_token_or_exact_hit = True
+                    # Extra words present alongside short query -> cap at medium confidence
+                    sc = 0.62 if is_canonical else 0.56
+                    rsn = "Ambiguous short-title partial token match"
+                    if sc > best_base_score:
+                        best_base_score, best_reason, best_matched_title = sc, rsn, cand_raw
+                continue
+
+            # 7. Token & prefix similarity
+            overlap_sig = len(probe_set & cand_set)
+            overlap_all = len(probe_all_set & cand_all_set)
+            if overlap_sig > 0 or overlap_all > 0:
+                has_token_or_exact_hit = True
+                extra_in_cand = cand_set - probe_set
+                has_sequel_conflict = bool(extra_in_cand & _CONFLICT_SPINOFF_TOKENS)
+
+                if probe_set and probe_set.issubset(cand_set) and cand_norm.startswith(probe_norm):
+                    if has_sequel_conflict:
+                        # Standalone named sequel/spinoff (e.g. "Naruto: Shippuden" or "Bleach: Thousand-Year Blood War")
+                        sc = 0.84 if is_canonical else 0.80
+                        rsn = "Distinct sequel/spinoff prefix match"
+                    else:
+                        # Primary title prefix (e.g. "Frieren" -> "Frieren: Beyond Journey's End")
+                        sc = 0.89 if is_canonical else 0.85
+                        rsn = "Primary title prefix match"
+                elif probe_set and probe_set.issubset(cand_set) and probe_norm in cand_norm:
+                    # Query appears mid-title (e.g. "Your Name" inside "Call Me by Your Name")
+                    sc = 0.72 if is_canonical else 0.68
+                    rsn = "Contained phrase match"
+                else:
+                    dice = (2.0 * overlap_sig) / max(1, len(probe_set) + len(cand_set))
+                    if has_sequel_conflict:
+                        dice *= 0.78
+                    sc = round(0.76 * dice, 4)
+                    rsn = "Token similarity match"
+
+                if sc > best_base_score:
+                    best_base_score, best_reason, best_matched_title = sc, rsn, cand_raw
+                continue
+
+            # 8. Substring / character bigram similarity (never sufficient alone for high confidence)
+            if len(probe_comp) >= 4 and (probe_comp in cand_comp or cand_comp in probe_comp):
+                has_token_or_exact_hit = True
+                ratio = min(len(probe_comp), len(cand_comp)) / max(len(probe_comp), len(cand_comp))
+                sc = min(0.72, 0.55 + 0.20 * ratio)
+                rsn = "Substring containment match"
+                if sc > best_base_score:
+                    best_base_score, best_reason, best_matched_title = sc, rsn, cand_raw
+
+    if not has_token_or_exact_hit or best_base_score <= 0.0:
+        return CandidateRankResult(
+            score=0.0,
+            confidence_tier="rejected",
+            reason="Zero title token overlap with query",
+            matched_title=candidate.official_title,
+        )
+
+    score = best_base_score
+    reasons = [best_reason]
+
+    # 9. Penalize promotional/commercial/crossover/mini-special noise unless explicitly queried
+    if _PROMO_NOISE_RE.search(candidate.official_title) and not _PROMO_NOISE_RE.search(nq.raw_query):
+        score -= 0.38
+        reasons.append("promotional/special noise penalty")
+
+    # 5. Release year agreement
+    if nq.explicit_year is not None:
+        if candidate.release_year is not None:
+            diff = abs(candidate.release_year - nq.explicit_year)
+            if diff == 0:
+                score += 0.12
+                reasons.append(f"exact year match ({nq.explicit_year})")
+            elif diff == 1:
+                score += 0.04
+                reasons.append(f"near year match ({candidate.release_year})")
+            else:
+                score -= 0.30
+                reasons.append(f"year mismatch ({candidate.release_year} != {nq.explicit_year})")
+        else:
+            score -= 0.10
+
+    # 6. Media-type & country agreement
+    if nq.media_qualifier:
+        if nq.media_qualifier == "live_action":
+            if candidate.media_type == "tv":
+                score += 0.12
+                reasons.append("live-action TV match")
+            elif candidate.media_type == "anime":
+                score -= 0.30
+                reasons.append("anime vs live-action qualifier mismatch")
+        elif nq.media_qualifier == "anime":
+            if candidate.media_type == "anime":
+                score += 0.12
+                reasons.append("anime media-type match")
+            elif candidate.media_type == "tv":
+                score -= 0.30
+                reasons.append("TV vs anime qualifier mismatch")
+        elif nq.media_qualifier == "movie":
+            if candidate.media_type == "movie":
+                score += 0.12
+                reasons.append("movie media-type match")
+            else:
+                score -= 0.22
+
+    if nq.country_qualifier:
+        cand_country = (getattr(candidate, "country", "") or "").upper()
+        if cand_country:
+            if cand_country == nq.country_qualifier:
+                score += 0.12
+                reasons.append(f"country match ({cand_country})")
+            else:
+                score -= 0.22
+                reasons.append(f"country mismatch ({cand_country} != {nq.country_qualifier})")
+
+    # 3. External metadata richness & series completeness tie-breaker
+    # Helps major verified works (e.g. "Dark" 2017 3-season TV series, or "Your Name." 2016 movie)
+    # rank ahead of obscure dateless stubs or tie-ins with the same short name.
+    if candidate.imdb_id:
+        score += 0.02
+    if candidate.release_year is not None:
+        score += 0.03
+    else:
+        score -= 0.08
+    if getattr(candidate, "synopsis", ""):
+        score += 0.015
+    elif candidate.release_year is None:
+        score -= 0.06
+    if getattr(candidate, "poster_url", ""):
+        score += 0.01
+    if len(candidate.seasons) >= 2:
+        score += 0.015
+    elif candidate.media_type == "movie" and candidate.release_year:
+        score += 0.015
+    elif candidate.media_type == "tv" and not candidate.seasons and not getattr(candidate, "synopsis", ""):
+        # Sparse unenriched TV stubs (e.g. legacy IMDb-only TV entries with zero episode data)
+        score -= 0.08
+
+    if best_base_score < 0.95 and nq.explicit_year is None:
+        score = min(0.94, score)
+
+    final_score = round(max(0.0, min(1.0, score)), 4)
+    if final_score >= 0.78:
+        tier = "high"
+    elif final_score >= 0.48:
+        tier = "medium"
+    elif final_score >= 0.25:
+        tier = "low"
+    else:
+        tier = "rejected"
+
+    return CandidateRankResult(
+        score=final_score,
+        confidence_tier=tier,
+        reason=f"{'; '.join(reasons)} [matched '{best_matched_title}']",
+        matched_title=best_matched_title,
+    )
+
+
+def rank_and_filter_candidates(
+    query: str | NormalizedQuery,
+    candidates: list[MediaIdentity],
+    min_score: float = 0.28,
+) -> list[MediaIdentity]:
+    """
+    Score, annotate, filter out rejected noise, and deterministically sort candidate MediaIdentity records.
+    """
+    nq = preprocess_search_query(query) if isinstance(query, str) else query
+    if not nq.compact_key:
+        return list(candidates)
+
+    scored: list[tuple[float, int, int, int, int, int, MediaIdentity]] = []
+    for idx, cand in enumerate(candidates):
+        res = rank_media_candidate(nq, cand)
+        cand.match_score = res.score
+        cand.confidence = res.score
+        cand.confidence_tier = res.confidence_tier
+        cand.match_reason = res.reason
+        if res.confidence_tier == "rejected" or res.score < min_score:
+            continue
+        has_year_and_poster = 1 if (cand.release_year is not None and bool(cand.poster_url)) else 0
+        has_imdb = 1 if cand.imdb_id else 0
+        ep_total = getattr(cand, "episode_count", 0) or sum(s.episode_count for s in cand.seasons)
+        season_bonus = (
+            1
+            if (len(cand.seasons) >= 2 or ep_total >= 25 or (cand.media_type == "movie" and cand.release_year))
+            else 0
+        )
+        ep_bonus = min(100, ep_total)
+        scored.append((res.score, has_year_and_poster, has_imdb, season_bonus, ep_bonus, -idx, cand))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3], item[4], item[5]), reverse=True)
+    return [item[6] for item in scored]
 
 
 class TitleIdentityMatcher:
@@ -414,13 +924,15 @@ class TitleIdentityMatcher:
         """
         rel_norm, rel_tokens = normalize_title_tokens(parsed.show_title)
         qual_norm, qual_tokens = normalize_title_tokens(parsed.season_qualified_title)
-        if not rel_norm:
+        alt_norm, alt_tokens = normalize_title_tokens(parsed.alternative_title)
+        if not rel_norm and not alt_norm:
             return (0.0, None, "Empty release title")
 
         # Build candidate reference titles: (candidate_title, associated_season_or_None)
         candidates: list[tuple[str, int | None]] = []
         for t in [
             identity.official_title,
+            getattr(identity, "english_title", ""),
             identity.romaji_title,
             identity.original_title,
             *identity.alternate_titles,
@@ -437,16 +949,22 @@ class TitleIdentityMatcher:
         best_season: int | None = None
         best_reason = "No match"
 
+        probes: list[tuple[str, list[str], bool]] = [
+            (qual_norm, qual_tokens, True),
+            (rel_norm, rel_tokens, False),
+        ]
+        if alt_norm:
+            probes.append((alt_norm, alt_tokens, False))
+
         for cand_str, cand_season in candidates:
             cand_norm, cand_tokens = normalize_title_tokens(cand_str)
             if not cand_norm:
                 continue
 
-            # Compare against both base show_title and season_qualified_title
-            for probe_norm, probe_tokens, is_qual in [
-                (qual_norm, qual_tokens, True),
-                (rel_norm, rel_tokens, False),
-            ]:
+            # Compare against base show_title, season_qualified_title, and pipe alternative_title
+            for probe_norm, probe_tokens, is_qual in probes:
+                if not probe_norm:
+                    continue
                 score, reason = cls._compare_normalized(
                     probe_norm,
                     probe_tokens,
@@ -483,6 +1001,11 @@ class TitleIdentityMatcher:
         if probe_norm == cand_norm:
             return (1.0, "Exact normalized title match")
 
+        probe_comp = compact_alnum_key(probe_norm)
+        cand_comp = compact_alnum_key(cand_norm)
+        if probe_comp and probe_comp == cand_comp:
+            return (0.98, "Exact compact spacing match")
+
         probe_set = set(probe_tokens)
         cand_set = set(cand_tokens)
         if not probe_set or not cand_set:
@@ -497,7 +1020,7 @@ class TitleIdentityMatcher:
         if (extra_in_probe & _CONFLICT_SPINOFF_TOKENS) or (extra_in_cand & _CONFLICT_SPINOFF_TOKENS):
             overlap = len(probe_set & cand_set)
             if overlap > 0:
-                return (0.52, "Conflicting sequel/spinoff/reboot qualifier token")
+                return (0.42, "Conflicting sequel/spinoff/reboot qualifier token")
             return (0.0, "Disjoint tokens")
 
         overlap = len(probe_set & cand_set)
@@ -535,11 +1058,21 @@ def match_release_to_identity(
     if not release.release_group and parsed.release_group:
         release.release_group = parsed.release_group
 
+    # Conflicting media-type check: e.g. S01E01 episodic live-action release vs 1999 Anime when year conflicts
+    if (
+        identity.media_type == "movie"
+        and parsed.classification in {"episode", "season_pack", "complete_series"}
+        and parsed.season_number is not None
+    ):
+        confidence *= 0.45
+        reason += " [episodic SxxExx release vs movie identity]"
+
     if confidence < TitleIdentityMatcher.AMBIGUOUS_THRESHOLD:
         return ReleaseMatchResult(
             release=release,
             canonical_id=identity.canonical_id,
             classification="unclassified",
+            match_bucket="rejected",
             confidence=confidence,
             match_reason=reason,
         )
@@ -549,11 +1082,30 @@ def match_release_to_identity(
             release=release,
             canonical_id=identity.canonical_id,
             classification="ambiguous",
+            match_bucket="possible",
             season_number=parsed.season_number or alias_season,
             episode_number=parsed.episode_number,
             first_episode=parsed.first_episode,
             last_episode=parsed.last_episode,
             batch_label=parsed.batch_label,
+            confidence=confidence,
+            match_reason=reason,
+        )
+
+    # Standalone Movie Identity Handling:
+    # A movie release (like "[PHTMini] Your Name. (2016) (BD 1080p AV1...)") should be classified as a confirmed
+    # feature-film release (Season 1, Episode 1 = Full Movie) rather than buried in unclassified specials!
+    if identity.media_type == "movie" and parsed.classification in {"unclassified", "special"}:
+        return ReleaseMatchResult(
+            release=release,
+            canonical_id=identity.canonical_id,
+            classification="movie",
+            match_bucket="confirmed",
+            season_number=1,
+            episode_number=1,
+            first_episode=1,
+            last_episode=1,
+            batch_label="Feature Film",
             confidence=confidence,
             match_reason=reason,
         )
@@ -586,10 +1138,17 @@ def match_release_to_identity(
                     resolved_ep = rem
                     break
 
+    bucket = (
+        "unclassified"
+        if parsed.classification in {"unclassified", "special"}
+        else "confirmed"
+    )
+
     return ReleaseMatchResult(
         release=release,
         canonical_id=identity.canonical_id,
         classification=parsed.classification,
+        match_bucket=bucket,
         season_number=resolved_season,
         episode_number=resolved_ep,
         first_episode=parsed.first_episode if parsed.classification != "episode" else resolved_ep,

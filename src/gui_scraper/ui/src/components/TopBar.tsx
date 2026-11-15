@@ -73,8 +73,8 @@ export function TopBar({
               value={query}
               autoComplete="off"
               spellCheck={false}
-              aria-label="Search anime shows or browse catalog"
-              placeholder="Search anime title (e.g. Frieren)..."
+              aria-label="Search anime, movies, or TV series"
+              placeholder="Search anime, movie, or TV show (e.g. Frieren, Your Name, Breaking Bad)..."
               onChange={(e) => onQueryChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {

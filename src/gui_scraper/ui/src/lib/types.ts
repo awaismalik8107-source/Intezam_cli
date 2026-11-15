@@ -38,12 +38,14 @@ export interface ScrapedItem {
   codec?: string;
   subtitle_lang?: string;
   classification?: string;
+  match_bucket?: "confirmed" | "possible" | "unclassified" | "rejected" | string;
   season_number?: number | null;
   episode_number?: number | null;
   first_episode?: number | null;
   last_episode?: number | null;
   batch_label?: string;
   match_confidence?: number;
+  match_reason?: string;
   mirror_providers?: string[];
 }
 
@@ -70,6 +72,7 @@ export interface SeasonMetadata {
 export interface MediaIdentity {
   canonical_id: string;
   official_title: string;
+  english_title?: string;
   original_title: string;
   romaji_title: string;
   alternate_titles: string[];
@@ -80,6 +83,8 @@ export interface MediaIdentity {
   mal_id?: number | null;
   release_year: number | null;
   media_type: "anime" | "tv" | "movie" | string;
+  country?: string;
+  episode_count?: number | null;
   synopsis: string;
   genres: string[];
   status: string;
@@ -88,18 +93,23 @@ export interface MediaIdentity {
   seasons: SeasonMetadata[];
   metadata_provider: string;
   confidence: number;
+  match_score?: number;
+  confidence_tier?: "high" | "medium" | "low" | "rejected" | string;
+  match_reason?: string;
 }
 
 export interface ProviderRetrievalStatus {
   provider_id: string;
   provider_name: string;
-  status: "ok" | "partial" | "error" | "skipped" | "rate_limited" | string;
+  status: "ok" | "partial" | "error" | "skipped" | "rate_limited" | "exhausted" | string;
   items_found: number;
   page: number;
   total_pages: number;
   has_next_page: boolean;
   error?: string | null;
   queried_urls?: string[];
+  query?: string;
+  cursor_key?: string;
 }
 
 export interface SourceSearchFilters {
@@ -131,6 +141,8 @@ export interface MediaSource {
   providerId?: string;
   mirrorProviders?: string[];
   matchConfidence?: number;
+  matchBucket?: string;
+  matchReason?: string;
 }
 
 export interface MediaEntry {
@@ -139,6 +151,8 @@ export interface MediaEntry {
   year: string | null;
   seasonEpisode: string | null;
   mediaType: "series" | "release";
+  mediaKind?: "anime" | "movie" | "tv" | string;
+  country?: string;
   sources: MediaSource[];
   bestQuality: QualityTier;
   verifiedCount: number;
@@ -157,6 +171,7 @@ export interface MediaEntry {
   officialSeasons?: SeasonMetadata[];
   metadataProvider?: string;
   providerStatuses?: ProviderRetrievalStatus[];
+  paginationCursors?: Record<string, Record<string, unknown>>;
 }
 
 export interface LibraryEntry {
@@ -274,10 +289,19 @@ export interface PaginatedSearchResponse {
   provider_statuses?: ProviderRetrievalStatus[];
 }
 
+export type SearchStatusKind =
+  | "ok"
+  | "no_matches"
+  | "provider_unavailable"
+  | "partial_failure"
+  | "mock"
+  | "idle";
+
 export interface DiscoverShowsResponse {
   shows: MediaIdentity[];
   query: string;
   mode: ScrapeMode;
+  search_status?: SearchStatusKind;
   error?: string | null;
   provider_notes?: string[];
 }
@@ -290,6 +314,8 @@ export interface DiscoverShowSourcesResponse {
   has_next_page: boolean;
   total_pages: number;
   provider_statuses: ProviderRetrievalStatus[];
+  pagination_cursors?: Record<string, Record<string, unknown>>;
+  rejected_count?: number;
   error?: string | null;
 }
 
@@ -312,6 +338,7 @@ export interface PyWebViewApi {
     page?: number,
     forceRefresh?: boolean,
     filters?: SourceSearchFilters,
+    cursors?: Record<string, Record<string, unknown>>,
   ) => Promise<DiscoverShowSourcesResponse>;
   verify_url: (url: string) => Promise<VerifyUrlResponse>;
   get_config: () => Promise<ScraperConfig>;

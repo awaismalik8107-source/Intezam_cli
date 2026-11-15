@@ -100,9 +100,11 @@ export function MediaDetailsView({
   onChangeSourceFilters,
 }: MediaDetailsViewProps) {
   const batchSectionRef = useRef<HTMLElement | null>(null);
+  const isMovie = media.mediaKind === "movie" || media.metadata?.media_type === "movie";
+  const isTv = media.mediaKind === "tv" || media.metadata?.media_type === "tv";
   const catalog = useMemo(
-    () => buildEpisodeCatalog(media.sources, media.officialSeasons),
-    [media.sources, media.officialSeasons],
+    () => buildEpisodeCatalog(media.sources, media.officialSeasons, media.mediaKind || media.metadata?.media_type),
+    [media.sources, media.officialSeasons, media.mediaKind, media.metadata?.media_type],
   );
   const [season, setSeason] = useState<number | null>(null);
   const [episode, setEpisode] = useState<number | null>(null);
@@ -350,24 +352,35 @@ export function MediaDetailsView({
                 </span>
               )}
               <span className="rounded-md border border-white/10 bg-black/45 px-2.5 py-1">
-                {media.metadata?.media_type === "tv"
-                  ? "TV Series"
-                  : media.mediaType === "series"
-                    ? "Anime Series"
-                    : "Release"}
+                {isMovie
+                  ? "Feature Film"
+                  : isTv
+                    ? media.country
+                      ? `TV Series · ${media.country}`
+                      : "TV Series"
+                    : "Anime Series"}
               </span>
-              <span className="rounded-md border border-[#786BFF]/35 bg-[#786BFF]/15 px-2.5 py-1 font-medium text-[#DAD6FF]">
-                {(catalog.seasons.length || media.officialSeasons?.length || 0) > 0
-                  ? `${catalog.seasons.length || media.officialSeasons?.length} ${
-                      (catalog.seasons.length || media.officialSeasons?.length) === 1
-                        ? "Season"
-                        : "Seasons"
-                    }`
-                  : "Season Unspecified"}
-              </span>
-              <span className="rounded-md border border-white/10 bg-black/45 px-2.5 py-1">
-                {catalog.episodes.length} {catalog.episodes.length === 1 ? "Episode" : "Episodes"}
-              </span>
+              {!isMovie && (
+                <>
+                  <span className="rounded-md border border-[#786BFF]/35 bg-[#786BFF]/15 px-2.5 py-1 font-medium text-[#DAD6FF]">
+                    {(catalog.seasons.length || media.officialSeasons?.length || 0) > 0
+                      ? `${catalog.seasons.length || media.officialSeasons?.length} ${
+                          (catalog.seasons.length || media.officialSeasons?.length) === 1
+                            ? "Season"
+                            : "Seasons"
+                        }`
+                      : "Season Unspecified"}
+                  </span>
+                  <span className="rounded-md border border-white/10 bg-black/45 px-2.5 py-1">
+                    {catalog.episodes.length} {catalog.episodes.length === 1 ? "Episode" : "Episodes"}
+                  </span>
+                </>
+              )}
+              {isMovie && (
+                <span className="rounded-md border border-emerald-400/30 bg-emerald-400/10 px-2.5 py-1 text-emerald-200">
+                  {sortedSources.length} {sortedSources.length === 1 ? "Release" : "Releases"}
+                </span>
+              )}
               {catalog.batches.length > 0 && (
                 <span className="rounded-md border border-[#38BDF8]/30 bg-[#38BDF8]/10 px-2.5 py-1 text-[#7DD3FC]">
                   {catalog.batches.length} {catalog.batches.length === 1 ? "Batch Pack" : "Batch Packs"}
@@ -451,12 +464,13 @@ export function MediaDetailsView({
       <section className="space-y-4 rounded-2xl border border-white/[0.08] bg-[#111522] p-4 sm:p-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-lg font-semibold text-white">Episodes & Multi-Provider Discovery</h3>
+            <h3 className="text-lg font-semibold text-white">
+              {isMovie ? "Movie Releases & Multi-Provider Discovery" : "Episodes & Multi-Provider Discovery"}
+            </h3>
             <p className="mt-1 text-xs text-[#AAB5CA]">
-              {catalog.episodes.length} distinct{" "}
-              {catalog.episodes.length === 1 ? "episode" : "episodes"} across{" "}
-              {catalog.seasons.length} identified{" "}
-              {catalog.seasons.length === 1 ? "season" : "seasons"} ({media.sources.length} deduplicated releases).
+              {isMovie
+                ? `${sortedSources.length} confirmed ${sortedSources.length === 1 ? "release" : "releases"} (${media.sources.length} total non-rejected sources across providers).`
+                : `${catalog.episodes.length} distinct ${catalog.episodes.length === 1 ? "episode" : "episodes"} across ${catalog.seasons.length} identified ${catalog.seasons.length === 1 ? "season" : "seasons"} (${media.sources.length} deduplicated releases).`}
             </p>
           </div>
 
@@ -470,7 +484,9 @@ export function MediaDetailsView({
                 <select
                   id="nyaa-category-filter"
                   aria-label="Filter torrent category"
-                  value={sourceFilters?.category || "1_0"}
+                  value={
+                    sourceFilters?.category || (isMovie || isTv ? "0_0" : "1_0")
+                  }
                   onChange={(e) =>
                     onChangeSourceFilters({
                       ...(sourceFilters || {}),
@@ -522,26 +538,37 @@ export function MediaDetailsView({
           </div>
         </div>
 
-        {/* Per-Provider Retrieval Status Pills */}
+        {/* Per-Provider & Per-Query Retrieval Status Pills */}
         {media.providerStatuses && media.providerStatuses.length > 0 && (
           <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/[0.06] bg-[#0B0E18] px-3 py-2 text-[11px]">
             <span className="font-semibold uppercase tracking-wider text-[#949CAF]">
               Source Providers:
             </span>
-            {media.providerStatuses.map((st) => (
+            {media.providerStatuses.map((st, idx) => (
               <span
-                key={st.provider_id}
-                title={st.error || `${st.provider_name}: ${st.items_found} releases`}
+                key={st.cursor_key || `${st.provider_id}-${st.query || idx}`}
+                title={st.error || `${st.provider_name}${st.query ? ` (${st.query})` : ""}: ${st.items_found} releases · page ${st.page}/${st.total_pages}`}
                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 font-mono ${
                   st.status === "ok"
                     ? st.items_found > 0
                       ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
                       : "border-white/10 bg-white/5 text-[#949CAF]"
-                    : "border-amber-400/30 bg-amber-400/10 text-amber-200"
+                    : st.status === "exhausted"
+                      ? "border-white/10 bg-white/5 text-[#7D879C]"
+                      : "border-amber-400/30 bg-amber-400/10 text-amber-200"
                 }`}
               >
-                <span>{st.provider_name}:</span>
-                <strong>{st.status === "ok" ? `${st.items_found} found` : st.status}</strong>
+                <span>
+                  {st.provider_name}
+                  {st.query ? ` [${st.query}]` : ""}:
+                </span>
+                <strong>
+                  {st.status === "ok"
+                    ? `${st.items_found} · p${st.page}/${st.total_pages}`
+                    : st.status === "exhausted"
+                      ? `done (p${st.page})`
+                      : st.status}
+                </strong>
               </span>
             ))}
           </div>
@@ -587,104 +614,108 @@ export function MediaDetailsView({
           </div>
         )}
 
-        {/* Season Selector */}
-        {catalog.seasons.length > 0 ? (
-          <div role="group" aria-label="Choose season" className="flex flex-wrap items-center gap-2">
-            {catalog.seasons.map((value) => {
-              const isSelected = currentSeason === value;
-              return (
-                <button
-                  key={value}
-                  type="button"
-                  onClick={() => {
-                    setSeason(value);
-                    setEpisode(null);
-                    setExpandedSource(null);
-                  }}
-                  aria-pressed={isSelected}
-                  className={`rounded-xl px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${
-                    isSelected
-                      ? "border border-[#786BFF]/70 bg-[#786BFF]/25 text-white shadow-sm"
-                      : "border border-white/10 bg-[#191E2E] text-[#AAB5CA] hover:bg-[#232A40] hover:text-white"
-                  }`}
-                >
-                  Season {value}
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-[#191E2E] px-3.5 py-2 text-xs text-[#AAB5CA]">
-            <span>Season Unspecified / Multi-Season — No explicit season number in release titles</span>
-          </div>
-        )}
+        {/* Season Selector & Episode Grid (Series Only) */}
+        {!isMovie && (
+          <>
+            {catalog.seasons.length > 0 ? (
+              <div role="group" aria-label="Choose season" className="flex flex-wrap items-center gap-2">
+                {catalog.seasons.map((value) => {
+                  const isSelected = currentSeason === value;
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      onClick={() => {
+                        setSeason(value);
+                        setEpisode(null);
+                        setExpandedSource(null);
+                      }}
+                      aria-pressed={isSelected}
+                      className={`rounded-xl px-4 py-2 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${
+                        isSelected
+                          ? "border border-[#786BFF]/70 bg-[#786BFF]/25 text-white shadow-sm"
+                          : "border border-white/10 bg-[#191E2E] text-[#AAB5CA] hover:bg-[#232A40] hover:text-white"
+                      }`}
+                    >
+                      Season {value}
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="inline-flex items-center gap-2 rounded-xl border border-white/10 bg-[#191E2E] px-3.5 py-2 text-xs text-[#AAB5CA]">
+                <span>Season Unspecified / Multi-Season — No explicit season number in release titles</span>
+              </div>
+            )}
 
-        {/* Episode Grid */}
-        {loadingEpisodes && visibleEpisodes.length === 0 && catalog.batches.length === 0 ? (
-          <div
-            aria-busy="true"
-            className="grid grid-cols-3 gap-2.5 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10"
-          >
-            {Array.from({ length: 10 }, (_, idx) => (
-              <div key={idx} className="skeleton-shimmer h-16 rounded-xl" />
-            ))}
-          </div>
-        ) : visibleEpisodes.length > 0 ? (
-          <div
-            role="group"
-            aria-label="Choose episode"
-            className="grid max-h-[340px] grid-cols-3 gap-2.5 overflow-y-auto pr-1 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10"
-          >
-            {visibleEpisodes.map((entry) => {
-              const isSelected = selectedEpisode?.number === entry.number;
-              return (
-                <button
-                  type="button"
-                  key={entry.number}
-                  onClick={() => handleSelectEpisode(entry.number)}
-                  aria-label={`Episode ${entry.number}${entry.title ? `: ${entry.title}` : ""}`}
-                  title={entry.title ? `Episode ${entry.number}: ${entry.title}` : `Episode ${entry.number}`}
-                  aria-pressed={isSelected}
-                  className={`flex min-h-[74px] flex-col items-center justify-center gap-0.5 rounded-xl border px-2 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${
-                    isSelected
-                      ? "border-[#786BFF] bg-[#786BFF]/25 text-white shadow-sm"
-                      : "border-white/10 bg-[#191E2E] text-[#D2D7E4] hover:border-white/25 hover:bg-[#232A40]"
-                  }`}
-                >
-                  <span className="text-[10px] font-medium uppercase tracking-wider text-[#AAB5CA]">
-                    EP {String(entry.number).padStart(2, "0")}
+            {/* Episode Grid */}
+            {loadingEpisodes && visibleEpisodes.length === 0 && catalog.batches.length === 0 ? (
+              <div
+                aria-busy="true"
+                className="grid grid-cols-3 gap-2.5 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10"
+              >
+                {Array.from({ length: 10 }, (_, idx) => (
+                  <div key={idx} className="skeleton-shimmer h-16 rounded-xl" />
+                ))}
+              </div>
+            ) : visibleEpisodes.length > 0 ? (
+              <div
+                role="group"
+                aria-label="Choose episode"
+                className="grid max-h-[340px] grid-cols-3 gap-2.5 overflow-y-auto pr-1 sm:grid-cols-5 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10"
+              >
+                {visibleEpisodes.map((entry) => {
+                  const isSelected = selectedEpisode?.number === entry.number;
+                  return (
+                    <button
+                      type="button"
+                      key={entry.number}
+                      onClick={() => handleSelectEpisode(entry.number)}
+                      aria-label={`Episode ${entry.number}${entry.title ? `: ${entry.title}` : ""}`}
+                      title={entry.title ? `Episode ${entry.number}: ${entry.title}` : `Episode ${entry.number}`}
+                      aria-pressed={isSelected}
+                      className={`flex min-h-[74px] flex-col items-center justify-center gap-0.5 rounded-xl border px-2 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF] ${
+                        isSelected
+                          ? "border-[#786BFF] bg-[#786BFF]/25 text-white shadow-sm"
+                          : "border-white/10 bg-[#191E2E] text-[#D2D7E4] hover:border-white/25 hover:bg-[#232A40]"
+                      }`}
+                    >
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-[#AAB5CA]">
+                        EP {String(entry.number).padStart(2, "0")}
+                      </span>
+                      {entry.title ? (
+                        <span className="line-clamp-1 max-w-full text-[11px] font-semibold text-white">
+                          {entry.title}
+                        </span>
+                      ) : (
+                        <strong className="font-mono text-base font-bold">
+                          {String(entry.number).padStart(2, "0")}
+                        </strong>
+                      )}
+                      <span className="text-[10px] text-[#AAB5CA]">
+                        {entry.sources.length} {entry.sources.length === 1 ? "source" : "sources"}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-white/15 bg-[#0C101C] p-5 text-xs text-[#AAB5CA]">
+                <div className="flex items-center gap-3">
+                  <Search className="h-5 w-5 shrink-0 text-[#786BFF]" aria-hidden="true" />
+                  <span>
+                    {availableBatches.length > 0
+                      ? "This show has batch or full-season packs rather than individually numbered episode torrents. Inspect the batch releases below to copy a magnet link."
+                      : "No individually numbered episodes were identified for this season. Check batch or possible releases below, or refresh sources."}
                   </span>
-                  {entry.title ? (
-                    <span className="line-clamp-1 max-w-full text-[11px] font-semibold text-white">
-                      {entry.title}
-                    </span>
-                  ) : (
-                    <strong className="font-mono text-base font-bold">
-                      {String(entry.number).padStart(2, "0")}
-                    </strong>
-                  )}
-                  <span className="text-[10px] text-[#AAB5CA]">
-                    {entry.sources.length} {entry.sources.length === 1 ? "source" : "sources"}
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-dashed border-white/15 bg-[#0C101C] p-5 text-xs text-[#AAB5CA]">
-            <div className="flex items-center gap-3">
-              <Search className="h-5 w-5 shrink-0 text-[#786BFF]" aria-hidden="true" />
-              <span>
-                {availableBatches.length > 0
-                  ? "This show has batch or full-season packs rather than individually numbered episode torrents. Inspect the batch releases below to copy a magnet link."
-                  : "No individually numbered episodes were identified for this season. Check batch or unclassified releases below, or refresh sources."}
-              </span>
-            </div>
-          </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
       </section>
 
-      {/* Episode Magnet Sources Panel */}
+      {/* Episode / Movie Magnet Sources Panel */}
       {(visibleEpisodes.length > 0 || selectedEpisode !== null) && (
         <section
           aria-live="polite"
@@ -694,14 +725,18 @@ export function MediaDetailsView({
             <div>
               <h3 className="text-lg font-semibold text-white">
                 {selectedEpisode
-                  ? `Season ${selectedEpisode.season} · Episode ${selectedEpisode.number}${
-                      selectedEpisode.title ? ` — ${selectedEpisode.title}` : ""
-                    } — Magnet sources`
+                  ? isMovie
+                    ? `${media.title} — Feature Film Magnet Sources`
+                    : `Season ${selectedEpisode.season} · Episode ${selectedEpisode.number}${
+                        selectedEpisode.title ? ` — ${selectedEpisode.title}` : ""
+                      } — Magnet sources`
                   : "Select an episode"}
               </h3>
               <p className="mt-1 text-xs text-[#AAB5CA]">
                 {selectedEpisode
-                  ? `${sortedSources.length} matching ${sortedSources.length === 1 ? "release" : "releases"} for Episode ${String(selectedEpisode.number).padStart(2, "0")}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
+                  ? isMovie
+                    ? `${sortedSources.length} matching movie ${sortedSources.length === 1 ? "release" : "releases"}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
+                    : `${sortedSources.length} matching ${sortedSources.length === 1 ? "release" : "releases"} for Episode ${String(selectedEpisode.number).padStart(2, "0")}. Compare resolution, codec, and seeders, then copy your preferred magnet URI.`
                   : "Source links appear here after you choose an episode above."}
               </p>
             </div>
@@ -809,6 +844,37 @@ export function MediaDetailsView({
             })}
           </div>
         </section>
+      )}
+
+      {/* Possible Matches Panel (Ambiguous / Clarification Bucket) */}
+      {catalog.possibleMatches.length > 0 && (
+        <details
+          open={visibleEpisodes.length === 0 && availableBatches.length === 0}
+          className="rounded-2xl border border-amber-400/20 bg-[#111522] p-4 sm:p-6"
+        >
+          <summary className="cursor-pointer text-sm font-semibold text-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]">
+            Possible Matches ({catalog.possibleMatches.length}) — Partial or uncertain title matches
+          </summary>
+          <p className="mt-1.5 text-xs text-[#AAB5CA]">
+            These releases partially matched the title or had ambiguous adaptation metadata and were
+            kept separate from confirmed episodes so nothing valid is silently dropped.
+          </p>
+          <div className="mt-4 space-y-3">
+            {catalog.possibleMatches.map((source) => (
+              <article
+                key={sourceKey(source)}
+                className="space-y-2.5 rounded-xl border border-white/10 bg-[#191E2E] p-4"
+              >
+                <p className="break-words text-sm font-medium text-white">{source.sourceTitle}</p>
+                {source.matchReason && (
+                  <p className="text-[11px] text-amber-200/80">{source.matchReason}</p>
+                )}
+                {renderSourceMetadataBadges(source)}
+                {renderMagnet(source)}
+              </article>
+            ))}
+          </div>
+        </details>
       )}
 
       {/* Unclassified Releases Panel */}

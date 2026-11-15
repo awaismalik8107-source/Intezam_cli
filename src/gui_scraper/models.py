@@ -49,6 +49,16 @@ class ScrapedItem:
     timestamp: str = ""
     magnet_tracker_count: int = 0
     trackers: list[str] = field(default_factory=list)
+    classification: str = ""
+    match_bucket: str = "confirmed"
+    season_number: int | None = None
+    episode_number: int | None = None
+    first_episode: int | None = None
+    last_episode: int | None = None
+    batch_label: str = ""
+    match_confidence: float = 0.0
+    match_reason: str = ""
+    mirror_providers: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.release_title and self.title:
@@ -105,10 +115,11 @@ class SeasonMetadata:
 
 @dataclass(slots=True)
 class MediaIdentity:
-    """Canonical show/anime identity separate from torrent release data."""
+    """Canonical show/anime/movie/TV identity separate from torrent release data."""
 
     canonical_id: str
     official_title: str
+    english_title: str = ""
     original_title: str = ""
     romaji_title: str = ""
     alternate_titles: list[str] = field(default_factory=list)
@@ -119,6 +130,8 @@ class MediaIdentity:
     mal_id: int | None = None
     release_year: int | None = None
     media_type: str = "anime"  # "anime" | "tv" | "movie"
+    country: str = ""
+    episode_count: int = 0
     synopsis: str = ""
     genres: list[str] = field(default_factory=list)
     status: str = ""
@@ -127,27 +140,48 @@ class MediaIdentity:
     seasons: list[SeasonMetadata] = field(default_factory=list)
     metadata_provider: str = ""
     confidence: float = 1.0
+    match_score: float = 1.0
+    confidence_tier: str = "high"  # "high" | "medium" | "low" | "rejected"
+    match_reason: str = ""
 
-    def all_search_titles(self) -> list[str]:
-        """Return deduplicated primary and alternate titles suitable for torrent queries."""
-        candidates: list[str] = []
-        seen: set[str] = set()
-        for raw in [
+    def all_search_titles(self, max_queries: int = 6) -> list[str]:
+        """Return prioritized, deduplicated primary, Romaji, alternate, and season titles for torrent queries."""
+        import re
+
+        latin_candidates: list[str] = []
+        cjk_candidates: list[str] = []
+        seen_norm: set[str] = set()
+
+        season_aliases: list[str] = []
+        for s_meta in self.seasons:
+            for s_alias in s_meta.season_aliases:
+                if s_alias and s_alias.strip():
+                    season_aliases.append(s_alias.strip())
+
+        raw_pool = [
             self.official_title,
+            self.english_title,
             self.romaji_title,
-            self.original_title,
             *self.alternate_titles,
-        ]:
+            *season_aliases,
+            self.original_title,
+        ]
+        for raw in raw_pool:
             cleaned = (raw or "").strip()
             if not cleaned or len(cleaned) < 2:
                 continue
-            # Skip purely non-Latin/CJK strings as primary query if Latin titles exist,
-            # or include them after Latin titles.
-            norm = cleaned.lower()
-            if norm not in seen:
-                seen.add(norm)
-                candidates.append(cleaned)
-        return candidates
+            norm = re.sub(r"[^\w]+", " ", cleaned.lower()).strip()
+            if not norm or norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            has_latin = bool(re.search(r"[A-Za-z0-9]", cleaned))
+            if has_latin:
+                latin_candidates.append(cleaned)
+            else:
+                cjk_candidates.append(cleaned)
+
+        combined = [*latin_candidates, *cjk_candidates]
+        return combined[: max(1, max_queries)]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -207,11 +241,24 @@ class TorrentRelease:
     timestamp: str = ""
     magnet_tracker_count: int = 0
     trackers: list[str] = field(default_factory=list)
+    classification: str = ""
+    match_bucket: str = "confirmed"
+    season_number: int | None = None
+    episode_number: int | None = None
+    first_episode: int | None = None
+    last_episode: int | None = None
+    batch_label: str = ""
+    match_confidence: float = 0.0
+    match_reason: str = ""
     is_valid: bool = True
     verification_msg: str = ""
     mirror_providers: list[str] = field(default_factory=list)
 
-    def to_scraped_item(self, numeric_id: int) -> ScrapedItem:
+    def to_scraped_item(
+        self,
+        numeric_id: int,
+        match_result: ReleaseMatchResult | None = None,
+    ) -> ScrapedItem:
         """Convert normalized TorrentRelease into legacy ScrapedItem for bridge compatibility."""
         stats = f"S:{self.seeders} L:{self.leechers} D:{self.downloads}"
         primary_link = self.magnet_uri or self.torrent_url or self.view_url
@@ -255,6 +302,16 @@ class TorrentRelease:
             timestamp=self.timestamp,
             magnet_tracker_count=self.magnet_tracker_count or len(self.trackers),
             trackers=list(self.trackers),
+            classification=match_result.classification if match_result else "",
+            match_bucket=match_result.match_bucket if match_result else "confirmed",
+            season_number=match_result.season_number if match_result else None,
+            episode_number=match_result.episode_number if match_result else None,
+            first_episode=match_result.first_episode if match_result else None,
+            last_episode=match_result.last_episode if match_result else None,
+            batch_label=match_result.batch_label if match_result else "",
+            match_confidence=match_result.confidence if match_result else 1.0,
+            match_reason=match_result.match_reason if match_result else "",
+            mirror_providers=list(self.mirror_providers),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -274,6 +331,8 @@ class ProviderRetrievalStatus:
     has_next_page: bool = False
     error: str | None = None
     queried_urls: list[str] = field(default_factory=list)
+    query: str = ""
+    cursor_key: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -285,7 +344,8 @@ class ReleaseMatchResult:
 
     release: TorrentRelease
     canonical_id: str
-    classification: str  # "episode" | "multi_episode" | "season_pack" | "complete_series" | "special" | "unclassified" | "ambiguous"
+    classification: str  # "episode" | "multi_episode" | "season_pack" | "complete_series" | "movie" | "special" | "unclassified" | "ambiguous"
+    match_bucket: str = "confirmed"  # "confirmed" | "possible" | "unclassified" | "rejected"
     season_number: int | None = None
     episode_number: int | None = None
     first_episode: int | None = None

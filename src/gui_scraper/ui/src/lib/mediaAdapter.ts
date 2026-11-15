@@ -135,6 +135,10 @@ export function adaptScrapedItem(item: ScrapedItem, providerName: string): Media
     hostname: extractHostname(item.torrent_link || primaryUri),
     providerName: effectiveProvider,
     providerId: item.provider_id,
+    mirrorProviders: item.mirror_providers,
+    matchConfidence: item.match_confidence,
+    matchBucket: item.match_bucket,
+    matchReason: item.match_reason,
   };
 }
 
@@ -231,16 +235,30 @@ export function adaptMetadataToMediaEntry(
   items: ScrapedItem[] = [],
   defaultProviderName = "Multi-Source",
   providerStatuses?: ProviderRetrievalStatus[],
+  paginationCursors?: Record<string, Record<string, unknown>>,
 ): MediaEntry {
+  const isMovie = identity.media_type === "movie";
+  const totalEps =
+    identity.episode_count ||
+    identity.seasons.reduce((sum, s) => sum + (s.episode_count || 0), 0);
+  let seasonEpisodeLabel: string | null = null;
+  if (isMovie) {
+    seasonEpisodeLabel = "Feature Film";
+  } else if (identity.seasons.length > 0) {
+    const sLabel = `${identity.seasons.length} Season${identity.seasons.length > 1 ? "s" : ""}`;
+    seasonEpisodeLabel = totalEps > 0 ? `${sLabel} · ${totalEps} Eps` : sLabel;
+  } else if (totalEps > 0) {
+    seasonEpisodeLabel = `${totalEps} Episodes`;
+  }
+
   const baseEntry: MediaEntry = {
     key: identity.canonical_id || showKey(identity.official_title),
     title: identity.official_title,
     year: identity.release_year ? String(identity.release_year) : null,
-    seasonEpisode:
-      identity.seasons.length > 0
-        ? `${identity.seasons.length} Season${identity.seasons.length > 1 ? "s" : ""}`
-        : null,
-    mediaType: "series",
+    seasonEpisode: seasonEpisodeLabel,
+    mediaType: isMovie ? "release" : "series",
+    mediaKind: identity.media_type || "anime",
+    country: identity.country || undefined,
     sources: [],
     bestQuality: "Other",
     verifiedCount: 0,
@@ -255,20 +273,31 @@ export function adaptMetadataToMediaEntry(
     synopsis: identity.synopsis || undefined,
     genres: identity.genres?.length ? identity.genres : undefined,
     alternateTitles: [
+      identity.english_title,
       identity.romaji_title,
       identity.original_title,
       ...(identity.alternate_titles || []),
-    ].filter((t): t is string => Boolean(t && t.trim() && t.trim() !== identity.official_title)),
+    ].filter(
+      (t, idx, arr): t is string =>
+        Boolean(t && t.trim() && t.trim() !== identity.official_title && arr.indexOf(t) === idx),
+    ),
     officialSeasons: identity.seasons,
     metadataProvider: identity.metadata_provider,
     metadata: identity,
     providerStatuses,
+    paginationCursors,
   };
 
   if (items.length === 0) {
     return baseEntry;
   }
-  return mergeSourcesIntoMediaEntry(baseEntry, items, defaultProviderName, providerStatuses);
+  return mergeSourcesIntoMediaEntry(
+    baseEntry,
+    items,
+    defaultProviderName,
+    providerStatuses,
+    paginationCursors,
+  );
 }
 
 export function mergeSourcesIntoMediaEntry(
@@ -276,6 +305,7 @@ export function mergeSourcesIntoMediaEntry(
   items: ScrapedItem[],
   defaultProviderName = "Multi-Source",
   providerStatuses?: ProviderRetrievalStatus[],
+  paginationCursors?: Record<string, Record<string, unknown>>,
 ): MediaEntry {
   const adapted = items.map((item) =>
     adaptScrapedItem(item, item.provider_name || defaultProviderName),
@@ -345,5 +375,6 @@ export function mergeSourcesIntoMediaEntry(
     largestSizeLabel,
     maxSeeders,
     providerStatuses: providerStatuses ?? entry.providerStatuses,
+    paginationCursors: paginationCursors ?? entry.paginationCursors,
   };
 }

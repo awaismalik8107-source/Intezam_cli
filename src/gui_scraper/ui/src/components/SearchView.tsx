@@ -7,7 +7,13 @@ import {
 } from "lucide-react";
 import { m } from "motion/react";
 import { PAGE_VARIANTS } from "../lib/motion";
-import type { MediaEntry, ScrapeMode, ScrapedItem, SearchHistoryEntry } from "../lib/types";
+import type {
+  MediaEntry,
+  ScrapeMode,
+  ScrapedItem,
+  SearchHistoryEntry,
+  SearchStatusKind,
+} from "../lib/types";
 import { NyaaLogo } from "./NyaaLogo";
 import { PaginationBar } from "./PaginationBar";
 import { PosterCard } from "./PosterCard";
@@ -25,6 +31,8 @@ interface SearchViewProps {
   totalPages: number;
   hasNextPage: boolean;
   errorMessage: string | null;
+  searchStatus?: SearchStatusKind;
+  providerNotes?: string[];
   libraryKeys: Set<string>;
   searchHistory: SearchHistoryEntry[];
   selectedRowId: number | null;
@@ -38,6 +46,7 @@ interface SearchViewProps {
   onRetry: () => void;
   onOpenSettings: () => void;
   onOpenAdvancedBrowser?: () => void;
+  onSearchRawFallback?: () => void;
   onSelectPage: (page: number) => void;
   onLoadMore: () => void;
 }
@@ -54,6 +63,8 @@ export function SearchView({
   totalPages,
   hasNextPage,
   errorMessage,
+  searchStatus = "idle",
+  providerNotes = [],
   libraryKeys,
   searchHistory,
   onSelectMedia,
@@ -63,9 +74,15 @@ export function SearchView({
   onRetry,
   onOpenSettings,
   onOpenAdvancedBrowser,
+  onSearchRawFallback,
   onSelectPage,
   onLoadMore,
 }: SearchViewProps) {
+  const uniqueHistory = searchHistory.filter((entry, idx, arr) => {
+    const q = entry.query.trim().toLowerCase();
+    return Boolean(q) && arr.findIndex((e) => e.query.trim().toLowerCase() === q) === idx;
+  });
+
   return (
     <m.div
       variants={PAGE_VARIANTS}
@@ -79,19 +96,30 @@ export function SearchView({
         <div className="flex items-center gap-3">
           <NyaaLogo size={34} className="shrink-0 shadow-md shadow-[#3582F7]/20" />
           <div>
-            <h2 className="text-lg font-semibold tracking-tight text-[#F8FAFC]">
-              {hasSearched && query.trim()
-                ? `Shows matching "${query.trim()}"`
-                : hasSearched
-                  ? "Featured Anime Shows"
-                  : "Discover Anime Shows"}
-            </h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-lg font-semibold tracking-tight text-[#F8FAFC]">
+                {hasSearched && query.trim()
+                  ? `Shows matching "${query.trim()}"`
+                  : hasSearched
+                    ? "Featured Catalog"
+                    : "Discover Anime, Movies & TV Shows"}
+              </h2>
+              <span
+                className={`rounded-full border px-2 py-0.5 text-[10.5px] font-medium ${
+                  mode === "mock"
+                    ? "border-amber-400/30 bg-amber-400/10 text-amber-200"
+                    : "border-emerald-400/30 bg-emerald-400/10 text-emerald-200"
+                }`}
+              >
+                {mode === "mock" ? "Offline Demo Mode" : "Live Discovery"}
+              </span>
+            </div>
             <p className="mt-0.5 text-xs text-[#949CAF]">
               {isLoading
-                ? `Searching ${mode === "mock" ? "sample anime catalog" : "Nyaa"}...`
+                ? `Searching ${mode === "mock" ? "offline demo catalog" : "AniList, TMDB & TVMaze metadata"}...`
                 : hasSearched
-                  ? `${mediaItems.length} ${mediaItems.length === 1 ? "show" : "shows"} identified · Open a show to browse seasons, episodes, and magnet links`
-                  : "Search for an anime title above or browse featured shows to inspect seasons and episodes."}
+                  ? `${mediaItems.length} ${mediaItems.length === 1 ? "title" : "titles"} identified · Select a card to inspect seasons, episodes, and multi-provider magnet links`
+                  : "Search for any anime, movie, or TV series above to inspect canonical metadata and verified magnet sources."}
             </p>
           </div>
         </div>
@@ -109,12 +137,12 @@ export function SearchView({
       </div>
 
       {/* Recent Queries */}
-      {searchHistory.length > 0 && (
+      {uniqueHistory.length > 0 && (
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-[11px] font-medium text-[#949CAF]">Recent:</span>
-          {searchHistory.slice(0, 8).map((entry) => (
+          {uniqueHistory.slice(0, 8).map((entry) => (
             <button
-              key={`${entry.query}-${entry.mode}`}
+              key={entry.query.trim().toLowerCase()}
               type="button"
               onClick={() => onQuickSearch(entry.query)}
               className="rounded-lg border border-white/[0.08] bg-[#111522] px-2.5 py-1 text-xs text-[#F8FAFC] transition-colors hover:border-[#786BFF]/45 hover:bg-[#191E2E] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
@@ -174,17 +202,48 @@ export function SearchView({
       ) : hasSearched && !isLoading && mediaItems.length === 0 && rawItems.length === 0 ? (
         <div className="flex flex-col items-center justify-center rounded-2xl border border-white/[0.06] bg-[#111522] px-6 py-16 text-center">
           <Search className="mb-3 h-7 w-7 text-[#949CAF]" aria-hidden="true" />
-          <h3 className="text-sm font-semibold text-[#F8FAFC]">No matching shows found</h3>
+          <h3 className="text-sm font-semibold text-[#F8FAFC]">
+            {searchStatus === "provider_unavailable"
+              ? "Metadata Providers Temporarily Unavailable"
+              : "No matching shows found"}
+          </h3>
           <p className="mt-1 max-w-md text-xs text-[#949CAF]">
-            No releases matched your query. Try another anime title or inspect provider settings.
+            {searchStatus === "provider_unavailable"
+              ? "AniList / TVMaze / TMDB could not be reached right now. You can retry or search raw torrents directly on Nyaa."
+              : "No anime, movie, or TV show matched your query. Try another title or search raw torrent releases directly."}
           </p>
+          {providerNotes.length > 0 && (
+            <p className="mt-2 max-w-lg rounded-lg border border-white/[0.07] bg-[#0B0D16] px-3 py-1.5 text-[11px] text-[#949CAF]">
+              {providerNotes.join(" · ")}
+            </p>
+          )}
+          <div className="mt-4 flex flex-wrap justify-center gap-2.5">
+            <button
+              type="button"
+              onClick={onRetry}
+              className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-[#786BFF] px-4 text-xs font-semibold text-[#F8FAFC] hover:bg-[#6A5CFF] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#786BFF]"
+            >
+              <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Retry Search</span>
+            </button>
+            {onSearchRawFallback && query.trim() && (
+              <button
+                type="button"
+                onClick={onSearchRawFallback}
+                className="inline-flex h-9 items-center gap-1.5 rounded-xl border border-white/10 bg-[#191E2E] px-4 text-xs font-medium text-[#F8FAFC] hover:border-[#38BDF8]/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38BDF8]"
+              >
+                <Table2 className="h-3.5 w-3.5 text-[#38BDF8]" aria-hidden="true" />
+                <span>Search Raw Torrents on Nyaa</span>
+              </button>
+            )}
+          </div>
         </div>
       ) : !hasSearched ? (
         <div className="flex flex-col items-center justify-center rounded-2xl border border-white/[0.06] bg-[#111522]/75 px-6 py-16 text-center">
           <NyaaLogo size={42} className="mb-3 shadow-lg shadow-[#3582F7]/20" />
-          <h3 className="text-sm font-semibold text-[#F8FAFC]">Search or Browse Anime Shows</h3>
+          <h3 className="text-sm font-semibold text-[#F8FAFC]">Search or Browse Anime, Movies & TV</h3>
           <p className="mt-1 max-w-md text-xs text-[#949CAF]">
-            Enter an anime title in the top bar, browse featured shows, or pick a sample title below.
+            Enter a title in the top bar, browse featured shows, or pick a sample title below.
           </p>
           <div className="mt-4 flex flex-wrap justify-center gap-2">
             <button
@@ -192,9 +251,9 @@ export function SearchView({
               onClick={onBrowseDefault}
               className="rounded-xl bg-[#3582F7] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#2563EB] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#38BDF8]"
             >
-              Browse Featured Anime
+              Browse Featured Catalog
             </button>
-            {["Frieren", "Dan Da Dan", "Delicious in Dungeon", "Solo Leveling"].map((sample) => (
+            {["Frieren", "Dan Da Dan", "Your Name", "Breaking Bad", "The Office"].map((sample) => (
               <button
                 key={sample}
                 type="button"
@@ -208,6 +267,23 @@ export function SearchView({
         </div>
       ) : (
         <div className="space-y-4">
+          {searchStatus === "partial_failure" && providerNotes.length > 0 && (
+            <div
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-400/25 bg-amber-400/10 px-4 py-2.5 text-xs text-amber-100"
+            >
+              <span>Partial metadata results: {providerNotes.join(" · ")}</span>
+              {onSearchRawFallback && query.trim() && (
+                <button
+                  type="button"
+                  onClick={onSearchRawFallback}
+                  className="rounded-lg border border-amber-300/30 px-2.5 py-1 font-medium text-amber-100 hover:bg-amber-400/15"
+                >
+                  Search Raw Torrents
+                </button>
+              )}
+            </div>
+          )}
           {errorMessage && (
             <div
               role="alert"

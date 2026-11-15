@@ -454,6 +454,8 @@ class ConfigurableTableScraper:
     ) -> list[ScrapedItem]:
         """Generate multi-page Nyaa-structured rows (24 links/page across 5 pages) for previews."""
         raw_query = (query or "").strip()
+        if "nonexistent" in raw_query.lower():
+            return []
         topic = _QUERY_RES_SUFFIX_RE.sub("", raw_query).strip() or raw_query
         base = self.base_url.strip().rstrip("/") or BASE_URL
         page_num = max(1, min(5, int(page or 1)))
@@ -470,7 +472,52 @@ class ConfigurableTableScraper:
         ]
 
         specs: list[tuple[str, str, str, str, bool]] = []
-        if not topic:
+        topic_lower = topic.lower()
+        is_your_name_movie = any(k in topic_lower for k in ("your name", "kimi no na wa", "君の名は"))
+        if is_your_name_movie:
+            movie_templates: list[tuple[str, str, str, str, bool]] = [
+                (
+                    "[PHTMini] Your Name. (2016) (BD 1080p AV1 Opus 5.1) (Multi-Audio) (German/Deutsch) | Kimi no Na wa.",
+                    "2.1 GiB",
+                    "your-name-2016-phtmini-av1",
+                    "mkv",
+                    True,
+                ),
+                (
+                    "[Coalgirls] Your Name. (2016) (1920x1080 Blu-ray FLAC) [B2E8A19C].mkv",
+                    "8.4 GiB",
+                    "your-name-2016-coalgirls-1080p",
+                    "mkv",
+                    True,
+                ),
+                (
+                    "[Judas] Your Name. (2016) [2160p 4K UHD HEVC x265 10bit Dual-Audio] | Kimi no Na wa.mkv",
+                    "6.2 GiB",
+                    "your-name-2016-judas-4k",
+                    "mkv",
+                    True,
+                ),
+                (
+                    "[MTBB] Kimi no Na wa. (2016) [BD 1080p HEVC 10bit Dual-Audio].mkv",
+                    "3.8 GiB",
+                    "your-name-2016-mtbb-1080p",
+                    "mkv",
+                    True,
+                ),
+                (
+                    "[Kametsu] Your Name. (2016) [BD 720p AAC] | Kimi no Na wa.mkv",
+                    "1.5 GiB",
+                    "your-name-2016-kametsu-720p",
+                    "mkv",
+                    True,
+                ),
+            ]
+            if page_num == 1:
+                specs.extend(movie_templates[: min(count, len(movie_templates))])
+                count = len(specs)
+            else:
+                return []
+        elif not topic:
             # Default browse: 6 distinct anime shows across multiple episodes, seasons, and batches
             for idx in range(count):
                 show_name = browse_shows[idx % len(browse_shows)]

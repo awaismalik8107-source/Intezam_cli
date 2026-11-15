@@ -89,10 +89,11 @@ export async function discoverShowSources(
   page = 1,
   forceRefresh = false,
   filters?: SourceSearchFilters,
+  cursors?: Record<string, Record<string, unknown>>,
 ): Promise<DiscoverShowSourcesResponse> {
   const api = getApi();
   if (typeof api.discover_show_sources === "function") {
-    const res = await api.discover_show_sources(show, mode, page, forceRefresh, filters);
+    const res = await api.discover_show_sources(show, mode, page, forceRefresh, filters, cursors);
     if (res && Array.isArray(res.items)) {
       return res;
     }

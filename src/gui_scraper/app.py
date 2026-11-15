@@ -131,20 +131,24 @@ class ScraperBridge:
         mode_key = "mock" if use_demo else "live"
         cleaned = (query or "").strip()
 
-        shows, notes = self.metadata_service.search_shows(
+        shows, notes, search_status = self.metadata_service.search_shows_detailed(
             cleaned,
             demo_mode=use_demo,
             limit=8,
         )
         if cleaned:
-            self.store.record_search(cleaned, mode_key, len(shows))
+            try:
+                self.store.record_search(cleaned, mode_key, len(shows))
+            except Exception as exc:
+                self._log(f"Non-fatal search history write warning: {exc}")
         self._log(
-            f"Metadata discovery ({mode_key}) for {cleaned!r} returned {len(shows)} show(s)."
+            f"Metadata discovery ({mode_key}, status={search_status}) for {cleaned!r} returned {len(shows)} show(s)."
         )
         return {
             "shows": [s.to_dict() for s in shows],
             "query": cleaned,
             "mode": mode_key,
+            "search_status": search_status,
             "error": None,
             "provider_notes": notes,
         }
@@ -156,8 +160,9 @@ class ScraperBridge:
         page: int = 1,
         force_refresh: bool = False,
         filters: dict[str, Any] | None = None,
+        cursors: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Stage 9: On-demand multi-provider torrent discovery and episode matching for a selected show."""
+        """Stage 5, 6 & 9: On-demand multi-provider torrent discovery, 4-bucket classification, and independent per-query pagination."""
         normalized_mode = (mode or "mock").strip().lower()
         use_demo = normalized_mode in {"mock", "mock data", "demo"}
         mode_key = "mock" if use_demo else "live"
@@ -172,10 +177,14 @@ class ScraperBridge:
             demo_mode=use_demo,
             force_refresh=bool(force_refresh),
             filters=search_filters,
+            cursors=cursors if isinstance(cursors, dict) else None,
         )
         serialized = [asdict(item) for item in items]
+        pagination_cursors = dict(self.discovery_engine.last_pagination_cursors)
+        rejected_count = len(self.discovery_engine.last_rejected_items)
         self._log(
-            f"Show source discovery ({mode_key}, p={page_num}/{total_pages}) for {identity.official_title!r} returned {len(serialized)} source(s)."
+            f"Show source discovery ({mode_key}, p={page_num}/{total_pages}) for {identity.official_title!r} "
+            f"returned {len(serialized)} source(s) (rejected={rejected_count})."
         )
         return {
             "canonical_id": identity.canonical_id,
@@ -184,6 +193,8 @@ class ScraperBridge:
             "has_next_page": has_next,
             "total_pages": total_pages,
             "provider_statuses": [s.to_dict() for s in statuses],
+            "pagination_cursors": pagination_cursors,
+            "rejected_count": rejected_count,
             "error": None,
         }
 
@@ -228,6 +239,7 @@ class ScraperBridge:
         return MediaIdentity(
             canonical_id=str(show.get("canonical_id") or show.get("key") or f"show:{official.lower()}"),
             official_title=official,
+            english_title=str(show.get("english_title") or ""),
             original_title=str(show.get("original_title") or ""),
             romaji_title=str(show.get("romaji_title") or ""),
             alternate_titles=[str(a) for a in (show.get("alternate_titles") or []) if a],
@@ -237,6 +249,8 @@ class ScraperBridge:
             tvmaze_id=int(show["tvmaze_id"]) if show.get("tvmaze_id") else None,
             release_year=int(show["release_year"]) if show.get("release_year") else None,
             media_type=str(show.get("media_type") or "anime"),
+            country=str(show.get("country") or ""),
+            episode_count=int(show["episode_count"]) if show.get("episode_count") else None,
             synopsis=str(show.get("synopsis") or ""),
             genres=[str(g) for g in (show.get("genres") or []) if g],
             status=str(show.get("status") or ""),
@@ -244,6 +258,9 @@ class ScraperBridge:
             backdrop_url=str(show.get("backdrop_url") or ""),
             seasons=seasons,
             metadata_provider=str(show.get("metadata_provider") or ""),
+            match_score=float(show.get("match_score") or 0.0),
+            confidence_tier=str(show.get("confidence_tier") or "high"),
+            match_reason=str(show.get("match_reason") or ""),
         )
 
     @staticmethod
